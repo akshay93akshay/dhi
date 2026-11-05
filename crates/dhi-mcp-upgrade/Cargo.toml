@@ -1,0 +1,31 @@
+[package]
+name = "dhi-mcp-upgrade"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Pure MCP upgrade core for DHI: visibility, deferred schemas, legacy SSE, reload planning, auth harness"
+
+[features]
+# The fake SSE/HTTP endpoints are test-only. The integration tests enable this
+# through the self dev-dependency below; production builds leave it off.
+default = []
+testkit = ["dep:axum", "dep:futures"]
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum = { workspace = true, optional = true }
+dhi-mcp = { path = "../dhi-mcp" }
+futures = { workspace = true, optional = true }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+url = "2"
+
+[dev-dependencies]
+# Self dev-dependency: cargo enables `testkit` for `cargo test` without making
+# the fake endpoints part of production builds.
+dhi-mcp-upgrade = { path = ".", features = ["testkit"] }

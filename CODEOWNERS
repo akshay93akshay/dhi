@@ -1,0 +1,25 @@
+# Default owner
+* @drakshayr
+
+# Core contracts
+/crates/dhi-core/ @drakshayr
+/crates/dhi-store/ @drakshayr
+
+# Engine and safety
+/crates/dhi-engine/ @drakshayr
+/crates/dhi-guard/ @drakshayr
+
+# Agent
+/crates/dhi-agent/ @drakshayr
+
+# Surface
+/crates/dhi-server/ @drakshayr
+/web/ @drakshayr
+
+# Tests and fixtures
+/crates/dhi-testkit/ @drakshayr
+
+# Operations
+/ops/ @drakshayr
+/scripts/ @drakshayr
+/.github/ @drakshayr

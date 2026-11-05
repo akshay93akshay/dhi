@@ -1,0 +1,66 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/dhi-core",
+  "crates/dhi-store",
+  "crates/dhi-engine",
+  "crates/dhi-guard",
+  "crates/dhi-agent",
+  "crates/dhi-exec",
+  "crates/dhi-pty",
+  "crates/dhi-followups",
+  "crates/dhi-server",
+  "crates/dhi-testkit",
+  "crates/dhi-mcp",
+  "crates/dhi-mcp-runtime",
+  "crates/dhi-tool-source",
+  "crates/dhi-tool-catalog",
+  "crates/dhi-tool-control",
+  "crates/dhi-skills",
+  "crates/dhi-custom-tools",
+  "crates/dhi-web",
+  "crates/dhi-mcp-upgrade",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+
+[workspace.dependencies]
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+futures = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rig = { version = "0.45.0", features = ["rmcp"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serial_test = "3"
+sha2 = "0.10"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.dev]
+debug = 0
+incremental = true
+split-debuginfo = "off"
+
+[profile.dev-debug]
+inherits = "dev"
+debug = 2
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "chess": {
+      "transport": "stdio",
+      "command": "/opt/chess/bin/python",
+      "args": [
+        "-c",
+        "import uvicorn\n_Config = uvicorn.Config\nclass _C(_Config):\n    def __init__(self, *a, **k):\n        k['host'] = '0.0.0.0'\n        super().__init__(*a, **k)\nuvicorn.Config = _C\nimport src.mcp_server as m\nm.DASHBOARD_PORT = 8090\nm.main()"
+      ],
+      "timeout_secs": 60,
+      "enabled": true
+    }
+  }
+}

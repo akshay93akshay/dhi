@@ -1,0 +1,32 @@
+{
+  "name": "dhi-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "build:static": "NEXT_EXPORT=1 next build",
+    "test": "node --experimental-strip-types --test src/lib/api.test.ts src/lib/ui.test.ts src/lib/feed.test.ts src/lib/approvals.test.ts src/lib/settings.test.ts src/lib/taskGraph.test.ts src/lib/nav.test.ts src/lib/sideQuestions.test.ts src/lib/addGoal.test.ts src/lib/localTime.test.ts src/lib/clipboard.test.ts src/lib/preferences.test.ts src/lib/toolAdmin.test.ts",
+    "start": "next start"
+  },
+  "dependencies": {
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^1.67.0",
+    "next": "16.4.3",
+    "radix-ui": "^1.8.1",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "tailwind-merge": "^3.7.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.3.4",
+    "@types/node": "22.15.0",
+    "@types/react": "19.1.0",
+    "@types/react-dom": "19.1.0",
+    "postcss": "^8.5.32",
+    "tailwindcss": "^4.3.4",
+    "typescript": "5.9.2"
+  }
+}

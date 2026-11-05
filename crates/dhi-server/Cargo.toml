@@ -1,0 +1,61 @@
+[package]
+name = "dhi-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+dhi-agent = { path = "../dhi-agent" }
+dhi-core = { path = "../dhi-core" }
+dhi-engine = { path = "../dhi-engine" }
+dhi-exec = { path = "../dhi-exec" }
+dhi-followups = { path = "../dhi-followups" }
+dhi-guard = { path = "../dhi-guard" }
+dhi-mcp = { path = "../dhi-mcp" }
+dhi-mcp-runtime = { path = "../dhi-mcp-runtime" }
+dhi-mcp-upgrade = { path = "../dhi-mcp-upgrade" }
+dhi-tool-source = { path = "../dhi-tool-source" }
+dhi-tool-catalog = { path = "../dhi-tool-catalog" }
+dhi-tool-control = { path = "../dhi-tool-control" }
+dhi-skills = { path = "../dhi-skills" }
+dhi-custom-tools = { path = "../dhi-custom-tools" }
+dhi-pty = { path = "../dhi-pty" }
+dhi-store = { path = "../dhi-store" }
+dhi-web = { path = "../dhi-web" }
+dotenvy.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+futures.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+rig.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+# MCP: the client SDK behind rig's `rmcp` feature. rig-rmcp 0.45.0
+# builds against rmcp 3.8.0 (features `client`); the direct dependency exists
+# only for the transports rig-rmcp does not enable (`transport-child-process`
+# for stdio servers and `transport-streamable-http-client-reqwest` for HTTP
+# ones). Feature unification keeps one rmcp across both.
+rmcp = { version = "3.8.0", default-features = false, features = [
+  "client",
+  "transport-child-process",
+  "transport-streamable-http-client-reqwest",
+] }
+# Prompt hash of the specialist audit rows (same short-hash shape as the
+# engine's `agent_runs.prompt_hash`).
+sha2.workspace = true
+
+[dev-dependencies]
+dhi-testkit = { path = "../dhi-testkit" }
+serial_test.workspace = true
+tempfile.workspace = true
+tower = "0.5"
+http-body-util = "0.1"
+sqlx.workspace = true

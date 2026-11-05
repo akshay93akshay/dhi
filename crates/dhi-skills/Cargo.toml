@@ -1,0 +1,23 @@
+[package]
+name = "dhi-skills"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "DHI skills: concise instruction packs loaded by agents"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+dhi-agent = { path = "../dhi-agent" }
+dhi-core = { path = "../dhi-core" }
+dhi-guard = { path = "../dhi-guard" }
+dhi-tool-source = { path = "../dhi-tool-source" }
+rig.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true

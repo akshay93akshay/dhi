@@ -1,0 +1,40 @@
+{
+  "tools": {
+    "weather": {
+      "description": "Get weather",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "city": { "type": "string" }
+        },
+        "required": ["city"]
+      },
+      "exec": {
+        "kind": "http",
+        "method": "GET",
+        "url": "https://api.example.com/weather",
+        "headers": { "X-Key": "replace-me" },
+        "timeout_secs": 30,
+        "max_response_bytes": 1048576,
+        "allow_private": false
+      }
+    },
+    "echo": {
+      "description": "Echo a message",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "message": { "type": "string" }
+        },
+        "required": ["message"]
+      },
+      "exec": {
+        "kind": "command",
+        "command": "echo",
+        "args": ["{message}"],
+        "timeout_secs": 10,
+        "max_output_bytes": 65536
+      }
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{"specialists": [{"name": "researcher", "description": "Searches and reads the live web: finds sources, reads pages, and parses PDF/DOCX documents. Delegate when the answer needs current web content or a document the context does not already contain.", "preamble_file": "researcher.md", "tools": ["web_search", "web_read", "web_parse"], "max_turns": 8}]}

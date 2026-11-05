@@ -1,0 +1,525 @@
+/* Animated DHI brand mark. The full lockup inherits theme-aware ink from CSS
+   variables scoped to the SVG; the compact sidebar tile always keeps the
+   cream face and amber accent on the dark tile. */
+
+.block {
+  --dhi-focus: #df9417;
+  display: inline-flex;
+  width: auto;
+  max-width: 100%;
+  flex-direction: column;
+  align-items: center;
+  padding: 0;
+  color: var(--sidebar-foreground);
+  text-decoration: none;
+  outline: none;
+}
+
+.block:focus-visible {
+  outline: 2px dashed var(--dhi-focus);
+  outline-offset: 9px;
+  border-radius: 14px;
+}
+
+:global(html[data-theme="dark"]) .block,
+:global(html.dark) .block {
+  --dhi-focus: #f3a51b;
+}
+
+.hero {
+  max-width: 100%;
+}
+
+.detail {
+  max-width: 100%;
+}
+
+/* The full lockup is bare: no frame, panel, halo, border, or shadow. */
+.logoFull {
+  --dhi-ink: #1b2a40;
+  --dhi-tagline: #64748b;
+  --dhi-accent: #df9417;
+  --dhi-pupil-core: #17191e;
+  --dhi-lid: var(--background);
+  display: block;
+  width: 380px;
+  max-width: 100%;
+  height: auto;
+  overflow: visible;
+  background: transparent;
+}
+
+:global(html[data-theme="dark"]) .logoFull,
+:global(html.dark) .logoFull {
+  --dhi-ink: #f3f0e9;
+  --dhi-tagline: #c1c7d0;
+  --dhi-accent: #f3a51b;
+  --dhi-pupil-core: #17191e;
+}
+
+.hero .logoFull {
+  width: 380px;
+}
+
+.detail .logoFull {
+  width: 400px;
+}
+
+.wordmark {
+  fill: var(--dhi-ink);
+  font-family: var(--font-sans);
+  font-size: 142px;
+  font-weight: 780;
+  letter-spacing: -8px;
+}
+
+.tagline {
+  fill: var(--dhi-tagline);
+  font-family: var(--font-sans);
+  font-size: 17px;
+  font-weight: 550;
+  letter-spacing: 2.1px;
+}
+
+/* Status bar: separate from the logo, pinned in the sidebar footer. */
+.statusBar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--sidebar-foreground);
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1;
+}
+
+.statusCompact {
+  display: flex;
+  justify-content: center;
+  padding: 2px 0;
+}
+
+.statusDot {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: #35c979;
+  box-shadow: 0 0 0 3px rgb(53 201 121 / 10%), 0 0 9px rgb(53 201 121 / 45%);
+}
+
+.statusDot[data-state="error"] {
+  background: #ff626c;
+  box-shadow: 0 0 0 3px rgb(255 98 108 / 10%), 0 0 9px rgb(255 98 108 / 42%);
+}
+
+.statusDot[data-state="loading"] {
+  background: #f3ae35;
+  box-shadow: 0 0 0 3px rgb(243 174 53 / 10%), 0 0 9px rgb(243 174 53 / 40%);
+}
+
+/* Compact tile: face only, with a status badge on the corner. */
+.markLink {
+  display: inline-flex;
+  border-radius: 11px;
+  outline: none;
+}
+
+.markLink:focus-visible {
+  outline: 2px solid #f3a51b;
+  outline-offset: 2px;
+}
+
+.markTile,
+.markTileCompact {
+  position: relative;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgb(255 255 255 / 10%);
+  background: #080a0f;
+}
+
+.markTile {
+  width: 50px;
+  height: 50px;
+  padding: 4px;
+  border-radius: 13px;
+  box-shadow: 0 6px 18px rgb(0 0 0 / 16%);
+}
+
+.markTileCompact {
+  width: 38px;
+  height: 38px;
+  padding: 2px;
+  border-radius: 10px;
+}
+
+.mark {
+  --dhi-ink: #f3f0e9;
+  --dhi-tagline: #c1c7d0;
+  --dhi-accent: #f3a51b;
+  --dhi-pupil-core: #17191e;
+  --dhi-lid: #080a0f;
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.badge {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 10px;
+  height: 10px;
+  border: 2px solid var(--background);
+  border-radius: 999px;
+  background: #35c979;
+  box-shadow: 0 0 7px rgb(53 201 121 / 55%);
+}
+
+.badge[data-state="error"] {
+  background: #ff626c;
+  box-shadow: 0 0 7px rgb(255 98 108 / 55%);
+}
+
+.badge[data-state="loading"] {
+  background: #f3ae35;
+  box-shadow: 0 0 7px rgb(243 174 53 / 50%);
+}
+
+/* SVG styling. */
+.dShell {
+  fill: var(--dhi-ink);
+}
+
+.antennaStem {
+  fill: none;
+  stroke: var(--dhi-accent);
+  stroke-linecap: round;
+  stroke-width: 6;
+}
+
+.antennaBase {
+  fill: var(--dhi-ink);
+}
+
+.antennaLight {
+  fill: var(--dhi-accent);
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.sidePort {
+  fill: var(--dhi-accent);
+}
+
+.brow,
+.browLeft,
+.browRight {
+  fill: none;
+  stroke: var(--dhi-ink);
+  stroke-linecap: round;
+  stroke-width: 4.5;
+}
+
+.lens {
+  fill: none;
+  stroke: var(--dhi-ink);
+  stroke-linecap: round;
+  stroke-width: 2.8;
+}
+
+.lensEye,
+.lensLeft,
+.lensRight {
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: transform 160ms ease, stroke-width 180ms ease;
+}
+
+.eyeWhite,
+.eyeWhiteLeft,
+.eyeWhiteRight {
+  fill: var(--dhi-ink);
+  opacity: 0.12;
+}
+
+.pupilGroup,
+.pupilGroupLeft,
+.pupilGroupRight {
+  transform-box: fill-box;
+  transform-origin: center;
+  transition: transform 120ms ease-out;
+}
+
+.pupil {
+  fill: var(--dhi-accent);
+}
+
+.pupilCore {
+  fill: var(--dhi-pupil-core);
+  pointer-events: none;
+}
+
+.mouth {
+  fill: none;
+  stroke: var(--dhi-ink);
+  stroke-linecap: round;
+  stroke-width: 3;
+  opacity: 0.85;
+}
+
+.happyEye,
+.winkLine {
+  fill: none;
+  stroke: var(--dhi-ink);
+  stroke-linecap: round;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.happyEye {
+  stroke-width: 3.4;
+}
+
+.winkLine {
+  stroke-width: 3.2;
+}
+
+.sadLid,
+.sadLidLeft,
+.sadLidRight {
+  fill: var(--dhi-lid);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 220ms ease;
+}
+
+.blinkLid,
+.blinkLidLeft,
+.blinkLidRight {
+  fill: var(--dhi-lid);
+  pointer-events: none;
+  transform: scaleY(0);
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: blink 6.4s ease-in-out infinite;
+}
+
+/* Service-state expressions. */
+svg[data-state="error"] .sadLid {
+  opacity: 0.78;
+}
+
+svg[data-state="error"] .lensEye {
+  stroke-width: 3.8;
+}
+
+svg[data-state="error"] .pupil {
+  fill: #ff626c;
+}
+
+svg[data-state="error"] .blinkLid {
+  animation: none;
+}
+
+svg[data-state="loading"] .lensEye {
+  stroke-width: 3.4;
+}
+
+svg[data-state="healthy"] .antennaLight {
+  animation: antenna-glow 2.4s ease-in-out infinite;
+}
+
+svg[data-state="error"] .antennaLight {
+  animation: error-pulse 1.8s ease-in-out infinite;
+}
+
+svg[data-state="loading"] .antennaLight {
+  animation: loading-pulse 0.75s ease-in-out infinite alternate;
+}
+
+/* Controlled activity gestures. */
+svg[data-activity="error"] .sadLid {
+  opacity: 0.78;
+}
+
+svg[data-activity="error"] .lensEye {
+  stroke-width: 3.8;
+}
+
+svg[data-activity="error"] .pupil {
+  fill: #ff626c;
+}
+
+svg[data-activity="error"] .blinkLid {
+  animation: none;
+}
+
+svg[data-activity="error"] .antennaLight {
+  animation: error-pulse 1.8s ease-in-out infinite;
+}
+
+svg[data-activity="submit"] .lensEye {
+  transform: scaleY(0.55);
+}
+
+svg[data-activity="submit"] .pupilGroup {
+  animation: submit-scan 640ms ease-in-out infinite alternate;
+}
+
+svg[data-activity="submit"] .antennaLight {
+  animation: antenna-fast 0.34s ease-in-out infinite alternate;
+}
+
+svg[data-activity="typing"] .pupilGroup {
+  animation: typing-dart 180ms steps(1, end) infinite alternate;
+}
+
+svg[data-activity="success"] .lensEye,
+svg[data-activity="success"] .lensBridge,
+svg[data-activity="success"] .eyeWhite,
+svg[data-activity="success"] .pupilGroup,
+svg[data-activity="success"] .sadLid {
+  opacity: 0;
+}
+
+svg[data-activity="success"] .happyEye {
+  opacity: 1;
+}
+
+svg[data-activity="success"] .blinkLid {
+  animation: success-double-blink 620ms ease-in-out 1;
+}
+
+svg[data-activity="wink"] .winkLine {
+  opacity: 1;
+}
+
+svg[data-activity="wink"] .lensLeft,
+svg[data-activity="wink"] .eyeWhiteLeft,
+svg[data-activity="wink"] .pupilGroupLeft,
+svg[data-activity="wink"] .happyEye {
+  opacity: 0;
+}
+
+svg[data-activity="wink"] .sadLid {
+  opacity: 0;
+}
+
+svg[data-activity="wink"] .blinkLid {
+  animation: none;
+}
+
+@keyframes blink {
+  0%,
+  93%,
+  100% {
+    transform: scaleY(0);
+  }
+  94%,
+  95% {
+    transform: scaleY(1);
+  }
+  96% {
+    transform: scaleY(0);
+  }
+}
+
+@keyframes success-double-blink {
+  0%,
+  14%,
+  38%,
+  48%,
+  72%,
+  100% {
+    transform: scaleY(0);
+  }
+  20%,
+  30%,
+  56%,
+  66% {
+    transform: scaleY(1);
+  }
+}
+
+@keyframes typing-dart {
+  from {
+    transform: translate(-2.5px, 0);
+  }
+  to {
+    transform: translate(2.5px, 0);
+  }
+}
+
+@keyframes submit-scan {
+  from {
+    transform: translate(1.5px, 0);
+  }
+  to {
+    transform: translate(5.5px, 0);
+  }
+}
+
+@keyframes antenna-glow {
+  0%,
+  100% {
+    opacity: 0.85;
+    filter: drop-shadow(0 0 1px var(--dhi-accent));
+  }
+  50% {
+    opacity: 1;
+    filter: drop-shadow(0 0 7px var(--dhi-accent));
+  }
+}
+
+@keyframes loading-pulse {
+  from {
+    opacity: 0.55;
+  }
+  to {
+    opacity: 1;
+    filter: drop-shadow(0 0 8px var(--dhi-accent));
+  }
+}
+
+@keyframes error-pulse {
+  0%,
+  100% {
+    opacity: 0.7;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@keyframes antenna-fast {
+  from {
+    opacity: 0.6;
+    filter: drop-shadow(0 0 1px var(--dhi-accent));
+  }
+  to {
+    opacity: 1;
+    filter: drop-shadow(0 0 8px var(--dhi-accent));
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .blinkLid,
+  .antennaLight,
+  .pupilGroup,
+  .happyEye {
+    animation: none !important;
+  }
+
+  .pupilGroup,
+  .lensEye,
+  .happyEye,
+  .winkLine,
+  .sadLid {
+    transition: none !important;
+  }
+}

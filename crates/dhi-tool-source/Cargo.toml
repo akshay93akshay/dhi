@@ -1,0 +1,19 @@
+[package]
+name = "dhi-tool-source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Small extension seam for DHI tool sources and their backends"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+dhi-agent = { path = "../dhi-agent" }
+dhi-guard = { path = "../dhi-guard" }
+rig.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+dhi-core = { path = "../dhi-core" }
+tokio.workspace = true
+uuid.workspace = true

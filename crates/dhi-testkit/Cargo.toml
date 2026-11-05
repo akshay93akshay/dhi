@@ -1,0 +1,14 @@
+[package]
+name = "dhi-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+dhi-core = { path = "../dhi-core" }
+dhi-followups = { path = "../dhi-followups" }
+serde_json.workspace = true
+uuid.workspace = true

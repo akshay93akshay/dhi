@@ -1,0 +1,7 @@
+{
+  "firecrawl": {
+    "baseUrl": "https://api.firecrawl.dev",
+    "apiKey": "fc-your-key-here",
+    "timeoutSecs": 60
+  }
+}

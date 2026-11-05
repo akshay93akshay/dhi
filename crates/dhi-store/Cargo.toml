@@ -1,0 +1,25 @@
+[package]
+name = "dhi-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+dhi-core = { path = "../dhi-core" }
+dhi-followups = { path = "../dhi-followups" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+dhi-agent = { path = "../dhi-agent" }
+dhi-engine = { path = "../dhi-engine" }
+dhi-guard = { path = "../dhi-guard" }
+dhi-testkit = { path = "../dhi-testkit" }
+futures.workspace = true
+tokio.workspace = true

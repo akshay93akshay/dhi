@@ -1,0 +1,29 @@
+[package]
+name = "dhi-mcp-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "DHI MCP runtime: guarded connections, discovery, registration, and dispatch"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+dhi-agent = { path = "../dhi-agent" }
+dhi-core = { path = "../dhi-core" }
+dhi-guard = { path = "../dhi-guard" }
+dhi-mcp = { path = "../dhi-mcp" }
+dhi-mcp-upgrade = { path = "../dhi-mcp-upgrade" }
+rig.workspace = true
+rmcp = { version = "3.8.0", default-features = false, features = [
+  "client",
+  "transport-child-process",
+  "transport-streamable-http-client-reqwest",
+] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

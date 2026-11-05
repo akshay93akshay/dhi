@@ -1,0 +1,13 @@
+[package]
+name = "dhi-followups"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+dhi-core = { path = "../dhi-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
