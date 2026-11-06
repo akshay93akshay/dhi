@@ -185,11 +185,11 @@ pub struct Engine {
     max_idle_ticks: usize,
     /// Consecutive spent rounds allowed without a new confirmed fact.
     max_no_progress_rounds: usize,
-    /// DHI+ plans keyed by the intent the planner created.
+    /// In-memory cache of DHI+ plans keyed by the intent the planner created.
     ///
-    /// In-memory only for now: persistence is the next phase. After a restart
-    /// this map is empty, so a planned intent falls back to the single-worker
-    /// path until plans are stored durably.
+    /// Every planned intent also has a durable `intent_plans` row. The cache is
+    /// dropped after the intent finishes; a restarted engine loads the plan
+    /// from the store when it claims the intent again.
     plans: Mutex<HashMap<Uuid, IntentPlan>>,
 }
 
@@ -225,7 +225,7 @@ impl Engine {
             .insert(intent_id, plan);
     }
 
-    /// The plan attached to `intent_id`, if it is still in memory.
+    /// The cached plan attached to `intent_id`, if this engine still has it.
     fn plan_for(&self, intent_id: Uuid) -> Option<IntentPlan> {
         self.plans
             .lock()
@@ -234,28 +234,13 @@ impl Engine {
             .cloned()
     }
 
-    /// Drops a plan once its intent can no longer be executed.
+    /// Drops the in-memory cache entry once its intent can no longer be
+    /// executed. The persisted plan row stays as audit data.
     fn forget_plan(&self, intent_id: Uuid) {
         self.plans
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&intent_id);
-    }
-
-    /// Whether the activity stream says the intent was added with a plan.
-    ///
-    /// The map itself is not durable, so this marker is how a resumed intent
-    /// is distinguished from one the planner added without a plan.
-    async fn plan_was_recorded(&self, task_id: Uuid, intent_id: Uuid) -> anyhow::Result<bool> {
-        Ok(self
-            .store
-            .list_activity(task_id, Some("intents_added"))
-            .await?
-            .iter()
-            .any(|activity| {
-                activity.payload["intent_id"] == intent_id.to_string()
-                    && activity.payload["has_plan"].as_bool().unwrap_or(false)
-            }))
     }
 
     /// Runs a non-single plan through its topology's runner.
@@ -825,10 +810,10 @@ impl Engine {
                             .await?;
                         let has_plan = plan.is_some();
                         if let Some(plan) = plan {
-                            // The map is the first step only; plans become
-                            // durable in the next phase. The activity marker
-                            // below lets a restart tell a planned intent from
-                            // an ordinary single-worker one.
+                            // A planned intent is durable before execution: a
+                            // restarted engine loads the plan from the store.
+                            self.store.save_intent_plan(intent.id, &plan).await?;
+                            // The map stays a cache for the current process.
                             self.remember_plan(intent.id, plan);
                         }
                         // Only real work spends budget: a new intent is work.
@@ -979,18 +964,13 @@ impl Engine {
 
             let facts = self.store.list_facts(task_id).await?;
 
-            let plan = self.plan_for(claimed.id);
-            if plan.is_none() && self.plan_was_recorded(task_id, claimed.id).await? {
-                // Known limitation until plans are persisted: a restart loses
-                // the map, so the intent runs with the old single worker.
-                warn!(
-                    task_id = %task_id,
-                    intent_id = %claimed.id,
-                    "DHI+ plan is missing from engine memory; falling back to the \
-                     single-worker path. Plans are not persisted yet, so this is \
-                     expected after a restart."
-                );
-            }
+            // The cache carries plans from this process; a restarted engine
+            // loads the durable row instead. A missing plan keeps the
+            // single-worker fallback for intents the planner added without one.
+            let plan = match self.plan_for(claimed.id) {
+                Some(plan) => Some(plan),
+                None => self.store.get_intent_plan(claimed.id).await?,
+            };
 
             if let Some(plan) = plan.filter(|plan| plan.topology != Topology::Single) {
                 let result = match self
@@ -3342,6 +3322,18 @@ mod tests {
             self.inner.list_intents(task_id, limit).await
         }
 
+        async fn save_intent_plan(
+            &self,
+            intent_id: IntentId,
+            plan: &IntentPlan,
+        ) -> anyhow::Result<()> {
+            self.inner.save_intent_plan(intent_id, plan).await
+        }
+
+        async fn get_intent_plan(&self, intent_id: IntentId) -> anyhow::Result<Option<IntentPlan>> {
+            self.inner.get_intent_plan(intent_id).await
+        }
+
         async fn claim_intent(
             &self,
             intent_id: IntentId,
@@ -3973,6 +3965,14 @@ mod tests {
         assert_eq!(intents.len(), 1);
         assert_eq!(intents[0].state, IntentState::Done);
         assert_eq!(team_fact.provenance["intent_id"], intents[0].id.to_string());
+        assert!(
+            store
+                .get_intent_plan(intents[0].id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the plan is persisted before execution and kept as audit data"
+        );
 
         let team_run = store
             .activities(task.id)
@@ -4204,7 +4204,8 @@ mod tests {
         let task = store.seed_task("resume fallback", 4);
         let goal = seed_goal(&store, &task).await;
         // Simulate a planned intent added by a previous process: its activity
-        // marker survives, but the new engine's in-memory map is empty.
+        // marker survives but its plan row is gone, so the new engine's load
+        // returns `None`.
         let intent = store
             .add_intent(task.id, task.origin_fact_id, "resumed work".to_string())
             .await
@@ -4238,6 +4239,58 @@ mod tests {
             "a resumed intent without its plan uses single-worker provenance"
         );
         assert_eq!(store.intents(task.id)[0].state, IntentState::Done);
+    }
+
+    #[tokio::test]
+    async fn restarted_engine_loads_the_persisted_plan() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("restart task", 4);
+        let goal = seed_goal(&store, &task).await;
+        let plan = two_worker_plan("restart work", Topology::ManagerWorker);
+        let intent = store
+            .add_intent(task.id, task.origin_fact_id, "restart work".to_string())
+            .await
+            .unwrap();
+        // A previous process persisted the planner's plan before it died.
+        store.save_intent_plan(intent.id, &plan).await.unwrap();
+        // The restarted engine starts with an empty in-memory cache.
+        let previous = Engine::new(store.clone(), Arc::new(ScriptedAgent::new(vec![], vec![])));
+        drop(previous);
+
+        let agent = Arc::new(TeamAgent::new(
+            vec![ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id }],
+            vec![
+                ("subtask one", TeamWorker::Success("finding one")),
+                ("subtask two", TeamWorker::Success("finding two")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone());
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(
+            agent.calls().len(),
+            2,
+            "the persisted manager-worker plan ran both workers"
+        );
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 2, "origin fact plus exactly one team fact");
+        let team_fact = facts
+            .iter()
+            .find(|fact| fact.id != task.origin_fact_id)
+            .expect("the team fact");
+        assert_eq!(team_fact.provenance["topology"], "manager_worker");
+        assert_eq!(store.intents(task.id)[0].state, IntentState::Done);
+        assert_eq!(
+            store.get_intent_plan(intent.id).await.unwrap(),
+            Some(plan),
+            "the plan row survives completion as audit data"
+        );
+        assert!(
+            engine.plans.lock().unwrap().is_empty(),
+            "completion drops only the in-memory cache"
+        );
     }
 
     #[tokio::test]

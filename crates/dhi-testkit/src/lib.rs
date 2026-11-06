@@ -10,7 +10,7 @@ use chrono::Utc;
 use dhi_core::{
     Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, ApprovalStatus, Fact, FactId,
     FactState, Goal, GoalState, GraphStore, GuardDecision, GuardDecisionId, GuardStore,
-    GuardVerdict, Intent, IntentId, IntentState, NewSideQuestionRequest, ReopenOutcome,
+    GuardVerdict, Intent, IntentId, IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome,
     ResultRecord, ResultStatus, RunId, SideQuestionRequest, SideQuestionSession,
     SideQuestionSessionStatus, SideQuestionStatus, SideQuestionThread, Task, TaskId, TaskState,
     ToolCall, ToolCallId,
@@ -25,6 +25,8 @@ struct Inner {
     goals: HashMap<Uuid, Goal>,
     facts: HashMap<FactId, Fact>,
     intents: HashMap<IntentId, Intent>,
+    /// DHI+ plans by intent. Kept after completion as audit data.
+    intent_plans: HashMap<IntentId, IntentPlan>,
     results: Vec<ResultRecord>,
     activities: Vec<Activity>,
     tool_calls: HashMap<ToolCallId, ToolCall>,
@@ -427,6 +429,25 @@ impl GraphStore for MemoryStore {
         intents.sort_by_key(|i| (i.created_at, i.id));
         intents.truncate(limit.max(0) as usize);
         Ok(intents)
+    }
+
+    async fn save_intent_plan(&self, intent_id: IntentId, plan: &IntentPlan) -> anyhow::Result<()> {
+        self.inner
+            .lock()
+            .unwrap()
+            .intent_plans
+            .insert(intent_id, plan.clone());
+        Ok(())
+    }
+
+    async fn get_intent_plan(&self, intent_id: IntentId) -> anyhow::Result<Option<IntentPlan>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .intent_plans
+            .get(&intent_id)
+            .cloned())
     }
 
     async fn claim_intent(

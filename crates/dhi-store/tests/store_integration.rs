@@ -4,7 +4,10 @@
 //! these tests never share state. `DATABASE_URL` must point at a role that is
 //! allowed to create databases.
 
-use dhi_core::{CoreError, FactState, IntentState, TaskState};
+use dhi_core::{
+    CapabilityLimits, CoreError, FactState, IntentPlan, IntentState, Subtask, TaskState, Topology,
+    WorkerSpec,
+};
 use dhi_store::{Store, StoreError};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -201,17 +204,62 @@ async fn duplicate_exploration_is_rejected(pool: PgPool) {
 
 /// Migrations from an empty database create the full schema, idempotently.
 /// The schema includes tool control (`tool_catalog`, `tool_visibility`,
-/// `skill_usage`) and web-provider settings (`web_provider_settings`).
+/// `skill_usage`), web-provider settings (`web_provider_settings`), and
+/// persisted DHI+ plans (`intent_plans`).
 #[sqlx::test(migrations = false)]
-async fn migration_creates_23_tables_and_is_idempotent_from_clean_database(pool: PgPool) {
+async fn migration_creates_24_tables_and_is_idempotent_from_clean_database(pool: PgPool) {
     assert_eq!(base_table_count(&pool).await, 0);
 
     let store = Store::new(pool);
     store.migrate().await.expect("first migrate succeeds");
-    assert_eq!(base_table_count(store.pool()).await, 23);
+    assert_eq!(base_table_count(store.pool()).await, 24);
 
     store.migrate().await.expect("second migrate succeeds");
-    assert_eq!(base_table_count(store.pool()).await, 23);
+    assert_eq!(base_table_count(store.pool()).await, 24);
+}
+
+/// A DHI+ plan round-trips through JSONB, an upsert replaces it, and an
+/// intent without a plan (or an unknown id) reads back `None`.
+#[sqlx::test]
+async fn intent_plan_round_trips_upserts_and_unknown_returns_none(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store.create_task("team task", 4).await.unwrap();
+    let intent = store
+        .add_intent(task.id, task.origin_fact_id, "team work")
+        .await
+        .unwrap();
+
+    assert!(
+        store.get_intent_plan(intent.id).await.unwrap().is_none(),
+        "an intent without a plan has no row"
+    );
+    assert!(
+        store
+            .get_intent_plan(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none(),
+        "an unknown intent has no plan"
+    );
+
+    let first = sample_intent_plan("first plan");
+    store.save_intent_plan(intent.id, &first).await.unwrap();
+    assert_eq!(store.get_intent_plan(intent.id).await.unwrap(), Some(first));
+
+    let second = sample_intent_plan("replacement plan");
+    store.save_intent_plan(intent.id, &second).await.unwrap();
+    assert_eq!(
+        store.get_intent_plan(intent.id).await.unwrap(),
+        Some(second),
+        "saving again replaces the plan for the same intent"
+    );
+
+    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM intent_plans WHERE intent_id = $1")
+        .bind(intent.id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, 1, "the upsert keeps exactly one row per intent");
 }
 
 /// Two appends add exactly two rows.
@@ -232,6 +280,40 @@ async fn activity_appends_accumulate(pool: PgPool) {
     let after = activity_count(store.pool(), task.id).await;
 
     assert_eq!(after, before + 2);
+}
+
+fn sample_intent_plan(intent: &str) -> IntentPlan {
+    IntentPlan {
+        intent: intent.to_string(),
+        topology: Topology::ManagerWorker,
+        workers: vec![
+            WorkerSpec {
+                key: "alpha".to_string(),
+                role: "researcher".to_string(),
+                prompt: "research".to_string(),
+                max_turns: 1,
+            },
+            WorkerSpec {
+                key: "beta".to_string(),
+                role: "critic".to_string(),
+                prompt: "critique".to_string(),
+                max_turns: 1,
+            },
+        ],
+        subtasks: vec![
+            Subtask {
+                id: "s1".to_string(),
+                description: "subtask one".to_string(),
+                worker_key: Some("alpha".to_string()),
+            },
+            Subtask {
+                id: "s2".to_string(),
+                description: "subtask two".to_string(),
+                worker_key: Some("beta".to_string()),
+            },
+        ],
+        limits: CapabilityLimits::default(),
+    }
 }
 
 async fn base_table_count(pool: &PgPool) -> i64 {

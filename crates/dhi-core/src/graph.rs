@@ -5,7 +5,7 @@
 
 use crate::{
     Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, Fact, FactId, Goal, GoalId,
-    GuardDecision, GuardDecisionId, GuardVerdict, Intent, IntentId, IntentState,
+    GuardDecision, GuardDecisionId, GuardVerdict, Intent, IntentId, IntentPlan, IntentState,
     NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus, SideQuestionRequest,
     SideQuestionSession, SideQuestionThread, Task, TaskId, TaskState, ToolCall, ToolCallId,
 };
@@ -87,6 +87,16 @@ pub trait GraphStore: Send + Sync {
     /// rows. The API reads the full intent history through this; the engine
     /// still claims work through `list_open_intents`.
     async fn list_intents(&self, task_id: TaskId, limit: i64) -> anyhow::Result<Vec<Intent>>;
+
+    /// Upserts the DHI+ plan attached to `intent_id`.
+    ///
+    /// The plan is audit data: it stays after the intent completes and is only
+    /// removed with its intent. Re-saving the same intent replaces the plan.
+    async fn save_intent_plan(&self, intent_id: IntentId, plan: &IntentPlan) -> anyhow::Result<()>;
+
+    /// The DHI+ plan attached to `intent_id`, or `None` when the intent was
+    /// added without one or no plan row exists.
+    async fn get_intent_plan(&self, intent_id: IntentId) -> anyhow::Result<Option<IntentPlan>>;
 
     async fn claim_intent(
         &self,

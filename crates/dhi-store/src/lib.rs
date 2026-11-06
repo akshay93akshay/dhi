@@ -1,14 +1,14 @@
 //! PostgreSQL store for DHI.
 //!
-//! This crate owns the 23-table schema and the SQL used by the engine and API.
+//! This crate owns the 24-table schema and the SQL used by the engine and API.
 //! Every invariant that can be enforced by a constraint is enforced here.
 
 use chrono::{DateTime, Utc};
 use dhi_core::{
     Activity, AgentRole, AgentRun, Approval, ApprovalDecision, ApprovalId, ApprovalStatus,
     CheckpointId, Fact, FactState, Goal, GoalState, GuardDecision, GuardVerdict, Intent, IntentId,
-    IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus, RunId,
-    SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus, SideQuestionStatus,
+    IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus,
+    RunId, SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus, SideQuestionStatus,
     SideQuestionThread, Task, TaskId, TaskState, ToolCall, ToolCallId,
 };
 use sqlx::{FromRow, PgPool};
@@ -541,6 +541,47 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Intent::try_from).collect()
+    }
+
+    /// Upserts the DHI+ plan attached to `intent_id`.
+    ///
+    /// The plan row is audit data: it stays after the intent completes and is
+    /// only removed with the intent (or its task).
+    pub async fn save_intent_plan(
+        &self,
+        intent_id: IntentId,
+        plan: &IntentPlan,
+    ) -> Result<(), StoreError> {
+        let plan = serde_json::to_value(plan)
+            .map_err(|err| StoreError::InvalidValue(format!("intent plan: {err}")))?;
+        sqlx::query(
+            "INSERT INTO intent_plans (intent_id, plan)
+             VALUES ($1, $2)
+             ON CONFLICT (intent_id) DO UPDATE SET plan = EXCLUDED.plan",
+        )
+        .bind(intent_id)
+        .bind(plan)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The DHI+ plan attached to `intent_id`. `None` when the intent has no
+    /// plan row, including an unknown intent.
+    pub async fn get_intent_plan(
+        &self,
+        intent_id: IntentId,
+    ) -> Result<Option<IntentPlan>, StoreError> {
+        let plan: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT plan FROM intent_plans WHERE intent_id = $1")
+                .bind(intent_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        plan.map(|plan| {
+            serde_json::from_value(plan)
+                .map_err(|err| StoreError::InvalidValue(format!("intent plan: {err}")))
+        })
+        .transpose()
     }
 
     /// Atomic claim. Only one worker can move an intent from open to running.

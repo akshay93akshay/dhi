@@ -6,7 +6,7 @@ use chrono::{DateTime, Utc};
 use dhi_core::{
     Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, Fact, FactId, Goal, GoalId,
     GraphStore, GuardDecision, GuardDecisionId, GuardStore, GuardVerdict, Intent, IntentId,
-    IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus,
+    IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus,
     SideQuestionRequest, SideQuestionSession, SideQuestionThread, Task, TaskId, TaskState,
     ToolCall, ToolCallId,
 };
@@ -83,6 +83,14 @@ impl GraphStore for Store {
 
     async fn list_intents(&self, task_id: TaskId, limit: i64) -> anyhow::Result<Vec<Intent>> {
         Ok(Store::list_intents(self, task_id, limit).await?)
+    }
+
+    async fn save_intent_plan(&self, intent_id: IntentId, plan: &IntentPlan) -> anyhow::Result<()> {
+        Ok(Store::save_intent_plan(self, intent_id, plan).await?)
+    }
+
+    async fn get_intent_plan(&self, intent_id: IntentId) -> anyhow::Result<Option<IntentPlan>> {
+        Ok(Store::get_intent_plan(self, intent_id).await?)
     }
 
     async fn claim_intent(
