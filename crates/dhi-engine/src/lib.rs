@@ -11,20 +11,26 @@
 //! engine re-reads PostgreSQL and relies on the heartbeat plus
 //! `ResetRunningIntents` recovery. Activity rows record what happened.
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chrono::Utc;
 use dhi_agent::{AgentCall, AgentCallRecord, AgentRuntime, ExecuteInput, PlanInput, PlanOutcome};
 use dhi_core::{
-    AgentRun, ApprovalDecision, Fact, FactState, Goal, GoalState, GraphStore, GuardStore,
-    IntentState, Task, TaskState, ToolCallOutcome, ToolCallRequest,
+    AgentRun, ApprovalDecision, Fact, FactState, Goal, GoalState, GraphStore, GuardStore, Intent,
+    IntentPlan, IntentState, Task, TaskState, ToolCallOutcome, ToolCallRequest, Topology,
 };
 use dhi_guard::ToolExecutor;
+use dhi_orchestrator::{IntentResult, ManagerRunner, SwarmRunner, WorkerStatus};
 use tokio::sync::Notify;
 use tracing::warn;
 use uuid::Uuid;
+
+mod team;
+
+use team::RuntimeWorkerExecutor;
 
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 
@@ -98,6 +104,72 @@ fn agent_run<T>(
     }
 }
 
+/// Evidence for the one fact a team run records.
+///
+/// The deterministic aggregator already lists failed and skipped results;
+/// the explicit failed-worker line keeps the failure visible even if an
+/// aggregator implementation only returns successful evidence.
+fn team_evidence(result: &IntentResult) -> String {
+    let mut evidence = result.fact.evidence.trim().to_owned();
+    let failed: Vec<String> = result
+        .worker_results
+        .iter()
+        .filter(|worker| worker.status == WorkerStatus::Failed)
+        .map(|worker| match worker.error.as_deref() {
+            Some(error) if !error.is_empty() => format!("{} ({error})", worker.worker_key),
+            _ => format!("{} (unknown error)", worker.worker_key),
+        })
+        .collect();
+    if !failed.is_empty() {
+        if !evidence.is_empty() {
+            evidence.push('\n');
+        }
+        evidence.push_str(&format!("failed workers: {}", failed.join(", ")));
+    }
+    if evidence.is_empty() {
+        evidence = "no worker evidence".to_owned();
+    }
+    evidence
+}
+
+/// Fact provenance for a plan-executed intent.
+fn team_provenance(intent_id: Uuid, plan: &IntentPlan, result: &IntentResult) -> serde_json::Value {
+    let workers: Vec<serde_json::Value> = result
+        .worker_results
+        .iter()
+        .map(|worker_result| {
+            let role = plan
+                .workers
+                .iter()
+                .find(|worker| worker.key == worker_result.worker_key)
+                .map(|worker| worker.role.clone())
+                .unwrap_or_default();
+            let subtask = plan
+                .subtasks
+                .iter()
+                .find(|subtask| subtask.id == worker_result.subtask_id)
+                .map(|subtask| subtask.description.clone())
+                .unwrap_or_else(|| worker_result.subtask_id.clone());
+            serde_json::json!({
+                "key": worker_result.worker_key,
+                "role": role,
+                "status": worker_result.status.to_string(),
+                "subtask": subtask,
+                "error": worker_result.error,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        "intent_id": intent_id,
+        "detail": result.fact.detail,
+        "evidence": team_evidence(result),
+        "confidence": result.fact.confidence,
+        "topology": plan.topology.as_str(),
+        "workers": workers,
+    })
+}
+
 pub struct Engine {
     store: Arc<dyn GraphStore>,
     agent: Arc<dyn AgentRuntime>,
@@ -113,6 +185,12 @@ pub struct Engine {
     max_idle_ticks: usize,
     /// Consecutive spent rounds allowed without a new confirmed fact.
     max_no_progress_rounds: usize,
+    /// DHI+ plans keyed by the intent the planner created.
+    ///
+    /// In-memory only for now: persistence is the next phase. After a restart
+    /// this map is empty, so a planned intent falls back to the single-worker
+    /// path until plans are stored durably.
+    plans: Mutex<HashMap<Uuid, IntentPlan>>,
 }
 
 #[derive(Debug, Clone)]
@@ -135,6 +213,71 @@ impl Engine {
             max_rounds: 16,
             max_idle_ticks: DEFAULT_MAX_IDLE_TICKS,
             max_no_progress_rounds: DEFAULT_MAX_NO_PROGRESS_ROUNDS,
+            plans: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Remembers a planner-proposed execution plan for its new intent.
+    fn remember_plan(&self, intent_id: Uuid, plan: IntentPlan) {
+        self.plans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(intent_id, plan);
+    }
+
+    /// The plan attached to `intent_id`, if it is still in memory.
+    fn plan_for(&self, intent_id: Uuid) -> Option<IntentPlan> {
+        self.plans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&intent_id)
+            .cloned()
+    }
+
+    /// Drops a plan once its intent can no longer be executed.
+    fn forget_plan(&self, intent_id: Uuid) {
+        self.plans
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&intent_id);
+    }
+
+    /// Whether the activity stream says the intent was added with a plan.
+    ///
+    /// The map itself is not durable, so this marker is how a resumed intent
+    /// is distinguished from one the planner added without a plan.
+    async fn plan_was_recorded(&self, task_id: Uuid, intent_id: Uuid) -> anyhow::Result<bool> {
+        Ok(self
+            .store
+            .list_activity(task_id, Some("intents_added"))
+            .await?
+            .iter()
+            .any(|activity| {
+                activity.payload["intent_id"] == intent_id.to_string()
+                    && activity.payload["has_plan"].as_bool().unwrap_or(false)
+            }))
+    }
+
+    /// Runs a non-single plan through its topology's runner.
+    async fn run_team_plan(
+        &self,
+        task_id: Uuid,
+        task: &Task,
+        intent: &Intent,
+        plan: &IntentPlan,
+        facts: &[Fact],
+    ) -> anyhow::Result<IntentResult> {
+        let executor = Arc::new(RuntimeWorkerExecutor {
+            agent: Arc::clone(&self.agent),
+            task_id,
+            intent_id: intent.id,
+            context: facts.iter().map(|fact| fact.claim.clone()).collect(),
+            worker_profile_id: task.pinned_worker_profile_id,
+        });
+        match plan.topology {
+            Topology::ManagerWorker => ManagerRunner::new(executor).run(plan).await,
+            Topology::Swarm => SwarmRunner::new(executor).run(plan).await,
+            Topology::Single => unreachable!("single plans use the worker path"),
         }
     }
 
@@ -424,6 +567,7 @@ impl Engine {
                     self.store
                         .finish_intent(intent.id, IntentState::Stopped)
                         .await?;
+                    self.forget_plan(intent.id);
                 }
             }
             self.log_activity(
@@ -633,13 +777,7 @@ impl Engine {
                             .await?;
                         anyhow::bail!("{message}");
                     }
-                    PlanOutcome::AddIntent {
-                        description,
-                        plan: _,
-                    } => {
-                        // Plan execution is the next phase: for now an
-                        // optional DHI+ plan is accepted and ignored, and the
-                        // engine keeps its current single-worker behavior.
+                    PlanOutcome::AddIntent { description, plan } => {
                         if rounds >= self.max_rounds {
                             let reason =
                                 format!("engine exceeded max rounds ({})", self.max_rounds);
@@ -681,9 +819,18 @@ impl Engine {
                             anyhow::bail!("{reason}");
                         }
 
-                        self.store
+                        let intent = self
+                            .store
                             .add_intent(task_id, task.origin_fact_id, description)
                             .await?;
+                        let has_plan = plan.is_some();
+                        if let Some(plan) = plan {
+                            // The map is the first step only; plans become
+                            // durable in the next phase. The activity marker
+                            // below lets a restart tell a planned intent from
+                            // an ordinary single-worker one.
+                            self.remember_plan(intent.id, plan);
+                        }
                         // Only real work spends budget: a new intent is work.
                         rounds += 1;
                         idle_ticks = 0;
@@ -691,7 +838,11 @@ impl Engine {
                             task_id,
                             "intents_added",
                             "planner added one intent".to_string(),
-                            serde_json::json!({"round": rounds}),
+                            serde_json::json!({
+                                "round": rounds,
+                                "intent_id": intent.id,
+                                "has_plan": has_plan,
+                            }),
                         )
                         .await?;
                         // Adding an intent is a spent round, but only a new
@@ -827,6 +978,155 @@ impl Engine {
             .await?;
 
             let facts = self.store.list_facts(task_id).await?;
+
+            let plan = self.plan_for(claimed.id);
+            if plan.is_none() && self.plan_was_recorded(task_id, claimed.id).await? {
+                // Known limitation until plans are persisted: a restart loses
+                // the map, so the intent runs with the old single worker.
+                warn!(
+                    task_id = %task_id,
+                    intent_id = %claimed.id,
+                    "DHI+ plan is missing from engine memory; falling back to the \
+                     single-worker path. Plans are not persisted yet, so this is \
+                     expected after a restart."
+                );
+            }
+
+            if let Some(plan) = plan.filter(|plan| plan.topology != Topology::Single) {
+                let result = match self
+                    .run_team_plan(task_id, &task, &claimed, &plan, &facts)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(err) => {
+                        if stop_requested(stop.as_ref()) {
+                            return self
+                                .stopped_result(
+                                    task_id,
+                                    task,
+                                    rounds,
+                                    "stop requested during the team run",
+                                )
+                                .await;
+                        }
+                        let reason = format!("worker/engine: {err}");
+                        self.store
+                            .finish_intent(claimed.id, IntentState::Stopped)
+                            .await?;
+                        self.forget_plan(claimed.id);
+                        self.fail_task(task_id, &mut task, reason.clone(), "worker")
+                            .await?;
+                        anyhow::bail!("{reason}");
+                    }
+                };
+
+                if stop_requested(stop.as_ref()) {
+                    return self
+                        .stopped_result(task_id, task, rounds, "stop requested after the team run")
+                        .await;
+                }
+
+                let successes = result
+                    .worker_results
+                    .iter()
+                    .filter(|worker| worker.status == WorkerStatus::Ok)
+                    .count();
+                let failures = result
+                    .worker_results
+                    .iter()
+                    .filter(|worker| worker.status == WorkerStatus::Failed)
+                    .count();
+                let skipped = result
+                    .worker_results
+                    .iter()
+                    .filter(|worker| worker.status == WorkerStatus::Skipped)
+                    .count();
+
+                if successes == 0 {
+                    let reason = format!(
+                        "DHI+ {} team produced no successful worker result \
+                         ({failures} failed, {skipped} skipped)",
+                        plan.topology
+                    );
+                    self.store
+                        .finish_intent(claimed.id, IntentState::Stopped)
+                        .await?;
+                    self.forget_plan(claimed.id);
+                    self.log_activity(
+                        task_id,
+                        "team_failed",
+                        reason.clone(),
+                        serde_json::json!({
+                            "intent_id": claimed.id,
+                            "topology": plan.topology.as_str(),
+                            "workers": result.worker_results.len(),
+                            "success": successes,
+                            "failed": failures,
+                            "skipped": skipped,
+                        }),
+                    )
+                    .await?;
+                    self.fail_task(task_id, &mut task, reason.clone(), "worker")
+                        .await?;
+                    anyhow::bail!("{reason}");
+                }
+
+                self.log_activity(
+                    task_id,
+                    "team_run",
+                    format!(
+                        "{} team finished: {successes} succeeded, {failures} failed, \
+                         {skipped} skipped",
+                        plan.topology
+                    ),
+                    serde_json::json!({
+                        "intent_id": claimed.id,
+                        "topology": plan.topology.as_str(),
+                        "workers": result.worker_results.len(),
+                        "success": successes,
+                        "failed": failures,
+                        "skipped": skipped,
+                    }),
+                )
+                .await?;
+
+                let provenance = team_provenance(claimed.id, &plan, &result);
+                let fact = self
+                    .store
+                    .record_fact(task_id, result.fact.summary.clone(), provenance)
+                    .await?;
+                self.store
+                    .finish_intent(claimed.id, IntentState::Done)
+                    .await?;
+                self.forget_plan(claimed.id);
+                self.log_activity(
+                    task_id,
+                    "intent_done",
+                    format!("intent complete: {}", claimed.description),
+                    serde_json::json!({
+                        "intent_id": claimed.id,
+                        "fact_id": fact.id,
+                        "topology": plan.topology.as_str(),
+                    }),
+                )
+                .await?;
+
+                let updated_facts = self.store.list_facts(task_id).await?;
+                let confirmed_now = confirmed_fact_count(&updated_facts);
+                if self.note_no_progress(
+                    confirmed_now,
+                    &mut last_confirmed,
+                    &mut no_progress_rounds,
+                ) {
+                    let reason = self
+                        .fail_no_progress(task_id, &mut task, no_progress_rounds, rounds)
+                        .await?;
+                    anyhow::bail!("{reason}");
+                }
+                self.wake();
+                continue;
+            }
+
             let executed = match self
                 .agent
                 .execute(ExecuteInput {
@@ -852,6 +1152,7 @@ impl Engine {
                             )
                             .await;
                     }
+                    self.forget_plan(claimed.id);
                     self.fail_task(
                         task_id,
                         &mut task,
@@ -882,9 +1183,13 @@ impl Engine {
             // Guarded tool calls: every request passes the single choke point.
             // An `Ask` blocks inside the call until a decision or expiry; a
             // denial is logged and the round continues normally.
-            if !output.tool_calls.is_empty() {
-                self.run_tool_calls(task_id, claimed.id, &output.tool_calls)
-                    .await?;
+            if !output.tool_calls.is_empty()
+                && let Err(err) = self
+                    .run_tool_calls(task_id, claimed.id, &output.tool_calls)
+                    .await
+            {
+                self.forget_plan(claimed.id);
+                return Err(err);
             }
 
             // Worker completion is this fact draft. The summary becomes the
@@ -905,6 +1210,7 @@ impl Engine {
             self.store
                 .finish_intent(claimed.id, IntentState::Done)
                 .await?;
+            self.forget_plan(claimed.id);
             self.log_activity(
                 task_id,
                 "intent_done",
@@ -1019,6 +1325,7 @@ mod tests {
     };
     use dhi_guard::Policy;
     use dhi_guard::executor::{GuardedExecutor, ToolBackend, ToolExecutor};
+    use dhi_orchestrator::{CapabilityLimits, Subtask, WorkerSpec};
     use dhi_testkit::MemoryStore;
     use serde_json::json;
     use std::sync::Mutex;
@@ -1118,6 +1425,73 @@ mod tests {
 
         fn name(&self) -> &str {
             "scripted"
+        }
+    }
+
+    /// What one subtask's worker turn should do.
+    #[derive(Clone)]
+    enum TeamWorker {
+        Success(&'static str),
+        Failure(&'static str),
+    }
+
+    /// Scripted planner plus per-subtask worker scripts. Worker responses are
+    /// keyed by the subtask description, so the manager and swarm runners can
+    /// execute in any order without making the test order-dependent.
+    struct TeamAgent {
+        planner: ScriptedAgent,
+        workers: Mutex<HashMap<String, TeamWorker>>,
+        calls: Mutex<Vec<ExecuteInput>>,
+    }
+
+    impl TeamAgent {
+        fn new(plans: Vec<ScriptedPlan>, workers: Vec<(&str, TeamWorker)>) -> Self {
+            Self {
+                planner: ScriptedAgent::with_plans(plans, vec![]),
+                workers: Mutex::new(
+                    workers
+                        .into_iter()
+                        .map(|(subtask, script)| (subtask.to_string(), script))
+                        .collect(),
+                ),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<ExecuteInput> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRuntime for TeamAgent {
+        async fn plan(
+            &self,
+            input: PlanInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<PlanOutcome>> {
+            self.planner.plan(input).await
+        }
+
+        async fn execute(
+            &self,
+            input: ExecuteInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<dhi_agent::ExecuteOutput>> {
+            self.calls.lock().unwrap().push(input.clone());
+            let script = self
+                .workers
+                .lock()
+                .unwrap()
+                .get(&input.intent)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("unexpected team subtask: {}", input.intent))?;
+            match script {
+                TeamWorker::Success(summary) => Ok(unrecorded(execute_output(&summary, vec![]))),
+                TeamWorker::Failure(error) => Err(anyhow::anyhow!(error)),
+            }
+        }
+
+        fn name(&self) -> &str {
+            "team"
         }
     }
 
@@ -1343,6 +1717,59 @@ mod tests {
         PlanOutcome::NoPlan {
             reason: "nothing to do yet".to_string(),
         }
+    }
+
+    fn team_worker(key: &str, role: &str) -> WorkerSpec {
+        WorkerSpec {
+            key: key.to_string(),
+            role: role.to_string(),
+            prompt: format!("act as {role}"),
+            max_turns: 1,
+        }
+    }
+
+    fn team_subtask(id: &str, description: &str, worker_key: &str) -> Subtask {
+        Subtask {
+            id: id.to_string(),
+            description: description.to_string(),
+            worker_key: Some(worker_key.to_string()),
+        }
+    }
+
+    /// A two-worker plan with one explicitly assigned subtask per worker.
+    fn two_worker_plan(intent: &str, topology: Topology) -> IntentPlan {
+        IntentPlan {
+            intent: intent.to_string(),
+            topology,
+            workers: vec![
+                team_worker("alpha", "researcher"),
+                team_worker("beta", "critic"),
+            ],
+            subtasks: vec![
+                team_subtask("s1", "subtask one", "alpha"),
+                team_subtask("s2", "subtask two", "beta"),
+            ],
+            limits: CapabilityLimits::default(),
+        }
+    }
+
+    fn planned_intent(description: &str, plan: IntentPlan) -> PlanOutcome {
+        PlanOutcome::AddIntent {
+            description: description.to_string(),
+            plan: Some(plan),
+        }
+    }
+
+    /// Completed team intent plus the planner proof of its one fact.
+    fn team_completion_plans(
+        description: &str,
+        plan: IntentPlan,
+        goal_id: Uuid,
+    ) -> Vec<ScriptedPlan> {
+        vec![
+            ScriptedPlan::Outcome(planned_intent(description, plan)),
+            ScriptedPlan::ProveFirstConfirmed { goal_id },
+        ]
     }
 
     fn fact_draft(summary: &str) -> dhi_agent::FactDraft {
@@ -3507,6 +3934,339 @@ mod tests {
         let json = serde_json::to_value(&output).unwrap();
         assert!(json.get("accepted").is_none(), "{json}");
         assert!(json.get("result").is_none(), "{json}");
+    }
+
+    // ---------- DHI+ plan execution ----------
+
+    #[tokio::test]
+    async fn manager_worker_plan_records_exactly_one_fact() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("team task", 4);
+        let goal = seed_goal(&store, &task).await;
+        let plan = two_worker_plan("team work", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("team work", plan, goal.id),
+            vec![
+                ("subtask one", TeamWorker::Success("finding one")),
+                ("subtask two", TeamWorker::Success("finding two")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone());
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(agent.calls().len(), 2, "both workers ran once");
+
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 2, "origin fact plus exactly one team fact");
+        let team_fact = facts
+            .iter()
+            .find(|fact| fact.id != task.origin_fact_id)
+            .expect("the team fact");
+        assert!(team_fact.claim.contains("finding one"), "{team_fact:?}");
+        assert!(team_fact.claim.contains("finding two"), "{team_fact:?}");
+        assert_eq!(team_fact.provenance["topology"], "manager_worker");
+        assert_eq!(team_fact.provenance["workers"].as_array().unwrap().len(), 2);
+
+        let intents = store.intents(task.id);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].state, IntentState::Done);
+        assert_eq!(team_fact.provenance["intent_id"], intents[0].id.to_string());
+
+        let team_run = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "team_run")
+            .expect("team_run activity");
+        assert_eq!(team_run.payload["topology"], "manager_worker");
+        assert_eq!(team_run.payload["success"], 2);
+        assert_eq!(team_run.payload["failed"], 0);
+        assert!(engine.plans.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn partially_failed_team_records_one_fact_naming_the_failure() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("partial team", 4);
+        let goal = seed_goal(&store, &task).await;
+        let plan = two_worker_plan("partial work", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("partial work", plan, goal.id),
+            vec![
+                ("subtask one", TeamWorker::Success("the surviving finding")),
+                ("subtask two", TeamWorker::Failure("beta exploded")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 2, "origin fact plus one aggregated fact");
+        let team_fact = facts
+            .iter()
+            .find(|fact| fact.id != task.origin_fact_id)
+            .expect("the team fact");
+        assert!(team_fact.claim.contains("the surviving finding"));
+        let evidence = team_fact.provenance["evidence"]
+            .as_str()
+            .expect("evidence text");
+        assert!(evidence.contains("beta"), "{evidence}");
+        assert!(evidence.contains("beta exploded"), "{evidence}");
+        let workers = team_fact.provenance["workers"].as_array().unwrap();
+        let failed = workers
+            .iter()
+            .find(|worker| worker["key"] == "beta")
+            .expect("beta result");
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["error"], "beta exploded");
+
+        let team_run = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "team_run")
+            .expect("team_run activity");
+        assert_eq!(team_run.payload["success"], 1);
+        assert_eq!(team_run.payload["failed"], 1);
+        assert_eq!(store.intents(task.id)[0].state, IntentState::Done);
+    }
+
+    #[tokio::test]
+    async fn all_workers_failed_records_no_fact_and_fails_the_task() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("failed team", 4);
+        let plan = two_worker_plan("doomed work", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            vec![ScriptedPlan::Outcome(planned_intent("doomed work", plan))],
+            vec![
+                ("subtask one", TeamWorker::Failure("alpha exploded")),
+                ("subtask two", TeamWorker::Failure("beta exploded")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent);
+
+        let err = engine
+            .run_task(task.id)
+            .await
+            .expect_err("a team with no finding fails the task");
+        assert!(
+            err.to_string().contains("no successful worker result"),
+            "{err}"
+        );
+
+        assert_eq!(
+            store.get_task(task.id).await.unwrap().unwrap().state,
+            TaskState::Failed
+        );
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 1, "only the origin fact exists");
+        assert_eq!(facts[0].id, task.origin_fact_id);
+        let intents = store.intents(task.id);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].state, IntentState::Stopped);
+        assert!(engine.plans.lock().unwrap().is_empty());
+
+        let activities = store.activities(task.id);
+        assert!(
+            activities
+                .iter()
+                .any(|activity| activity.kind == "team_failed"),
+            "a team failure leaves an activity row"
+        );
+        let failed = activities
+            .iter()
+            .find(|activity| activity.kind == "task_failed")
+            .expect("task_failed activity");
+        assert_eq!(failed.payload["source"], "worker");
+    }
+
+    #[tokio::test]
+    async fn invalid_plan_fails_the_task_with_a_worker_engine_reason() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("broken plan", 4);
+        let plan = IntentPlan {
+            intent: "broken work".to_string(),
+            topology: Topology::ManagerWorker,
+            workers: vec![],
+            subtasks: vec![team_subtask("s1", "unassigned work", "missing")],
+            limits: CapabilityLimits::default(),
+        };
+        let agent = Arc::new(TeamAgent::new(
+            vec![ScriptedPlan::Outcome(planned_intent("broken work", plan))],
+            vec![],
+        ));
+        let engine = Engine::new(store.clone(), agent);
+
+        let err = engine
+            .run_task(task.id)
+            .await
+            .expect_err("an invalid plan fails the task");
+        assert!(err.to_string().contains("worker/engine"), "{err}");
+
+        assert_eq!(
+            store.get_task(task.id).await.unwrap().unwrap().state,
+            TaskState::Failed
+        );
+        assert_eq!(store.facts(task.id).len(), 1, "only the origin fact exists");
+        assert_eq!(store.intents(task.id)[0].state, IntentState::Stopped);
+        assert!(engine.plans.lock().unwrap().is_empty());
+        let failed = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "task_failed")
+            .expect("task_failed activity");
+        assert_eq!(failed.payload["source"], "worker");
+        assert!(
+            failed.payload["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("worker/engine")
+        );
+    }
+
+    #[tokio::test]
+    async fn swarm_plan_records_one_fact() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("swarm task", 4);
+        let goal = seed_goal(&store, &task).await;
+        let plan = two_worker_plan("swarm work", Topology::Swarm);
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("swarm work", plan, goal.id),
+            vec![
+                ("subtask one", TeamWorker::Success("swarm finding one")),
+                ("subtask two", TeamWorker::Success("swarm finding two")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone());
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(agent.calls().len(), 2, "each peer ran its seed once");
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 2, "origin fact plus exactly one team fact");
+        let team_fact = facts
+            .iter()
+            .find(|fact| fact.id != task.origin_fact_id)
+            .expect("the team fact");
+        assert_eq!(team_fact.provenance["topology"], "swarm");
+        assert_eq!(team_fact.provenance["workers"].as_array().unwrap().len(), 2);
+        let team_run = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "team_run")
+            .expect("team_run activity");
+        assert_eq!(team_run.payload["topology"], "swarm");
+        assert_eq!(team_run.payload["success"], 2);
+        assert_eq!(store.intents(task.id)[0].state, IntentState::Done);
+    }
+
+    #[tokio::test]
+    async fn no_plan_intent_keeps_the_single_worker_path() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("single path", 4);
+        let goal = seed_goal(&store, &task).await;
+        let agent = Arc::new(ScriptedAgent::with_plans(
+            completion_plans("single work", goal.id),
+            vec![execute_output("single worker finding", vec![])],
+        ));
+        let engine = Engine::new(store.clone(), agent);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 2, "origin fact plus one worker fact");
+        let worker_fact = facts
+            .iter()
+            .find(|fact| fact.id != task.origin_fact_id)
+            .expect("the worker fact");
+        assert_eq!(worker_fact.claim, "single worker finding");
+        assert!(
+            worker_fact.provenance.get("topology").is_none(),
+            "the single path writes no team provenance"
+        );
+        assert!(
+            !store
+                .activities(task.id)
+                .iter()
+                .any(|activity| activity.kind == "team_run"),
+            "the single path never runs a team"
+        );
+        assert!(engine.plans.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_plan_on_resume_falls_back_to_single_worker() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("resume fallback", 4);
+        let goal = seed_goal(&store, &task).await;
+        // Simulate a planned intent added by a previous process: its activity
+        // marker survives, but the new engine's in-memory map is empty.
+        let intent = store
+            .add_intent(task.id, task.origin_fact_id, "resumed work".to_string())
+            .await
+            .unwrap();
+        store
+            .append_activity(
+                task.id,
+                "intents_added",
+                "planner added one intent".to_string(),
+                json!({"round": 1, "intent_id": intent.id, "has_plan": true}),
+            )
+            .await
+            .unwrap();
+
+        let agent = Arc::new(ScriptedAgent::with_plans(
+            vec![ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id }],
+            vec![execute_output("fallback finding", vec![])],
+        ));
+        let engine = Engine::new(store.clone(), agent);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        let facts = store.facts(task.id);
+        let fallback = facts
+            .iter()
+            .find(|fact| fact.claim == "fallback finding")
+            .expect("the single worker ran");
+        assert!(
+            fallback.provenance.get("topology").is_none(),
+            "a resumed intent without its plan uses single-worker provenance"
+        );
+        assert_eq!(store.intents(task.id)[0].state, IntentState::Done);
+    }
+
+    #[tokio::test]
+    async fn completed_plan_is_removed_from_the_engine_map() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("cleanup task", 4);
+        let plan = two_worker_plan("cleanup work", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            vec![
+                ScriptedPlan::Outcome(planned_intent("cleanup work", plan)),
+                ScriptedPlan::Outcome(idle_plan()),
+            ],
+            vec![
+                ("subtask one", TeamWorker::Success("one")),
+                ("subtask two", TeamWorker::Success("two")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent)
+            .with_heartbeat(Duration::from_millis(10))
+            .with_max_idle_ticks(1);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Timeout);
+        assert_eq!(store.intents(task.id)[0].state, IntentState::Done);
+        assert!(
+            engine.plans.lock().unwrap().is_empty(),
+            "a finished intent drops its plan"
+        );
     }
 
     // ---------- heartbeat ----------

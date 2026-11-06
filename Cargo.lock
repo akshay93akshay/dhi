@@ -2154,6 +2154,7 @@ dependencies = [
  "dhi-agent",
  "dhi-core",
  "dhi-guard",
+ "dhi-orchestrator",
  "dhi-testkit",
  "serde_json",
  "tokio",
