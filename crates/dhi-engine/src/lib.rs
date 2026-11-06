@@ -33,6 +33,10 @@ const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 /// always answers `done: false` with no intents would hibernate forever.
 const DEFAULT_MAX_IDLE_TICKS: usize = 120;
 
+/// Consecutive spent rounds without a new confirmed fact before the engine
+/// stops a task. This is a safety ceiling, not a work target.
+const DEFAULT_MAX_NO_PROGRESS_ROUNDS: usize = 16;
+
 /// Backoff after losing a claim race, so an engine never busy-spins on the
 /// same open intent.
 const CLAIM_BACKOFF: Duration = Duration::from_millis(50);
@@ -41,6 +45,15 @@ const CLAIM_BACKOFF: Duration = Duration::from_millis(50);
 /// caller did not wire cancellation (`run_task`).
 fn stop_requested(stop: Option<&Arc<AtomicBool>>) -> bool {
     stop.is_some_and(|flag| flag.load(Ordering::SeqCst))
+}
+
+/// Confirmed facts are the engine's progress measure; the task's origin fact
+/// is not confirmed.
+fn confirmed_fact_count(facts: &[Fact]) -> usize {
+    facts
+        .iter()
+        .filter(|fact| fact.state == FactState::Confirmed)
+        .count()
 }
 
 /// The `agent_runs` row one recorded call becomes.
@@ -98,6 +111,8 @@ pub struct Engine {
     heartbeat: Duration,
     max_rounds: usize,
     max_idle_ticks: usize,
+    /// Consecutive spent rounds allowed without a new confirmed fact.
+    max_no_progress_rounds: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -119,11 +134,20 @@ impl Engine {
             heartbeat: DEFAULT_HEARTBEAT,
             max_rounds: 16,
             max_idle_ticks: DEFAULT_MAX_IDLE_TICKS,
+            max_no_progress_rounds: DEFAULT_MAX_NO_PROGRESS_ROUNDS,
         }
     }
 
     pub fn with_max_rounds(mut self, max_rounds: usize) -> Self {
         self.max_rounds = max_rounds;
+        self
+    }
+
+    /// How many consecutive spent rounds may pass without a new confirmed
+    /// fact before the task fails. Idle ticks are not rounds and never count.
+    /// A zero value is treated as one so the guard can never be disabled.
+    pub fn with_max_no_progress_rounds(mut self, max_no_progress_rounds: usize) -> Self {
+        self.max_no_progress_rounds = max_no_progress_rounds.max(1);
         self
     }
 
@@ -240,6 +264,52 @@ impl Engine {
         )
         .await?;
         Ok(())
+    }
+
+    /// Charges one spent round to the no-progress ledger and returns whether
+    /// the configured limit is reached. Idle/heartbeat ticks never call this.
+    fn note_no_progress(
+        &self,
+        confirmed: usize,
+        last_confirmed: &mut usize,
+        no_progress_rounds: &mut usize,
+    ) -> bool {
+        if confirmed > *last_confirmed {
+            *no_progress_rounds = 0;
+        } else {
+            *no_progress_rounds += 1;
+        }
+        *last_confirmed = confirmed;
+        *no_progress_rounds >= self.max_no_progress_rounds
+    }
+
+    /// Records the `no_progress` activity row, fails the task with source
+    /// `engine`, and returns the reason for the caller to propagate.
+    async fn fail_no_progress(
+        &self,
+        task_id: Uuid,
+        task: &mut Task,
+        no_progress_rounds: usize,
+        rounds: usize,
+    ) -> anyhow::Result<String> {
+        let reason = format!(
+            "engine made no progress for {} rounds",
+            self.max_no_progress_rounds
+        );
+        self.log_activity(
+            task_id,
+            "no_progress",
+            reason.clone(),
+            serde_json::json!({
+                "rounds": no_progress_rounds,
+                "limit": self.max_no_progress_rounds,
+                "round": rounds,
+            }),
+        )
+        .await?;
+        self.fail_task(task_id, task, reason.clone(), "engine")
+            .await?;
+        Ok(reason)
     }
 
     /// Records an `approval_expired` activity row for an expired approval,
@@ -412,6 +482,11 @@ impl Engine {
         }
 
         let mut rounds = 0;
+        // Consecutive spent rounds without a new confirmed fact. The baseline
+        // is the task's current confirmed count, so a reopened task does not
+        // count facts from its previous epoch as new progress.
+        let mut no_progress_rounds = 0;
+        let mut last_confirmed = confirmed_fact_count(&self.store.list_facts(task_id).await?);
         // Consecutive idle planner ticks. Reset to zero on every real
         // intent, so only a genuinely stuck task ever exhausts this budget.
         let mut idle_ticks = 0;
@@ -613,6 +688,20 @@ impl Engine {
                             serde_json::json!({"round": rounds}),
                         )
                         .await?;
+                        // Adding an intent is a spent round, but only a new
+                        // confirmed fact counts as progress. A worker fact
+                        // from the previous round resets the ledger here.
+                        let confirmed_now = confirmed_fact_count(&facts);
+                        if self.note_no_progress(
+                            confirmed_now,
+                            &mut last_confirmed,
+                            &mut no_progress_rounds,
+                        ) {
+                            let reason = self
+                                .fail_no_progress(task_id, &mut task, no_progress_rounds, rounds)
+                                .await?;
+                            anyhow::bail!("{reason}");
+                        }
                         // The new work may already be claimable: nudge
                         // ourselves.
                         self.wake();
@@ -671,6 +760,11 @@ impl Engine {
                         };
                         rounds += 1;
                         idle_ticks = 0;
+                        // A successful proof moves a goal to met even though
+                        // it adds no fact: it is real progress, so it resets
+                        // the no-progress ledger.
+                        no_progress_rounds = 0;
+                        last_confirmed = confirmed_fact_count(&facts);
 
                         if all_met {
                             self.store
@@ -812,6 +906,17 @@ impl Engine {
                 serde_json::json!({"intent_id": claimed.id, "fact_id": fact.id}),
             )
             .await?;
+            // A worker round that confirms a fact is progress. Re-read the
+            // count rather than assuming the stored state: a store may accept
+            // a draft fact without confirming it.
+            let updated_facts = self.store.list_facts(task_id).await?;
+            let confirmed_now = confirmed_fact_count(&updated_facts);
+            if self.note_no_progress(confirmed_now, &mut last_confirmed, &mut no_progress_rounds) {
+                let reason = self
+                    .fail_no_progress(task_id, &mut task, no_progress_rounds, rounds)
+                    .await?;
+                anyhow::bail!("{reason}");
+            }
             self.wake();
         }
     }
@@ -901,7 +1006,11 @@ impl Engine {
 mod tests {
     use super::*;
     use dhi_agent::{AgentCallRecord, MockAgentRuntime, PlanOutcome, Role};
-    use dhi_core::{AgentRole, Approval, ApprovalStatus, FactState, Goal, GoalState, GuardVerdict};
+    use dhi_core::{
+        Activity, AgentRole, Approval, ApprovalStatus, FactId, FactState, Goal, GoalId, GoalState,
+        GuardVerdict, Intent, IntentId, NewSideQuestionRequest, ReopenOutcome, ResultRecord,
+        ResultStatus, SideQuestionRequest, SideQuestionSession, SideQuestionThread, TaskId,
+    };
     use dhi_guard::Policy;
     use dhi_guard::executor::{GuardedExecutor, ToolBackend, ToolExecutor};
     use dhi_testkit::MemoryStore;
@@ -2629,6 +2738,380 @@ mod tests {
         // One round to add the intent, one to claim and execute it, one to
         // prove the goal. The five idle heartbeats in between spend nothing.
         assert_eq!(result.rounds, 3);
+    }
+
+    #[tokio::test]
+    async fn max_rounds_stops_a_task_at_the_configured_value() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("round cap", 100);
+        let engine = Engine::new(
+            store.clone(),
+            Arc::new(ScriptedAgent::new(
+                vec![
+                    single_intent_plan("first"),
+                    single_intent_plan("second"),
+                    single_intent_plan("third"),
+                ],
+                vec![
+                    execute_output("fact one", vec![]),
+                    execute_output("fact two", vec![]),
+                    execute_output("fact three", vec![]),
+                ],
+            )),
+        )
+        .with_max_rounds(3)
+        .with_max_no_progress_rounds(16);
+
+        let err = engine
+            .run_task(task.id)
+            .await
+            .expect_err("the round cap ends the task");
+        assert!(
+            err.to_string().contains("engine exceeded max rounds (3)"),
+            "{err}"
+        );
+
+        let row = store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Failed);
+        let failed = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "task_failed")
+            .expect("failure row");
+        assert_eq!(failed.payload["source"], "engine");
+    }
+
+    #[tokio::test]
+    async fn no_progress_guard_does_not_stop_a_task_that_confirms_facts() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("steady progress", 100);
+        let goal = seed_goal(&store, &task).await;
+        let engine = Engine::new(
+            store.clone(),
+            Arc::new(ScriptedAgent::with_plans(
+                vec![
+                    ScriptedPlan::Outcome(single_intent_plan("step one")),
+                    ScriptedPlan::Outcome(single_intent_plan("step two")),
+                    ScriptedPlan::Outcome(single_intent_plan("step three")),
+                    ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+                ],
+                vec![
+                    execute_output("fact one", vec![]),
+                    execute_output("fact two", vec![]),
+                    execute_output("fact three", vec![]),
+                ],
+            )),
+        )
+        .with_max_rounds(16)
+        .with_max_no_progress_rounds(2);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(result.facts, 4, "the origin fact plus three worker facts");
+        assert!(
+            !store
+                .activities(task.id)
+                .iter()
+                .any(|activity| activity.kind == "no_progress"),
+            "facts across rounds are progress"
+        );
+    }
+
+    /// A store whose worker facts are accepted but never persisted. It
+    /// simulates a worker that records no facts, so the confirmed count can
+    /// never move and a planner that keeps adding intents is genuinely stuck.
+    struct FactlessStore {
+        inner: Arc<MemoryStore>,
+    }
+
+    #[async_trait::async_trait]
+    impl GraphStore for FactlessStore {
+        async fn create_task(&self, goal: String, bound: i32) -> anyhow::Result<Task> {
+            self.inner.create_task(goal, bound).await
+        }
+
+        async fn create_task_with_pins(
+            &self,
+            goal: String,
+            bound: i32,
+            planner_pin: Option<i64>,
+            worker_pin: Option<i64>,
+        ) -> anyhow::Result<Task> {
+            self.inner
+                .create_task_with_pins(goal, bound, planner_pin, worker_pin)
+                .await
+        }
+
+        async fn get_task(&self, id: TaskId) -> anyhow::Result<Option<Task>> {
+            self.inner.get_task(id).await
+        }
+
+        async fn list_tasks(&self, limit: i64) -> anyhow::Result<Vec<Task>> {
+            self.inner.list_tasks(limit).await
+        }
+
+        async fn set_task_state_guarded(
+            &self,
+            id: TaskId,
+            state: TaskState,
+        ) -> anyhow::Result<bool> {
+            self.inner.set_task_state_guarded(id, state).await
+        }
+
+        async fn add_goal(&self, task_id: TaskId, description: String) -> anyhow::Result<Goal> {
+            self.inner.add_goal(task_id, description).await
+        }
+
+        async fn list_goals(&self, task_id: TaskId) -> anyhow::Result<Vec<Goal>> {
+            self.inner.list_goals(task_id).await
+        }
+
+        async fn reopen_task_with_goal(
+            &self,
+            task_id: TaskId,
+            description: String,
+        ) -> anyhow::Result<ReopenOutcome> {
+            self.inner.reopen_task_with_goal(task_id, description).await
+        }
+
+        async fn prove_goal(
+            &self,
+            task_id: TaskId,
+            goal_id: GoalId,
+            fact_id: FactId,
+            reason: String,
+        ) -> anyhow::Result<bool> {
+            self.inner
+                .prove_goal(task_id, goal_id, fact_id, reason)
+                .await
+        }
+
+        async fn add_intent(
+            &self,
+            task_id: TaskId,
+            fact_id: FactId,
+            description: String,
+        ) -> anyhow::Result<Intent> {
+            self.inner.add_intent(task_id, fact_id, description).await
+        }
+
+        async fn list_open_intents(
+            &self,
+            task_id: TaskId,
+            limit: i64,
+        ) -> anyhow::Result<Vec<Intent>> {
+            self.inner.list_open_intents(task_id, limit).await
+        }
+
+        async fn list_intents(&self, task_id: TaskId, limit: i64) -> anyhow::Result<Vec<Intent>> {
+            self.inner.list_intents(task_id, limit).await
+        }
+
+        async fn claim_intent(
+            &self,
+            intent_id: IntentId,
+            owner: &str,
+        ) -> anyhow::Result<Option<Intent>> {
+            self.inner.claim_intent(intent_id, owner).await
+        }
+
+        async fn resume_intent(
+            &self,
+            intent_id: IntentId,
+            owner: &str,
+        ) -> anyhow::Result<Option<Intent>> {
+            self.inner.resume_intent(intent_id, owner).await
+        }
+
+        async fn finish_intent(
+            &self,
+            intent_id: IntentId,
+            state: IntentState,
+        ) -> anyhow::Result<()> {
+            self.inner.finish_intent(intent_id, state).await
+        }
+
+        async fn finish_paused_intent(
+            &self,
+            intent_id: IntentId,
+            owner: &str,
+            status: IntentState,
+        ) -> anyhow::Result<Option<Intent>> {
+            self.inner
+                .finish_paused_intent(intent_id, owner, status)
+                .await
+        }
+
+        async fn block_orphaned_paused_intents(&self, task_id: TaskId) -> anyhow::Result<usize> {
+            self.inner.block_orphaned_paused_intents(task_id).await
+        }
+
+        async fn reset_running_intents(&self) -> anyhow::Result<usize> {
+            self.inner.reset_running_intents().await
+        }
+
+        async fn record_fact(
+            &self,
+            task_id: TaskId,
+            claim: String,
+            provenance: serde_json::Value,
+        ) -> anyhow::Result<Fact> {
+            // Accepted but never persisted or confirmed: the confirmed count
+            // cannot move.
+            Ok(Fact {
+                id: Uuid::new_v4(),
+                task_id,
+                claim,
+                state: FactState::Origin,
+                provenance,
+                origin_of: None,
+                created_at: Utc::now(),
+            })
+        }
+
+        async fn list_facts(&self, task_id: TaskId) -> anyhow::Result<Vec<Fact>> {
+            self.inner.list_facts(task_id).await
+        }
+
+        async fn record_result(
+            &self,
+            task_id: TaskId,
+            intent_id: IntentId,
+            claim: String,
+            acceptance: ResultStatus,
+            evidence: serde_json::Value,
+        ) -> anyhow::Result<ResultRecord> {
+            self.inner
+                .record_result(task_id, intent_id, claim, acceptance, evidence)
+                .await
+        }
+
+        async fn list_results(
+            &self,
+            task_id: TaskId,
+            limit: i64,
+        ) -> anyhow::Result<Vec<ResultRecord>> {
+            self.inner.list_results(task_id, limit).await
+        }
+
+        async fn append_activity(
+            &self,
+            task_id: TaskId,
+            kind: &str,
+            message: String,
+            payload: serde_json::Value,
+        ) -> anyhow::Result<Activity> {
+            self.inner
+                .append_activity(task_id, kind, message, payload)
+                .await
+        }
+
+        async fn list_activity(
+            &self,
+            task_id: TaskId,
+            kind: Option<&str>,
+        ) -> anyhow::Result<Vec<Activity>> {
+            self.inner.list_activity(task_id, kind).await
+        }
+
+        fn save_agent_run<'a>(
+            &'a self,
+            run: &'a AgentRun,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+        {
+            self.inner.save_agent_run(run)
+        }
+
+        async fn list_agent_runs(&self, task_id: TaskId) -> anyhow::Result<Vec<AgentRun>> {
+            self.inner.list_agent_runs(task_id).await
+        }
+
+        async fn create_side_question_session(
+            &self,
+            task_id: TaskId,
+            snapshot: serde_json::Value,
+        ) -> anyhow::Result<SideQuestionSession> {
+            self.inner
+                .create_side_question_session(task_id, snapshot)
+                .await
+        }
+
+        async fn get_open_side_question_session(
+            &self,
+            task_id: TaskId,
+        ) -> anyhow::Result<Option<SideQuestionSession>> {
+            self.inner.get_open_side_question_session(task_id).await
+        }
+
+        async fn get_side_question_session(
+            &self,
+            session_id: Uuid,
+        ) -> anyhow::Result<Option<SideQuestionSession>> {
+            self.inner.get_side_question_session(session_id).await
+        }
+
+        async fn list_side_question_sessions(
+            &self,
+            task_id: TaskId,
+        ) -> anyhow::Result<Vec<SideQuestionThread>> {
+            self.inner.list_side_question_sessions(task_id).await
+        }
+
+        async fn append_side_question(
+            &self,
+            request: NewSideQuestionRequest,
+        ) -> anyhow::Result<SideQuestionRequest> {
+            self.inner.append_side_question(request).await
+        }
+    }
+
+    #[tokio::test]
+    async fn no_progress_guard_stops_a_planner_that_adds_intents_without_facts() {
+        let inner = Arc::new(MemoryStore::new());
+        let task = inner.seed_task("planner spin", 100);
+        let plans: Vec<ScriptedPlan> = (0..10)
+            .map(|i| ScriptedPlan::Outcome(single_intent_plan(&format!("intent {i}"))))
+            .collect();
+        let executes: Vec<dhi_agent::ExecuteOutput> = (0..10)
+            .map(|i| execute_output(&format!("ignored fact {i}"), vec![]))
+            .collect();
+        let engine = Engine::new(
+            Arc::new(FactlessStore {
+                inner: inner.clone(),
+            }),
+            Arc::new(ScriptedAgent::with_plans(plans, executes)),
+        )
+        .with_max_rounds(100)
+        .with_max_no_progress_rounds(3);
+
+        let err = engine
+            .run_task(task.id)
+            .await
+            .expect_err("the no-progress guard stops the spin");
+        assert!(
+            err.to_string()
+                .contains("engine made no progress for 3 rounds"),
+            "{err}"
+        );
+
+        let row = inner.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Failed);
+        let activities = inner.activities(task.id);
+        let no_progress = activities
+            .iter()
+            .find(|activity| activity.kind == "no_progress")
+            .expect("the guard leaves an activity row before failing");
+        assert_eq!(no_progress.payload["limit"], 3);
+        let failed = activities
+            .iter()
+            .find(|activity| activity.kind == "task_failed")
+            .expect("failure row");
+        assert_eq!(failed.payload["source"], "engine");
+        assert_eq!(
+            failed.payload["reason"],
+            "engine made no progress for 3 rounds"
+        );
     }
 
     // ---------- idle budget ----------

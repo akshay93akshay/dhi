@@ -141,6 +141,8 @@ Main settings:
 - `DHI_LLM_BASE_URL`, `DHI_LLM_API_KEY`, `DHI_LLM_PLANNER_MODEL`, `DHI_LLM_WORKER_MODEL` — LLM endpoint and models; other OpenAI-compatible endpoints work
 - `DHI_MANAGER_MAX_TURNS` — manager turn budget when specialists are enabled
 - `DHI_MAX_DELEGATIONS` — maximum delegation calls per manager run
+- `DHI_ENGINE_MAX_ROUNDS` — total planner rounds for a task run before the engine stops it; default `64`
+- `DHI_ENGINE_NO_PROGRESS_ROUNDS` — consecutive rounds without a new confirmed fact before the engine stops the task; default `16`
 - `TINYFISH_API_KEY`, `PARALLEL_API_KEY`, `FIRECRAWL_API_KEY`, `DHI_WEB_PROVIDER` — web tool providers
 
 On first boot, DHI seeds guard rules plus LLM profiles and settings when an LLM key is configured. After that, PostgreSQL is the source of truth and profiles and rules are managed from the settings UI or API.
