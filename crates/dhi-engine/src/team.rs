@@ -54,14 +54,28 @@ impl WorkerExecutor for RuntimeWorkerExecutor {
 
         match executed {
             Ok(call) => {
-                let fact = call.output.fact;
+                let dhi_agent::AgentCall {
+                    output,
+                    meta,
+                    prompt,
+                    response,
+                    thinking,
+                } = call;
+                let fact = output.fact;
                 let evidence = fact_evidence(&fact);
-                Ok(WorkerResult::ok(
+                let mut result = WorkerResult::ok(
                     worker.key.clone(),
                     subtask.id.clone(),
                     fact.summary,
                     evidence,
-                ))
+                );
+                // Audit is best-effort data: an empty field never fails the
+                // worker, and the engine skips results with no call records.
+                result.call_meta = meta;
+                result.prompt = prompt;
+                result.response = response;
+                result.thinking = thinking;
+                Ok(result)
             }
             // One failing worker never aborts the team: the runners turn this
             // into a failed result and the remaining workers keep running.

@@ -1032,6 +1032,25 @@ impl Engine {
                     }
                 };
 
+                // Each worker's runtime call is its own agent run. The
+                // runner-owned aggregate fact is recorded below, so usage is
+                // saved first. A worker with no completion record (a mock, or
+                // a failure before the call was made) is skipped.
+                for worker in &result.worker_results {
+                    if worker.call_meta.calls.is_empty() {
+                        continue;
+                    }
+                    let call: AgentCall<()> = AgentCall {
+                        output: (),
+                        meta: worker.call_meta.clone(),
+                        prompt: worker.prompt.clone(),
+                        response: worker.response.clone(),
+                        thinking: worker.thinking.clone(),
+                    };
+                    self.record_agent_calls(task_id, Some(claimed.id), &call)
+                        .await;
+                }
+
                 if stop_requested(stop.as_ref()) {
                     return self
                         .stopped_result(task_id, task, rounds, "stop requested after the team run")
@@ -1095,6 +1114,11 @@ impl Engine {
                         "intent_id": claimed.id,
                         "topology": plan.topology.as_str(),
                         "workers": result.worker_results.len(),
+                        "worker_keys": result
+                            .worker_results
+                            .iter()
+                            .map(|worker| worker.worker_key.as_str())
+                            .collect::<Vec<_>>(),
                         "success": successes,
                         "failed": failures,
                         "skipped": skipped,
@@ -1474,6 +1498,8 @@ mod tests {
     #[derive(Clone)]
     enum TeamWorker {
         Success(&'static str),
+        /// Success that also reports one completion call, like a real runtime.
+        Recorded(&'static str),
         Failure(&'static str),
     }
 
@@ -1528,6 +1554,19 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("unexpected team subtask: {}", input.intent))?;
             match script {
                 TeamWorker::Success(summary) => Ok(unrecorded(execute_output(summary, vec![]))),
+                TeamWorker::Recorded(summary) => {
+                    let record = call_record(Role::Worker, "team-worker-m");
+                    Ok(dhi_agent::AgentCall {
+                        output: execute_output(summary, vec![]),
+                        meta: dhi_agent::AgentCallMeta {
+                            usage: record.usage,
+                            calls: vec![record],
+                        },
+                        prompt: format!("team prompt for {}", input.intent),
+                        response: summary.to_string(),
+                        thinking: Some("team worker reasoning".to_string()),
+                    })
+                }
                 TeamWorker::Failure(error) => Err(anyhow::anyhow!(error)),
             }
         }
@@ -4076,6 +4115,62 @@ mod tests {
         assert_eq!(team_run.payload["success"], 2);
         assert_eq!(team_run.payload["failed"], 0);
         assert!(engine.plans.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn manager_worker_call_usage_is_recorded_as_one_agent_run() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("team usage", 4);
+        let goal = seed_goal(&store, &task).await;
+        let plan = two_worker_plan("team usage", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("team usage", plan, goal.id),
+            vec![
+                ("subtask one", TeamWorker::Recorded("recorded team finding")),
+                ("subtask two", TeamWorker::Success("plain finding")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        let runs = store.agent_runs(task.id);
+        let workers: Vec<_> = runs
+            .iter()
+            .filter(|run| run.role == AgentRole::Worker)
+            .collect();
+        assert_eq!(
+            workers.len(),
+            1,
+            "only the worker that reported a completion call is recorded"
+        );
+        let row = workers[0];
+        assert_eq!(row.tokens_in, 250);
+        assert_eq!(row.tokens_out, 80);
+        assert_eq!(row.cache_read_tokens, 100);
+        assert_eq!(row.reasoning_tokens, 5);
+        assert_eq!(row.model, "team-worker-m");
+        assert_eq!(row.prompt, "team prompt for subtask one");
+        assert_eq!(row.response.as_deref(), Some("recorded team finding"));
+        assert_eq!(row.thinking.as_deref(), Some("team worker reasoning"));
+        let intent_id = row.intent_id.expect("the team worker row names its intent");
+        assert_eq!(
+            store.intents(task.id)[0].id,
+            intent_id,
+            "the row is attached to the team intent"
+        );
+
+        let team_run = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "team_run")
+            .expect("team_run activity");
+        assert_eq!(
+            team_run.payload["worker_keys"],
+            json!(["alpha", "beta"]),
+            "the activity names the workers that ran"
+        );
     }
 
     #[tokio::test]

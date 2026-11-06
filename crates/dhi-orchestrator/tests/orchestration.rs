@@ -652,3 +652,47 @@ fn plans_and_swarm_messages_round_trip() {
         assert_eq!(decoded, message);
     }
 }
+
+#[test]
+fn worker_result_round_trip_preserves_audit_fields() {
+    let worker = worker("audit", 1);
+    let subtask = subtask("s0", Some("audit"));
+    let record = dhi_agent::AgentCallRecord {
+        run_id: uuid::Uuid::new_v4(),
+        call_index: 0,
+        role: dhi_agent::Role::Worker,
+        model: "audit-model".to_owned(),
+        profile: "open_ai/audit-model/max_tokens=4096/stream=true".to_owned(),
+        status: "ok".to_owned(),
+        error: None,
+        latency_ms: 12,
+        usage: dhi_agent::Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 3,
+            cache_write_tokens: 1,
+            reasoning_tokens: 2,
+            cost_usd: Some(0.01),
+        },
+        prompt_hash: "worker@audit".to_owned(),
+    };
+    let mut result = ok_from(&worker, &subtask);
+    result.call_meta = dhi_agent::AgentCallMeta {
+        usage: record.usage,
+        calls: vec![record],
+    };
+    result.prompt = "rendered worker prompt".to_owned();
+    result.response = "worker response text".to_owned();
+    result.thinking = Some("worker reasoning".to_owned());
+
+    let encoded = serde_json::to_string(&result).unwrap();
+    let decoded: WorkerResult = serde_json::from_str(&encoded).unwrap();
+
+    assert_eq!(decoded, result);
+    assert_eq!(decoded.call_meta.calls.len(), 1);
+    assert_eq!(decoded.call_meta.calls[0].model, "audit-model");
+    assert_eq!(decoded.call_meta.usage.input_tokens, 10);
+    assert_eq!(decoded.prompt, "rendered worker prompt");
+    assert_eq!(decoded.response, "worker response text");
+    assert_eq!(decoded.thinking.as_deref(), Some("worker reasoning"));
+}

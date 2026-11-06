@@ -38,7 +38,7 @@ impl std::fmt::Display for WorkerStatus {
 }
 
 /// One worker's outcome for one subtask.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerResult {
     pub worker_key: String,
     pub subtask_id: String,
@@ -46,6 +46,18 @@ pub struct WorkerResult {
     pub summary: String,
     pub evidence: String,
     pub error: Option<String>,
+    /// Usage records for every completion call the worker made.
+    #[serde(default)]
+    pub call_meta: dhi_agent::AgentCallMeta,
+    /// The rendered prompt the worker's runtime returned.
+    #[serde(default)]
+    pub prompt: String,
+    /// The final response text the worker's runtime returned.
+    #[serde(default)]
+    pub response: String,
+    /// The provider's final reasoning text, when it returned any.
+    #[serde(default)]
+    pub thinking: Option<String>,
 }
 
 impl WorkerResult {
@@ -63,6 +75,10 @@ impl WorkerResult {
             summary: summary.into(),
             evidence: evidence.into(),
             error: None,
+            call_meta: dhi_agent::AgentCallMeta::default(),
+            prompt: String::new(),
+            response: String::new(),
+            thinking: None,
         }
     }
 
@@ -79,6 +95,10 @@ impl WorkerResult {
             summary: String::new(),
             evidence: String::new(),
             error: Some(error.into()),
+            call_meta: dhi_agent::AgentCallMeta::default(),
+            prompt: String::new(),
+            response: String::new(),
+            thinking: None,
         }
     }
 
@@ -95,6 +115,10 @@ impl WorkerResult {
             summary: summary.into(),
             evidence: String::new(),
             error: None,
+            call_meta: dhi_agent::AgentCallMeta::default(),
+            prompt: String::new(),
+            response: String::new(),
+            thinking: None,
         }
     }
 
@@ -105,7 +129,7 @@ impl WorkerResult {
 }
 
 /// The single result of one intent.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IntentResult {
     pub summary: String,
     pub fact: FactDraft,
