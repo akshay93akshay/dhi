@@ -633,7 +633,13 @@ impl Engine {
                             .await?;
                         anyhow::bail!("{message}");
                     }
-                    PlanOutcome::AddIntent { description } => {
+                    PlanOutcome::AddIntent {
+                        description,
+                        plan: _,
+                    } => {
+                        // Plan execution is the next phase: for now an
+                        // optional DHI+ plan is accepted and ignored, and the
+                        // engine keeps its current single-worker behavior.
                         if rounds >= self.max_rounds {
                             let reason =
                                 format!("engine exceeded max rounds ({})", self.max_rounds);
@@ -1321,6 +1327,7 @@ mod tests {
     fn single_intent_plan(description: &str) -> PlanOutcome {
         PlanOutcome::AddIntent {
             description: description.to_string(),
+            plan: None,
         }
     }
 
@@ -3475,6 +3482,7 @@ mod tests {
         for outcome in [
             PlanOutcome::AddIntent {
                 description: "work".to_string(),
+                plan: None,
             },
             PlanOutcome::ProveGoal {
                 goal_id: Uuid::new_v4(),

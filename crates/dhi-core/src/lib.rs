@@ -10,8 +10,12 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod graph;
+pub mod orchestration;
 pub mod side_question;
 pub use graph::{GraphStore, GuardStore};
+pub use orchestration::{
+    CapabilityLimits, IntentPlan, OrchestrationError, Subtask, Topology, WorkerSpec,
+};
 pub use side_question::{
     NewSideQuestionRequest, SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus,
     SideQuestionStatus, SideQuestionThread,

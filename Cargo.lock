@@ -2268,6 +2268,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "dhi-agent",
+ "dhi-core",
  "serde",
  "serde_json",
  "thiserror",

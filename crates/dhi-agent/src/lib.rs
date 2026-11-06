@@ -72,6 +72,11 @@ pub struct PlanInput {
 pub enum PlanOutcome {
     AddIntent {
         description: String,
+        /// Optional DHI+ execution plan. `None` keeps the current
+        /// single-worker behavior. The engine records it but does not execute
+        /// it yet.
+        #[serde(default)]
+        plan: Option<dhi_core::IntentPlan>,
     },
     ProveGoal {
         goal_id: Uuid,
@@ -279,6 +284,7 @@ impl AgentRuntime for MockAgentRuntime {
                     "Investigate the next step for: {} (bound {})",
                     input.goal, input.bound
                 ),
+                plan: None,
             },
         };
         Ok(mock_call(output))
@@ -1142,13 +1148,78 @@ impl PlannerSink {
         let add_sink = self.outcome.clone();
         let add_intent = DynamicTool::new(
             add_name,
-            "Add exactly one intent for this task.",
+            "Add exactly one intent for this task. The optional plan is data \
+             only: it declares topology, workers, subtasks, and budgets, and \
+             cannot name tools or bypass engine limits.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
                     "description": {
                         "type": "string",
                         "description": "One sentence describing the work to do."
+                    },
+                    "plan": {
+                        "type": "object",
+                        "description": "Optional DHI+ execution plan. Omit it for the current single-worker behavior.",
+                        "properties": {
+                            "intent": {
+                                "type": "string",
+                                "description": "Intent text. Defaults to the description when empty."
+                            },
+                            "topology": {
+                                "type": "string",
+                                "enum": ["single", "manager_worker", "swarm"]
+                            },
+                            "workers": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "key": {
+                                            "type": "string",
+                                            "description": "Unique worker key referenced by subtasks."
+                                        },
+                                        "role": {"type": "string"},
+                                        "prompt": {"type": "string"},
+                                        "max_turns": {
+                                            "type": "integer",
+                                            "minimum": 1
+                                        }
+                                    },
+                                    "required": ["key", "role", "prompt", "max_turns"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "subtasks": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "description": {"type": "string"},
+                                        "worker_key": {
+                                            "type": ["string", "null"],
+                                            "description": "An optional worker key; omitted or null lets the runner assign round-robin."
+                                        }
+                                    },
+                                    "required": ["id", "description"],
+                                    "additionalProperties": false
+                                }
+                            },
+                            "limits": {
+                                "type": "object",
+                                "description": "Omitted fields use the runtime defaults.",
+                                "properties": {
+                                    "max_workers": {"type": "integer", "minimum": 1},
+                                    "max_parallel": {"type": "integer", "minimum": 1},
+                                    "max_rounds": {"type": "integer", "minimum": 1},
+                                    "max_messages": {"type": "integer", "minimum": 1}
+                                },
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": ["topology", "workers", "subtasks"],
+                        "additionalProperties": false
                     }
                 },
                 "required": ["description"],
@@ -1167,10 +1238,12 @@ impl PlannerSink {
                                 "description must be a non-empty string",
                             )
                         })?;
+                    let plan = parse_plan_arg(&args, description)?;
                     record_plan(
                         &sink,
                         PlanOutcome::AddIntent {
                             description: description.to_string(),
+                            plan,
                         },
                     )
                 })
@@ -1297,6 +1370,43 @@ fn parse_uuid_arg(args: &serde_json::Value, key: &str) -> Result<Uuid, ToolExecu
         .ok_or_else(|| ToolExecutionError::invalid_args(format!("{key} must be a string")))?;
     Uuid::parse_str(raw)
         .map_err(|_| ToolExecutionError::invalid_args(format!("{key} must be a UUID")))
+}
+
+/// Parse and validate the optional planner plan.
+///
+/// The plan is data only: the tool schema exposes no tool names, and
+/// [`dhi_core::IntentPlan::validate`] rejects anything the runners cannot
+/// execute. An omitted or empty intent defaults to the description, and
+/// missing limit fields fall back to [`dhi_core::CapabilityLimits::default`].
+fn parse_plan_arg(
+    args: &serde_json::Value,
+    description: &str,
+) -> Result<Option<dhi_core::IntentPlan>, ToolExecutionError> {
+    let Some(raw) = args.get("plan") else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let mut plan_value = raw.clone();
+    let object = plan_value
+        .as_object_mut()
+        .ok_or_else(|| ToolExecutionError::invalid_args("plan must be an object"))?;
+    let intent_is_empty = object
+        .get("intent")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(|text| text.trim().is_empty());
+    if intent_is_empty {
+        object.insert(
+            "intent".to_owned(),
+            serde_json::Value::String(description.to_owned()),
+        );
+    }
+    let plan: dhi_core::IntentPlan = serde_json::from_value(plan_value)
+        .map_err(|err| ToolExecutionError::invalid_args(format!("invalid plan: {err}")))?;
+    plan.validate()
+        .map_err(|err| ToolExecutionError::invalid_args(format!("invalid plan: {err}")))?;
+    Ok(Some(plan))
 }
 
 /// The worker's native tool sink.
@@ -1947,7 +2057,180 @@ mod tests {
         assert_eq!(
             sink.finish("ignored after a tool call"),
             PlanOutcome::AddIntent {
-                description: "check the pin".to_string()
+                description: "check the pin".to_string(),
+                plan: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn add_intent_without_plan_still_works() {
+        let sink = PlannerSink::default();
+        let tools = sink.tools().expect("planner tools build");
+        tools[0]
+            .run(serde_json::json!({"description": "check the pin"}))
+            .await
+            .expect("add_intent without a plan is accepted");
+        assert_eq!(
+            sink.finish("ignored after a tool call"),
+            PlanOutcome::AddIntent {
+                description: "check the pin".to_string(),
+                plan: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn add_intent_with_manager_worker_plan_parses_and_validates() {
+        let sink = PlannerSink::default();
+        let tools = sink.tools().expect("planner tools build");
+        tools[0]
+            .run(serde_json::json!({
+                "description": "review the patch",
+                "plan": {
+                    "topology": "manager_worker",
+                    "workers": [
+                        {
+                            "key": "worker-a",
+                            "role": "reviewer",
+                            "prompt": "review the patch",
+                            "max_turns": 8
+                        },
+                        {
+                            "key": "worker-b",
+                            "role": "tester",
+                            "prompt": "test the patch",
+                            "max_turns": 4
+                        }
+                    ],
+                    "subtasks": [
+                        {
+                            "id": "sub-1",
+                            "description": "review the change",
+                            "worker_key": "worker-a"
+                        },
+                        {
+                            "id": "sub-2",
+                            "description": "run the tests",
+                            "worker_key": "worker-b"
+                        }
+                    ],
+                    "limits": {"max_workers": 3}
+                }
+            }))
+            .await
+            .expect("a valid manager-worker plan is accepted");
+
+        let PlanOutcome::AddIntent {
+            description,
+            plan: Some(plan),
+        } = sink.finish("ignored after a tool call")
+        else {
+            panic!("expected an add_intent outcome with a plan");
+        };
+        assert_eq!(description, "review the patch");
+        assert_eq!(plan.intent, "review the patch");
+        assert_eq!(plan.topology, dhi_core::Topology::ManagerWorker);
+        assert_eq!(plan.workers.len(), 2);
+        assert_eq!(plan.workers[0].key, "worker-a");
+        assert_eq!(plan.workers[1].max_turns, 4);
+        assert_eq!(plan.subtasks.len(), 2);
+        assert_eq!(plan.subtasks[1].worker_key.as_deref(), Some("worker-b"));
+        assert_eq!(
+            plan.limits,
+            dhi_core::CapabilityLimits {
+                max_workers: 3,
+                ..dhi_core::CapabilityLimits::default()
+            }
+        );
+        plan.validate().expect("the accepted plan validates");
+    }
+
+    #[tokio::test]
+    async fn add_intent_rejects_invalid_plans() {
+        let worker = serde_json::json!({
+            "key": "worker-a",
+            "role": "reviewer",
+            "prompt": "review the patch",
+            "max_turns": 8
+        });
+        let subtask = serde_json::json!({
+            "id": "sub-1",
+            "description": "review the change",
+            "worker_key": "worker-a"
+        });
+
+        let invalid_topology = serde_json::json!({
+            "description": "review the patch",
+            "plan": {
+                "topology": "mesh",
+                "workers": [worker.clone()],
+                "subtasks": [subtask.clone()]
+            }
+        });
+        let zero_workers = serde_json::json!({
+            "description": "review the patch",
+            "plan": {
+                "topology": "manager_worker",
+                "workers": [],
+                "subtasks": [subtask.clone()]
+            }
+        });
+        let unknown_worker = serde_json::json!({
+            "description": "review the patch",
+            "plan": {
+                "topology": "manager_worker",
+                "workers": [worker],
+                "subtasks": [{
+                    "id": "sub-1",
+                    "description": "review the change",
+                    "worker_key": "ghost"
+                }]
+            }
+        });
+
+        for args in [invalid_topology, zero_workers, unknown_worker] {
+            let sink = PlannerSink::default();
+            let tools = sink.tools().expect("planner tools build");
+            assert!(
+                tools[0].run(args).await.is_err(),
+                "an invalid plan must be a tool error"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_outcome_round_trips_with_plan() {
+        let outcome = PlanOutcome::AddIntent {
+            description: "review the patch".to_string(),
+            plan: Some(dhi_core::IntentPlan {
+                intent: "review the patch".to_string(),
+                topology: dhi_core::Topology::Swarm,
+                workers: vec![dhi_core::WorkerSpec {
+                    key: "worker-a".to_string(),
+                    role: "reviewer".to_string(),
+                    prompt: "review the patch".to_string(),
+                    max_turns: 3,
+                }],
+                subtasks: vec![dhi_core::Subtask {
+                    id: "sub-1".to_string(),
+                    description: "review the change".to_string(),
+                    worker_key: Some("worker-a".to_string()),
+                }],
+                limits: dhi_core::CapabilityLimits::default(),
+            }),
+        };
+        let encoded = serde_json::to_string(&outcome).unwrap();
+        let decoded: PlanOutcome = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, outcome);
+
+        let legacy: PlanOutcome =
+            serde_json::from_str(r#"{"AddIntent":{"description":"check the pin"}}"#).unwrap();
+        assert_eq!(
+            legacy,
+            PlanOutcome::AddIntent {
+                description: "check the pin".to_string(),
+                plan: None,
             }
         );
     }
