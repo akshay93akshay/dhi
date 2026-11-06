@@ -21,7 +21,7 @@ use rig::tool::{DynamicTool, ToolContext, ToolExecutionError, ToolOutput};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 pub mod pool;
@@ -558,7 +558,7 @@ impl RigAgentRuntime {
             tool_server: ToolServer::new().run(),
             worker_tool_view: None,
             specialists: None,
-            limits: DelegationLimits::default(),
+            limits: DelegationLimits::from_env(),
         }
     }
 
@@ -611,7 +611,7 @@ impl RigAgentRuntime {
             tool_server: ToolServer::new().run(),
             worker_tool_view: None,
             specialists: None,
-            limits: DelegationLimits::default(),
+            limits: DelegationLimits::from_env(),
         }
     }
 
@@ -684,6 +684,11 @@ impl RigAgentRuntime {
             self.limits,
         )
         .map_err(|err| anyhow::anyhow!("specialists: {err}"))?;
+        info!(
+            manager_max_turns = fleet.manager_max_turns(),
+            max_delegations = fleet.max_delegations(),
+            "specialist delegation limits resolved"
+        );
         self.specialists = Some(Arc::new(fleet));
         Ok(())
     }
@@ -1565,6 +1570,7 @@ impl AgentRuntime for RigAgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn prompts() -> PromptSet {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/prompts");
@@ -1581,6 +1587,45 @@ mod tests {
         profiles.worker.api_key = "secret-key".to_string();
         profiles.worker.model = worker_model.to_string();
         RigAgentRuntime::with_parts(profiles, prompts())
+    }
+
+    const LIMIT_KEYS: &[&str] = &["DHI_MANAGER_MAX_TURNS", "DHI_MAX_DELEGATIONS"];
+
+    /// Runs `f` with exactly the given delegation-limit variables and restores
+    /// every previous value afterwards, including when `f` panics.
+    fn with_limit_env(vars: &[(&'static str, &str)], f: impl FnOnce()) {
+        let saved: Vec<(&str, Option<String>)> = LIMIT_KEYS
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        for key in LIMIT_KEYS {
+            // Edition 2024: `remove_var` is unsafe because env is global.
+            unsafe { std::env::remove_var(key) };
+        }
+        for (key, value) in vars {
+            unsafe { std::env::set_var(key, value) };
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (key, value) in saved {
+            match value {
+                Some(value) => unsafe { std::env::set_var(key, value) },
+                None => unsafe { std::env::remove_var(key) },
+            }
+        }
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    fn test_specialist(name: &str) -> SpecialistSpec {
+        SpecialistSpec {
+            name: name.to_string(),
+            description: format!("the {name} specialist"),
+            preamble: format!("# {name}\n\nDo the {name} work."),
+            tools: Vec::new(),
+            max_turns: DEFAULT_SPECIALIST_MAX_TURNS,
+            worker_profile_id: None,
+        }
     }
 
     fn plan_input() -> PlanInput {
@@ -1732,6 +1777,97 @@ mod tests {
         assert_eq!(runtime.worker_profile().model, "w");
         let call = runtime.render_plan(&plan_input()).expect("renders");
         assert_eq!(call.model, "p");
+    }
+
+    #[test]
+    #[serial]
+    fn manager_max_turns_env_reaches_attached_specialists() {
+        with_limit_env(&[("DHI_MANAGER_MAX_TURNS", "40")], || {
+            let mut runtime = runtime_with("planner-x", "worker-y");
+            runtime
+                .with_specialists(vec![test_specialist("researcher")], None)
+                .expect("specialists attach");
+
+            let fleet = runtime.specialists().expect("a fleet is attached");
+            assert_eq!(fleet.manager_max_turns(), 40);
+            assert_eq!(
+                runtime.manager_max_turns(),
+                40,
+                "execute uses the manager cap"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn max_delegations_env_reaches_the_fleet() {
+        with_limit_env(&[("DHI_MAX_DELEGATIONS", "3")], || {
+            let mut runtime = runtime_with("planner-x", "worker-y");
+            runtime
+                .with_specialists(vec![test_specialist("researcher")], None)
+                .expect("specialists attach");
+
+            let fleet = runtime.specialists().expect("a fleet is attached");
+            assert_eq!(fleet.max_delegations(), 3);
+            assert_eq!(fleet.manager_max_turns(), DEFAULT_MANAGER_MAX_TURNS);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn delegation_limits_default_when_the_env_is_unset() {
+        with_limit_env(&[], || {
+            let mut runtime = runtime_with("planner-x", "worker-y");
+            runtime
+                .with_specialists(vec![test_specialist("researcher")], None)
+                .expect("specialists attach");
+
+            let fleet = runtime.specialists().expect("a fleet is attached");
+            assert_eq!(fleet.manager_max_turns(), 12);
+            assert_eq!(fleet.max_delegations(), 8);
+            assert_eq!(runtime.manager_max_turns(), 12);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn worker_profile_budget_is_unchanged_without_specialists() {
+        with_limit_env(
+            &[
+                ("DHI_MANAGER_MAX_TURNS", "40"),
+                ("DHI_MAX_DELEGATIONS", "3"),
+            ],
+            || {
+                let runtime = runtime_with("planner-x", "worker-y");
+
+                assert!(runtime.specialists().is_none());
+                assert_eq!(runtime.worker_profile().max_turns, 24);
+                assert_eq!(runtime.manager_max_turns(), 24);
+            },
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn with_pool_resolves_the_same_delegation_limits() {
+        with_limit_env(
+            &[
+                ("DHI_MANAGER_MAX_TURNS", "40"),
+                ("DHI_MAX_DELEGATIONS", "3"),
+            ],
+            || {
+                let mut runtime =
+                    RigAgentRuntime::with_pool(Arc::new(LlmPool::default()), prompts());
+                runtime
+                    .with_specialists(vec![test_specialist("researcher")], None)
+                    .expect("specialists attach");
+
+                let fleet = runtime.specialists().expect("a fleet is attached");
+                assert_eq!(fleet.manager_max_turns(), 40);
+                assert_eq!(fleet.max_delegations(), 3);
+                assert_eq!(runtime.manager_max_turns(), 40);
+            },
+        );
     }
 
     #[test]

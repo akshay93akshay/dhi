@@ -139,6 +139,8 @@ Main settings:
 - `DHI_WORKSPACE_HOST_ROOT` — host path of that root, used as the bind-mount source for task containers; set it when the server runs in a container
 - `DHI_MCP_CONFIG` — MCP config path; when unset, the nearest `ops/mcp.json`
 - `DHI_LLM_BASE_URL`, `DHI_LLM_API_KEY`, `DHI_LLM_PLANNER_MODEL`, `DHI_LLM_WORKER_MODEL` — LLM endpoint and models; other OpenAI-compatible endpoints work
+- `DHI_MANAGER_MAX_TURNS` — manager turn budget when specialists are enabled
+- `DHI_MAX_DELEGATIONS` — maximum delegation calls per manager run
 - `TINYFISH_API_KEY`, `PARALLEL_API_KEY`, `FIRECRAWL_API_KEY`, `DHI_WEB_PROVIDER` — web tool providers
 
 On first boot, DHI seeds guard rules plus LLM profiles and settings when an LLM key is configured. After that, PostgreSQL is the source of truth and profiles and rules are managed from the settings UI or API.

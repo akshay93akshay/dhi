@@ -59,6 +59,8 @@ fn fixture() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("web");
     write(&root, "index.html", "INDEX SHELL");
+    write(&root, "tasks/index.html", "TASKS SHELL");
+    write(&root, "tasks/index.txt", "TASKS PAYLOAD");
     write(&root, "tasks/preview/index.html", "DETAIL SHELL");
     write(&root, "tasks/preview/work/index.html", "WORK SHELL");
     write(&root, "tasks/preview/graph/index.html", "GRAPH SHELL");
@@ -176,6 +178,42 @@ async fn real_task_deep_links_serve_the_preview_shells_without_redirects() {
         assert!(content_type(&headers).contains("text/html"), "{uri}");
         assert!(body_text(&body).contains(marker), "{uri}");
     }
+}
+
+#[tokio::test]
+async fn tasks_routes_serve_the_task_list_shell() {
+    let (_dir, root) = fixture();
+    let app = app_with(&root);
+
+    for uri in ["/tasks", "/tasks/"] {
+        let (status, headers, body) = send(app.clone(), uri).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        assert!(content_type(&headers).contains("text/html"), "{uri}");
+        assert_eq!(body_text(&body), "TASKS SHELL", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn task_list_aliases_serve_the_task_list_payload_not_the_detail_placeholder() {
+    let (_dir, root) = fixture();
+    let app = app_with(&root);
+
+    let (status, headers, body) = send(app.clone(), "/tasks/index.txt").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type(&headers).contains("text/plain"));
+    assert_eq!(body_text(&body), "TASKS PAYLOAD");
+    assert!(!body_text(&body).contains("DETAIL PAYLOAD"));
+
+    let (status, headers, body) = send(app.clone(), "/tasks/index.html").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type(&headers).contains("text/html"));
+    assert_eq!(body_text(&body), "TASKS SHELL");
+
+    // A real task id still resolves to the detail preview, not the task list.
+    let (status, headers, body) = send(app, &format!("/tasks/{TASK_ID}.txt")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(content_type(&headers).contains("text/plain"));
+    assert_eq!(body_text(&body), "DETAIL PAYLOAD");
 }
 
 #[tokio::test]

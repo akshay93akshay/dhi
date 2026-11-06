@@ -95,6 +95,12 @@ fn task_asset(path: &str) -> Option<(&'static str, &'static str)> {
     if path.is_empty() {
         return None;
     }
+    if path == "index.txt" {
+        return Some(("tasks/index.txt", TEXT));
+    }
+    if path == "index.html" {
+        return Some(("tasks/index.html", HTML));
+    }
     let (id, rest) = match path.split_once('/') {
         Some((id, rest)) => (id, rest),
         None => (path, ""),
