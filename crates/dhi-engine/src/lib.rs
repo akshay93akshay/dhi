@@ -1465,7 +1465,7 @@ mod tests {
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("unexpected team subtask: {}", input.intent))?;
             match script {
-                TeamWorker::Success(summary) => Ok(unrecorded(execute_output(&summary, vec![]))),
+                TeamWorker::Success(summary) => Ok(unrecorded(execute_output(summary, vec![]))),
                 TeamWorker::Failure(error) => Err(anyhow::anyhow!(error)),
             }
         }
