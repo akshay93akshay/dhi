@@ -2262,6 +2262,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dhi-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dhi-agent",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "dhi-pty"
 version = "0.1.0"
 dependencies = [

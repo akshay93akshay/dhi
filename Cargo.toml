@@ -20,6 +20,7 @@ members = [
   "crates/dhi-custom-tools",
   "crates/dhi-web",
   "crates/dhi-mcp-upgrade",
+  "crates/dhi-orchestrator",
 ]
 
 [workspace.package]
