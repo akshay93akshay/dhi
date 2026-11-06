@@ -128,13 +128,13 @@ impl IntentPlan {
         }
 
         for subtask in &self.subtasks {
-            if let Some(key) = subtask.worker_key.as_deref() {
-                if !keys.contains(key) {
-                    return Err(OrchestrationError::UnknownWorker {
-                        subtask_id: subtask.id.clone(),
-                        worker_key: key.to_owned(),
-                    });
-                }
+            if let Some(key) = subtask.worker_key.as_deref()
+                && !keys.contains(key)
+            {
+                return Err(OrchestrationError::UnknownWorker {
+                    subtask_id: subtask.id.clone(),
+                    worker_key: key.to_owned(),
+                });
             }
         }
 

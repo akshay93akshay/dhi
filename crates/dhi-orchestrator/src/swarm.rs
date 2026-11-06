@@ -144,18 +144,20 @@ impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
             let identity = (worker.key.clone(), seed.id.clone());
 
             let handle = tasks.spawn(run_worker(
-                executor,
+                WorkerContext {
+                    executor,
+                    permits: worker_permits,
+                    board: worker_board,
+                    rounds: worker_rounds,
+                    stop: worker_stop,
+                    reports: worker_reports,
+                    intent,
+                    limits,
+                },
                 worker,
                 seed,
                 inbox,
                 worker_peers,
-                worker_permits,
-                worker_board,
-                worker_rounds,
-                worker_stop,
-                worker_reports,
-                intent,
-                limits,
             ));
             identities.insert(handle.id(), identity);
         }
@@ -243,25 +245,13 @@ struct WorkerReport {
     round: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct BoardState {
     results: Vec<WorkerResult>,
     messages: usize,
     findings: usize,
     last_finding_round: u64,
     done: BTreeSet<String>,
-}
-
-impl Default for BoardState {
-    fn default() -> Self {
-        Self {
-            results: Vec::new(),
-            messages: 0,
-            findings: 0,
-            last_finding_round: 0,
-            done: BTreeSet::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -357,75 +347,80 @@ async fn wait_for_round(
     }
 }
 
-async fn run_worker<E: WorkerExecutor + 'static>(
+/// Shared runtime handles handed to every swarm worker task.
+struct WorkerContext<E> {
     executor: Arc<E>,
+    permits: Arc<Semaphore>,
+    board: Arc<Mutex<BoardState>>,
+    rounds: watch::Receiver<u64>,
+    stop: watch::Receiver<bool>,
+    reports: mpsc::UnboundedSender<WorkerReport>,
+    intent: String,
+    limits: CapabilityLimits,
+}
+
+async fn run_worker<E: WorkerExecutor + 'static>(
+    mut ctx: WorkerContext<E>,
     worker: WorkerSpec,
     seed: Subtask,
     mut inbox: mpsc::UnboundedReceiver<SwarmMessage>,
     peers: Vec<mpsc::UnboundedSender<SwarmMessage>>,
-    permits: Arc<Semaphore>,
-    board: Arc<Mutex<BoardState>>,
-    mut rounds: watch::Receiver<u64>,
-    mut stop: watch::Receiver<bool>,
-    reports: mpsc::UnboundedSender<WorkerReport>,
-    intent: String,
-    limits: CapabilityLimits,
 ) {
-    let mut context = vec![format!("intent: {intent}")];
+    let mut context = vec![format!("intent: {}", ctx.intent)];
     let mut turns = 0usize;
     let mut last_round = 1u64;
     let mut done = false;
 
     if worker.max_turns == 0 {
-        mark_done(&worker.key, &board, &peers, limits.max_messages);
+        mark_done(&worker.key, &ctx.board, &peers, ctx.limits.max_messages);
         done = true;
     } else {
         let result = execute(
-            executor.as_ref(),
+            ctx.executor.as_ref(),
             &worker,
             &seed,
             &context,
-            &permits,
-            &board,
+            &ctx.permits,
+            &ctx.board,
             &peers,
             1,
-            limits.max_messages,
+            ctx.limits.max_messages,
         )
         .await;
         turns += 1;
         push_result_context(&mut context, &result);
         if turns >= worker.max_turns {
-            mark_done(&worker.key, &board, &peers, limits.max_messages);
+            mark_done(&worker.key, &ctx.board, &peers, ctx.limits.max_messages);
             done = true;
         }
     }
-    let _ = reports.send(WorkerReport {
+    let _ = ctx.reports.send(WorkerReport {
         worker_key: worker.key.clone(),
         round: 1,
     });
 
     loop {
-        if *stop.borrow() {
+        if *ctx.stop.borrow() {
             break;
         }
 
         tokio::select! {
             biased;
-            changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() {
+            changed = ctx.stop.changed() => {
+                if changed.is_err() || *ctx.stop.borrow() {
                     break;
                 }
             }
-            changed = rounds.changed() => {
+            changed = ctx.rounds.changed() => {
                 if changed.is_err() {
                     break;
                 }
-                let round = *rounds.borrow();
+                let round = *ctx.rounds.borrow();
                 if round <= last_round {
                     continue;
                 }
                 last_round = round;
-                if *stop.borrow() {
+                if *ctx.stop.borrow() {
                     break;
                 }
 
@@ -439,29 +434,39 @@ async fn run_worker<E: WorkerExecutor + 'static>(
                             if let Some(subtask) = reaction_subtask(&seed, round, &message) {
                                 if worker.max_turns > turns {
                                     let result = execute(
-                                        executor.as_ref(),
+                                        ctx.executor.as_ref(),
                                         &worker,
                                         &subtask,
                                         &context,
-                                        &permits,
-                                        &board,
+                                        &ctx.permits,
+                                        &ctx.board,
                                         &peers,
                                         round,
-                                        limits.max_messages,
+                                        ctx.limits.max_messages,
                                     )
                                     .await;
                                     turns += 1;
                                     push_result_context(&mut context, &result);
                                     if turns >= worker.max_turns {
-                                        mark_done(&worker.key, &board, &peers, limits.max_messages);
+                                        mark_done(
+                                            &worker.key,
+                                            &ctx.board,
+                                            &peers,
+                                            ctx.limits.max_messages,
+                                        );
                                         done = true;
                                     }
                                 } else {
-                                    mark_done(&worker.key, &board, &peers, limits.max_messages);
+                                    mark_done(
+                                        &worker.key,
+                                        &ctx.board,
+                                        &peers,
+                                        ctx.limits.max_messages,
+                                    );
                                     done = true;
                                 }
                             } else if let SwarmMessage::Done { from } = &message {
-                                board_lock(&board).done.insert(from.clone());
+                                board_lock(&ctx.board).done.insert(from.clone());
                             }
                         }
                         Err(mpsc::error::TryRecvError::Empty) => {}
@@ -469,7 +474,7 @@ async fn run_worker<E: WorkerExecutor + 'static>(
                     }
                 }
 
-                let _ = reports.send(WorkerReport {
+                let _ = ctx.reports.send(WorkerReport {
                     worker_key: worker.key.clone(),
                     round,
                 });
