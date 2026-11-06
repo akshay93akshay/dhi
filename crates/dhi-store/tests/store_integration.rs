@@ -262,6 +262,138 @@ async fn intent_plan_round_trips_upserts_and_unknown_returns_none(pool: PgPool) 
     assert_eq!(rows, 1, "the upsert keeps exactly one row per intent");
 }
 
+/// A fact may name an intent only once.
+#[sqlx::test]
+async fn record_fact_for_intent_allows_one_fact_per_intent(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store.create_task("one fact per intent", 4).await.unwrap();
+    let intent = store
+        .add_intent(task.id, task.origin_fact_id, "the one intent")
+        .await
+        .unwrap();
+
+    let fact = store
+        .record_fact_for_intent(
+            task.id,
+            intent.id,
+            "the intent result".to_string(),
+            serde_json::json!({"source": "test"}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fact.task_id, task.id);
+    assert_eq!(fact.claim, "the intent result");
+
+    let bound: Uuid = sqlx::query_scalar("SELECT intent_id FROM facts WHERE id = $1")
+        .bind(fact.id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(bound, intent.id, "the fact names its intent");
+
+    let err = store
+        .record_fact_for_intent(
+            task.id,
+            intent.id,
+            "a second fact".to_string(),
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("a second fact for the same intent must be rejected");
+    assert!(
+        matches!(
+            err,
+            StoreError::Core(CoreError::FactAlreadyRecordedForIntent(id)) if id == intent.id
+        ),
+        "{err:?}"
+    );
+
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM facts WHERE intent_id = $1")
+        .bind(intent.id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "the rejected insert left exactly one fact");
+}
+
+/// Two different intents may each record one fact.
+#[sqlx::test]
+async fn different_intents_each_record_their_own_fact(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store.create_task("two intents", 4).await.unwrap();
+    let first = store
+        .add_intent(task.id, task.origin_fact_id, "first intent")
+        .await
+        .unwrap();
+    let second = store
+        .add_intent(task.id, task.origin_fact_id, "second intent")
+        .await
+        .unwrap();
+
+    let first_fact = store
+        .record_fact_for_intent(
+            task.id,
+            first.id,
+            "first result".to_string(),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let second_fact = store
+        .record_fact_for_intent(
+            task.id,
+            second.id,
+            "second result".to_string(),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+
+    assert_ne!(first_fact.id, second_fact.id);
+    for (intent, fact) in [(first, first_fact), (second, second_fact)] {
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM facts WHERE intent_id = $1")
+            .bind(intent.id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "each intent owns exactly one fact");
+        let bound: Uuid = sqlx::query_scalar("SELECT intent_id FROM facts WHERE id = $1")
+            .bind(fact.id)
+            .fetch_one(store.pool())
+            .await
+            .unwrap();
+        assert_eq!(bound, intent.id);
+    }
+}
+
+/// A fact cannot name an intent that does not exist; the foreign key rejects
+/// it, just like the schema's other references.
+#[sqlx::test]
+async fn record_fact_for_intent_rejects_a_missing_intent(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store.create_task("missing intent", 4).await.unwrap();
+
+    let err = store
+        .record_fact_for_intent(
+            task.id,
+            Uuid::new_v4(),
+            "orphan fact".to_string(),
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("a fact must reference an existing intent");
+    assert_eq!(
+        store_sqlstate(&err).as_deref(),
+        Some("23503"),
+        "the foreign key must reject the missing intent: {err:?}"
+    );
+    assert_eq!(
+        store.list_facts(task.id).await.unwrap().len(),
+        1,
+        "only the origin fact remains"
+    );
+}
+
 /// Two appends add exactly two rows.
 #[sqlx::test]
 async fn activity_appends_accumulate(pool: PgPool) {

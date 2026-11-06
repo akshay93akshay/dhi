@@ -41,6 +41,8 @@ pub enum CoreError {
     IntentWithoutFact,
     #[error("task must have an origin fact")]
     MissingOriginFact,
+    #[error("fact already recorded for intent {0}")]
+    FactAlreadyRecordedForIntent(IntentId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

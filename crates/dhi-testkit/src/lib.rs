@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use chrono::Utc;
 use dhi_core::{
-    Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, ApprovalStatus, Fact, FactId,
-    FactState, Goal, GoalState, GraphStore, GuardDecision, GuardDecisionId, GuardStore,
+    Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, ApprovalStatus, CoreError, Fact,
+    FactId, FactState, Goal, GoalState, GraphStore, GuardDecision, GuardDecisionId, GuardStore,
     GuardVerdict, Intent, IntentId, IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome,
     ResultRecord, ResultStatus, RunId, SideQuestionRequest, SideQuestionSession,
     SideQuestionSessionStatus, SideQuestionStatus, SideQuestionThread, Task, TaskId, TaskState,
@@ -24,6 +24,8 @@ struct Inner {
     tasks: HashMap<TaskId, Task>,
     goals: HashMap<Uuid, Goal>,
     facts: HashMap<FactId, Fact>,
+    /// The fact recorded for each intent. The store enforces at most one.
+    fact_intents: HashMap<IntentId, FactId>,
     intents: HashMap<IntentId, Intent>,
     /// DHI+ plans by intent. Kept after completion as audit data.
     intent_plans: HashMap<IntentId, IntentPlan>,
@@ -83,6 +85,16 @@ impl MemoryStore {
             .filter(|f| f.task_id == task_id)
             .cloned()
             .collect()
+    }
+
+    /// The one fact recorded for `intent_id`, if any.
+    pub fn fact_for_intent(&self, intent_id: IntentId) -> Option<Fact> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .fact_intents
+            .get(&intent_id)
+            .and_then(|fact_id| inner.facts.get(fact_id))
+            .cloned()
     }
 
     pub fn goals(&self, task_id: TaskId) -> Vec<Goal> {
@@ -596,6 +608,36 @@ impl GraphStore for MemoryStore {
             .unwrap()
             .facts
             .insert(fact.id, fact.clone());
+        Ok(fact)
+    }
+
+    async fn record_fact_for_intent(
+        &self,
+        task_id: TaskId,
+        intent_id: IntentId,
+        claim: String,
+        provenance: serde_json::Value,
+    ) -> anyhow::Result<Fact> {
+        let mut inner = self.inner.lock().unwrap();
+        // Mirror the PostgreSQL foreign key: the intent must exist.
+        if !inner.intents.contains_key(&intent_id) {
+            anyhow::bail!("fact references missing intent {intent_id}");
+        }
+        // Mirror `facts_one_per_intent`: one fact per intent, ever.
+        if inner.fact_intents.contains_key(&intent_id) {
+            return Err(CoreError::FactAlreadyRecordedForIntent(intent_id).into());
+        }
+        let fact = Fact {
+            id: Uuid::new_v4(),
+            task_id,
+            claim,
+            state: FactState::Confirmed,
+            provenance,
+            origin_of: None,
+            created_at: Utc::now(),
+        };
+        inner.facts.insert(fact.id, fact.clone());
+        inner.fact_intents.insert(intent_id, fact.id);
         Ok(fact)
     }
 

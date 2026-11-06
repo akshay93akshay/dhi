@@ -62,6 +62,18 @@ fn confirmed_fact_count(facts: &[Fact]) -> usize {
         .count()
 }
 
+/// True when a store rejected a second fact for one intent.
+///
+/// Both stores surface `CoreError::FactAlreadyRecordedForIntent`; the
+/// PostgreSQL store wraps it in the `facts_one_per_intent` unique-index error.
+fn is_duplicate_intent_fact(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<dhi_core::CoreError>()
+            .is_some_and(|err| matches!(err, dhi_core::CoreError::FactAlreadyRecordedForIntent(_)))
+    })
+}
+
 /// The `agent_runs` row one recorded call becomes.
 ///
 /// The row id is the record's `run_id` and the run it belongs to is the same
@@ -392,6 +404,26 @@ impl Engine {
         )
         .await?;
         Ok(())
+    }
+
+    /// Fails a task whose intent already has its one fact.
+    ///
+    /// The intent is never finished `done`: it moves to `stopped`, and the
+    /// duplicate reason is recorded on the task.
+    async fn fail_duplicate_intent_fact(
+        &self,
+        task_id: Uuid,
+        task: &mut Task,
+        intent_id: Uuid,
+    ) -> anyhow::Result<String> {
+        let reason = format!("fact already recorded for intent {intent_id}");
+        self.store
+            .finish_intent(intent_id, IntentState::Stopped)
+            .await?;
+        self.forget_plan(intent_id);
+        self.fail_task(task_id, task, reason.clone(), "worker")
+            .await?;
+        Ok(reason)
     }
 
     /// Charges one spent round to the no-progress ledger and returns whether
@@ -1071,10 +1103,25 @@ impl Engine {
                 .await?;
 
                 let provenance = team_provenance(claimed.id, &plan, &result);
-                let fact = self
+                let fact = match self
                     .store
-                    .record_fact(task_id, result.fact.summary.clone(), provenance)
-                    .await?;
+                    .record_fact_for_intent(
+                        task_id,
+                        claimed.id,
+                        result.fact.summary.clone(),
+                        provenance,
+                    )
+                    .await
+                {
+                    Ok(fact) => fact,
+                    Err(err) if is_duplicate_intent_fact(&err) => {
+                        let reason = self
+                            .fail_duplicate_intent_fact(task_id, &mut task, claimed.id)
+                            .await?;
+                        anyhow::bail!("{reason}");
+                    }
+                    Err(err) => return Err(err),
+                };
                 self.store
                     .finish_intent(claimed.id, IntentState::Done)
                     .await?;
@@ -1182,10 +1229,25 @@ impl Engine {
                 "evidence": output.fact.evidence.clone(),
                 "confidence": output.fact.confidence.clone(),
             });
-            let fact = self
+            let fact = match self
                 .store
-                .record_fact(task_id, output.fact.summary.clone(), provenance)
-                .await?;
+                .record_fact_for_intent(
+                    task_id,
+                    claimed.id,
+                    output.fact.summary.clone(),
+                    provenance,
+                )
+                .await
+            {
+                Ok(fact) => fact,
+                Err(err) if is_duplicate_intent_fact(&err) => {
+                    let reason = self
+                        .fail_duplicate_intent_fact(task_id, &mut task, claimed.id)
+                        .await?;
+                    anyhow::bail!("{reason}");
+                }
+                Err(err) => return Err(err),
+            };
 
             self.store
                 .finish_intent(claimed.id, IntentState::Done)
@@ -1840,6 +1902,12 @@ mod tests {
         let result = engine.run_task(task.id).await.unwrap();
         assert_eq!(result.task.state, TaskState::Done);
         assert!(!store.facts(task.id).is_empty());
+        let intents = store.intents(task.id);
+        assert_eq!(intents.len(), 1, "the mock plans one intent");
+        let recorded = store
+            .fact_for_intent(intents[0].id)
+            .expect("the single intent records one fact");
+        assert_ne!(recorded.id, task.origin_fact_id);
         // Activity rows are the record of what happened, replacing the old
         // event stream: claims, facts, proofs, and completion all leave a row.
         let activities = store.activities(task.id);
@@ -3396,6 +3464,26 @@ mod tests {
             })
         }
 
+        async fn record_fact_for_intent(
+            &self,
+            task_id: TaskId,
+            _intent_id: IntentId,
+            claim: String,
+            provenance: serde_json::Value,
+        ) -> anyhow::Result<Fact> {
+            // Same as `record_fact`: accepted but never persisted, so the
+            // confirmed count still cannot move.
+            Ok(Fact {
+                id: Uuid::new_v4(),
+                task_id,
+                claim,
+                state: FactState::Origin,
+                provenance,
+                origin_of: None,
+                created_at: Utc::now(),
+            })
+        }
+
         async fn list_facts(&self, task_id: TaskId) -> anyhow::Result<Vec<Fact>> {
             self.inner.list_facts(task_id).await
         }
@@ -3963,6 +4051,11 @@ mod tests {
 
         let intents = store.intents(task.id);
         assert_eq!(intents.len(), 1);
+        assert_eq!(
+            store.fact_for_intent(intents[0].id).map(|fact| fact.id),
+            Some(team_fact.id),
+            "the team fact is bound to its one intent"
+        );
         assert_eq!(intents[0].state, IntentState::Done);
         assert_eq!(team_fact.provenance["intent_id"], intents[0].id.to_string());
         assert!(
@@ -4323,6 +4416,107 @@ mod tests {
     }
 
     // ---------- heartbeat ----------
+
+    #[tokio::test]
+    async fn duplicate_fact_fails_the_single_worker_task_cleanly() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("duplicate fact", 4);
+        let intent = store.seed_intent(task.id, task.origin_fact_id, "the only intent");
+        let first = store
+            .record_fact_for_intent(
+                task.id,
+                intent.id,
+                "already recorded".to_string(),
+                json!({}),
+            )
+            .await
+            .unwrap();
+
+        let engine = Engine::new(store.clone(), Arc::new(MockAgentRuntime));
+        let err = engine
+            .run_task(task.id)
+            .await
+            .expect_err("a duplicate intent fact fails the task");
+
+        let reason = format!("fact already recorded for intent {}", intent.id);
+        assert!(err.to_string().contains(&reason), "{err}");
+        assert_eq!(
+            store.get_task(task.id).await.unwrap().unwrap().state,
+            TaskState::Failed
+        );
+        assert_eq!(
+            store.intents(task.id)[0].state,
+            IntentState::Stopped,
+            "the intent must not finish done"
+        );
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 2, "origin fact plus the one intent fact");
+        assert_eq!(store.fact_for_intent(intent.id).unwrap().id, first.id);
+
+        let failed = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "task_failed")
+            .expect("task_failed activity");
+        assert_eq!(failed.payload["source"], "worker");
+        assert!(
+            failed.payload["reason"].as_str().unwrap().contains(&reason),
+            "{failed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_fact_in_a_planned_intent_fails_the_task_cleanly() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("duplicate planned fact", 4);
+        let plan = two_worker_plan("team work", Topology::ManagerWorker);
+        let intent = store.seed_intent(task.id, task.origin_fact_id, "team work");
+        store.save_intent_plan(intent.id, &plan).await.unwrap();
+        let first = store
+            .record_fact_for_intent(
+                task.id,
+                intent.id,
+                "already recorded".to_string(),
+                json!({}),
+            )
+            .await
+            .unwrap();
+
+        let agent = Arc::new(TeamAgent::new(
+            vec![],
+            vec![
+                ("subtask one", TeamWorker::Success("finding one")),
+                ("subtask two", TeamWorker::Success("finding two")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone());
+        let err = engine
+            .run_task(task.id)
+            .await
+            .expect_err("a duplicate planned fact fails the task");
+
+        let reason = format!("fact already recorded for intent {}", intent.id);
+        assert!(err.to_string().contains(&reason), "{err}");
+        assert_eq!(
+            store.get_task(task.id).await.unwrap().unwrap().state,
+            TaskState::Failed
+        );
+        assert_eq!(
+            store.intents(task.id)[0].state,
+            IntentState::Stopped,
+            "the planned intent must not finish done"
+        );
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 2, "origin fact plus the one intent fact");
+        assert_eq!(store.fact_for_intent(intent.id).unwrap().id, first.id);
+        assert_eq!(
+            store.get_intent_plan(intent.id).await.unwrap(),
+            Some(plan),
+            "the plan row survives as audit data"
+        );
+        assert!(engine.plans.lock().unwrap().is_empty());
+        assert_eq!(agent.calls().len(), 2, "both planned workers still ran");
+    }
 
     #[tokio::test]
     async fn heartbeat_wakes_idle_engine() {

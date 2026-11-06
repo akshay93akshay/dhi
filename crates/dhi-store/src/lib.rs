@@ -6,10 +6,10 @@
 use chrono::{DateTime, Utc};
 use dhi_core::{
     Activity, AgentRole, AgentRun, Approval, ApprovalDecision, ApprovalId, ApprovalStatus,
-    CheckpointId, Fact, FactState, Goal, GoalState, GuardDecision, GuardVerdict, Intent, IntentId,
-    IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus,
-    RunId, SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus, SideQuestionStatus,
-    SideQuestionThread, Task, TaskId, TaskState, ToolCall, ToolCallId,
+    CheckpointId, CoreError, Fact, FactState, Goal, GoalState, GuardDecision, GuardVerdict, Intent,
+    IntentId, IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord,
+    ResultStatus, RunId, SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus,
+    SideQuestionStatus, SideQuestionThread, Task, TaskId, TaskState, ToolCall, ToolCallId,
 };
 use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
@@ -767,6 +767,52 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(fact)
+    }
+
+    /// Records one confirmed fact bound to `intent_id`.
+    ///
+    /// `facts_one_per_intent` rejects a second fact for the same intent; the
+    /// caller sees [`CoreError::FactAlreadyRecordedForIntent`]. A missing
+    /// intent is rejected by the foreign key.
+    pub async fn record_fact_for_intent(
+        &self,
+        task_id: Uuid,
+        intent_id: Uuid,
+        claim: impl Into<String>,
+        provenance: serde_json::Value,
+    ) -> Result<Fact, StoreError> {
+        let fact = Fact {
+            id: Uuid::new_v4(),
+            task_id,
+            claim: claim.into(),
+            state: FactState::Confirmed,
+            provenance,
+            origin_of: None,
+            created_at: Utc::now(),
+        };
+        let inserted = sqlx::query(
+            "INSERT INTO facts (id, task_id, intent_id, claim, state, provenance, origin_of, \
+             created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(fact.id)
+        .bind(fact.task_id)
+        .bind(intent_id)
+        .bind(&fact.claim)
+        .bind(fact.state.as_str())
+        .bind(&fact.provenance)
+        .bind(fact.origin_of)
+        .bind(fact.created_at)
+        .execute(&self.pool)
+        .await;
+
+        match inserted {
+            Ok(_) => Ok(fact),
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => Err(StoreError::Core(
+                CoreError::FactAlreadyRecordedForIntent(intent_id),
+            )),
+            Err(err) => Err(StoreError::Sqlx(err)),
+        }
     }
 
     pub async fn list_facts(&self, task_id: Uuid) -> Result<Vec<Fact>, StoreError> {

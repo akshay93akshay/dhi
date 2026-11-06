@@ -154,6 +154,21 @@ pub trait GraphStore: Send + Sync {
         claim: String,
         provenance: serde_json::Value,
     ) -> anyhow::Result<Fact>;
+
+    /// Records a confirmed fact bound to exactly one intent.
+    ///
+    /// Unlike [`GraphStore::record_fact`], the fact names its intent and the
+    /// store enforces at most one such fact per intent. A second fact returns
+    /// [`dhi_core::CoreError::FactAlreadyRecordedForIntent`]; a missing intent
+    /// is rejected by the foreign key.
+    async fn record_fact_for_intent(
+        &self,
+        task_id: TaskId,
+        intent_id: IntentId,
+        claim: String,
+        provenance: serde_json::Value,
+    ) -> anyhow::Result<Fact>;
+
     async fn list_facts(&self, task_id: TaskId) -> anyhow::Result<Vec<Fact>>;
 
     async fn record_result(

@@ -140,6 +140,16 @@ impl GraphStore for Store {
         Ok(Store::record_fact(self, task_id, claim, provenance).await?)
     }
 
+    async fn record_fact_for_intent(
+        &self,
+        task_id: TaskId,
+        intent_id: IntentId,
+        claim: String,
+        provenance: serde_json::Value,
+    ) -> anyhow::Result<Fact> {
+        Ok(Store::record_fact_for_intent(self, task_id, intent_id, claim, provenance).await?)
+    }
+
     async fn list_facts(&self, task_id: TaskId) -> anyhow::Result<Vec<Fact>> {
         Ok(Store::list_facts(self, task_id).await?)
     }
