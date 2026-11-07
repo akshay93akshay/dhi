@@ -188,6 +188,21 @@ fn team_provenance(intent_id: Uuid, plan: &IntentPlan, result: &IntentResult) ->
     })
 }
 
+/// Narrow a plan's parallel budget to the task's DHI+ capacity.
+///
+/// Only `max_parallel` is constrained; the other ledger fields are enforced
+/// by the engine's own capacity checks. A zero value is rejected at the API,
+/// but ignoring it here keeps a corrupt ledger from making a plan invalid.
+fn apply_task_capacity(
+    mut plan: dhi_core::IntentPlan,
+    capacity: dhi_core::TaskCapacity,
+) -> dhi_core::IntentPlan {
+    if let Some(max_parallel_workers) = capacity.max_parallel_workers.filter(|limit| *limit > 0) {
+        plan.limits.max_parallel = plan.limits.max_parallel.min(max_parallel_workers);
+    }
+    plan
+}
+
 /// The persisted `kind` of one typed swarm message.
 ///
 /// `Shutdown` is runtime control and has no persisted kind; a swarm run never
@@ -332,6 +347,9 @@ impl Engine {
     }
 
     /// Runs a non-single plan through its topology's runner.
+    ///
+    /// Returns the run result and the effective plan: the planner's plan
+    /// narrowed by the task's DHI+ capacity. The stored plan is never changed.
     async fn run_team_plan(
         &self,
         task_id: Uuid,
@@ -339,7 +357,8 @@ impl Engine {
         intent: &Intent,
         plan: &IntentPlan,
         facts: &[Fact],
-    ) -> anyhow::Result<IntentResult> {
+    ) -> anyhow::Result<(IntentResult, IntentPlan)> {
+        let plan = apply_task_capacity(plan.clone(), task.capacity);
         let executor = Arc::new(RuntimeWorkerExecutor {
             agent: Arc::clone(&self.agent),
             task_id,
@@ -347,13 +366,13 @@ impl Engine {
             context: facts.iter().map(|fact| fact.claim.clone()).collect(),
             worker_profile_id: task.pinned_worker_profile_id,
         });
-        match plan.topology {
+        let result = match plan.topology {
             Topology::ManagerWorker => match self.manager_selector.as_ref() {
                 // A test (or host) override always wins over the runtime
                 // manager.
                 Some(selector) => {
                     ManagerRunner::with_selector(executor, Arc::clone(selector))
-                        .run(plan)
+                        .run(&plan)
                         .await
                 }
                 None => {
@@ -366,19 +385,20 @@ impl Engine {
                         worker_profile_id: task.pinned_worker_profile_id,
                     };
                     ManagerRunner::with_selector(executor, selector)
-                        .run(plan)
+                        .run(&plan)
                         .await
                 }
             },
             Topology::Swarm => {
                 let runner = SwarmRunner::new(executor);
-                let result = runner.run(plan).await;
+                let result = runner.run(&plan).await;
                 self.persist_swarm_messages(task_id, intent.id, runner.messages())
                     .await;
                 result
             }
             Topology::Single => unreachable!("single plans use the worker path"),
-        }
+        }?;
+        Ok((result, plan))
     }
 
     /// Persists the typed broadcast log of one swarm run.
@@ -1315,11 +1335,11 @@ impl Engine {
             };
 
             if let Some(plan) = plan.filter(|plan| plan.topology != Topology::Single) {
-                let result = match self
+                let (result, team_plan) = match self
                     .run_team_plan(task_id, &task, &claimed, &plan, &facts)
                     .await
                 {
-                    Ok(result) => result,
+                    Ok(outcome) => outcome,
                     Err(err) => {
                         if stop_requested(stop.as_ref()) {
                             return self
@@ -1472,6 +1492,7 @@ impl Engine {
                             .iter()
                             .map(|worker| worker.worker_key.as_str())
                             .collect::<Vec<_>>(),
+                        "max_parallel": team_plan.limits.max_parallel,
                         "success": successes,
                         "failed": failures,
                         "skipped": skipped,
@@ -1479,7 +1500,7 @@ impl Engine {
                 )
                 .await?;
 
-                let provenance = team_provenance(claimed.id, &plan, &result);
+                let provenance = team_provenance(claimed.id, &team_plan, &result);
                 let fact = match self
                     .store
                     .record_fact_for_intent(
@@ -4670,6 +4691,49 @@ mod tests {
         assert!(json.get("result").is_none(), "{json}");
     }
 
+    #[test]
+    fn task_capacity_clamps_the_plan_parallel_budget() {
+        let mut plan = two_worker_plan("capacity", Topology::ManagerWorker);
+        plan.limits.max_parallel = 3;
+
+        let clamped = apply_task_capacity(
+            plan.clone(),
+            TaskCapacity {
+                max_parallel_workers: Some(1),
+                ..TaskCapacity::default()
+            },
+        );
+
+        assert_eq!(clamped.limits.max_parallel, 1);
+        assert_eq!(plan.limits.max_parallel, 3, "the input plan is unchanged");
+    }
+
+    #[test]
+    fn task_capacity_without_parallel_workers_keeps_the_plan_budget() {
+        let mut plan = two_worker_plan("capacity", Topology::ManagerWorker);
+        plan.limits.max_parallel = 3;
+
+        let unchanged = apply_task_capacity(plan.clone(), TaskCapacity::default());
+
+        assert_eq!(unchanged, plan);
+    }
+
+    #[test]
+    fn task_capacity_zero_parallel_workers_is_ignored() {
+        let mut plan = two_worker_plan("capacity", Topology::ManagerWorker);
+        plan.limits.max_parallel = 3;
+
+        let unchanged = apply_task_capacity(
+            plan.clone(),
+            TaskCapacity {
+                max_parallel_workers: Some(0),
+                ..TaskCapacity::default()
+            },
+        );
+
+        assert_eq!(unchanged, plan);
+    }
+
     // ---------- DHI+ plan execution ----------
 
     /// Scripted team agent whose runtime manager keeps only alpha and assigns
@@ -4838,6 +4902,57 @@ mod tests {
         assert_eq!(manager.prompt, "manager prompt");
         assert_eq!(manager.response.as_deref(), Some("manager response"));
         assert_eq!(manager.thinking.as_deref(), Some("manager reasoning"));
+    }
+
+    /// A task's parallel capacity narrows a manager plan without stopping it,
+    /// and the stored planner plan keeps its original budget.
+    #[tokio::test]
+    async fn capacity_clamps_manager_worker_parallelism() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("capacity team", 4);
+        let goal = seed_goal(&store, &task).await;
+        let mut plan = two_worker_plan("capacity team", Topology::ManagerWorker);
+        plan.limits.max_parallel = 3;
+        GraphStore::set_task_capacity(
+            store.as_ref(),
+            task.id,
+            TaskCapacity {
+                max_parallel_workers: Some(1),
+                ..TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("capacity team", plan.clone(), goal.id),
+            vec![
+                ("subtask one", TeamWorker::Success("finding one")),
+                ("subtask two", TeamWorker::Success("finding two")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone());
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(agent.calls().len(), 2, "both subtasks still run");
+        let team_run = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "team_run")
+            .expect("team_run activity");
+        assert_eq!(team_run.payload["max_parallel"], 1);
+
+        let intent_id = store.intents(task.id)[0].id;
+        let stored = store
+            .get_intent_plan(intent_id)
+            .await
+            .unwrap()
+            .expect("stored planner plan");
+        assert_eq!(
+            stored.limits.max_parallel, 3,
+            "capacity applies to the run, not the stored plan"
+        );
     }
 
     #[tokio::test]
