@@ -659,6 +659,13 @@ fn broadcast(
 }
 
 fn reaction_subtask(seed: &Subtask, round: u64, message: &SwarmMessage) -> Option<Subtask> {
+    let description = |peer: String| {
+        format!(
+            "Your assigned subtask: {seed_desc}. Stay on your assigned subtask: {seed_desc}. \
+             Do not take over another worker's topic. {peer}",
+            seed_desc = seed.description
+        )
+    };
     match message {
         SwarmMessage::Finding {
             from,
@@ -667,17 +674,19 @@ fn reaction_subtask(seed: &Subtask, round: u64, message: &SwarmMessage) -> Optio
             ..
         } => Some(Subtask {
             id: format!("{}:r{round}:peer:{from}", seed.id),
-            description: format!("Build on {from}'s finding from {subtask_id}: {summary}"),
+            description: description(format!(
+                "Build on {from}'s finding from {subtask_id}: {summary}"
+            )),
             worker_key: None,
         }),
         SwarmMessage::Question { from, text } => Some(Subtask {
             id: format!("{}:r{round}:question:{from}", seed.id),
-            description: format!("Answer {from}'s question: {text}"),
+            description: description(format!("Answer {from}'s question: {text}")),
             worker_key: None,
         }),
         SwarmMessage::Challenge { from, text } => Some(Subtask {
             id: format!("{}:r{round}:challenge:{from}", seed.id),
-            description: format!("Address {from}'s challenge: {text}"),
+            description: description(format!("Address {from}'s challenge: {text}")),
             worker_key: None,
         }),
         SwarmMessage::Done { .. } | SwarmMessage::Shutdown => None,
@@ -719,4 +728,90 @@ fn board_lock(board: &Mutex<BoardState>) -> MutexGuard<'_, BoardState> {
     board
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn seed() -> Subtask {
+        Subtask {
+            id: "seed-0".to_string(),
+            description: "audit the parser".to_string(),
+            worker_key: None,
+        }
+    }
+
+    #[test]
+    fn reaction_prompts_keep_the_assigned_subtask_primary() {
+        let seed = seed();
+        let cases = [
+            (
+                SwarmMessage::Finding {
+                    from: "peer".to_string(),
+                    subtask_id: "seed-1".to_string(),
+                    summary: "the lexer is fine".to_string(),
+                    evidence: "read the lexer".to_string(),
+                },
+                "the lexer is fine",
+            ),
+            (
+                SwarmMessage::Question {
+                    from: "peer".to_string(),
+                    text: "which module owns the grammar?".to_string(),
+                },
+                "which module owns the grammar?",
+            ),
+            (
+                SwarmMessage::Challenge {
+                    from: "peer".to_string(),
+                    text: "the parser test is weak".to_string(),
+                },
+                "the parser test is weak",
+            ),
+        ];
+
+        for (message, peer_content) in cases {
+            let reaction = reaction_subtask(&seed, 2, &message).expect("a reaction subtask");
+            assert!(
+                reaction.description.starts_with("Your assigned subtask:"),
+                "{}",
+                reaction.description
+            );
+            assert!(
+                reaction.description.contains(&seed.description),
+                "{}",
+                reaction.description
+            );
+            assert!(
+                reaction.description.contains(
+                    "Stay on your assigned subtask: audit the parser. \
+                     Do not take over another worker's topic."
+                ),
+                "{}",
+                reaction.description
+            );
+            assert!(
+                reaction.description.contains(peer_content),
+                "peer content is retained: {}",
+                reaction.description
+            );
+        }
+    }
+
+    #[test]
+    fn done_and_shutdown_produce_no_reaction() {
+        let seed = seed();
+        assert!(
+            reaction_subtask(
+                &seed,
+                2,
+                &SwarmMessage::Done {
+                    from: "peer".into()
+                }
+            )
+            .is_none()
+        );
+        assert!(reaction_subtask(&seed, 2, &SwarmMessage::Shutdown).is_none());
+    }
 }

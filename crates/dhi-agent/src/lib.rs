@@ -1656,6 +1656,31 @@ fn parse_plan_arg(
     Ok(Some(plan))
 }
 
+/// The exact [`WorkerSink::finish`] error that means the model never called
+/// `record_fact`. Only this error earns the one retry in
+/// [`AgentRuntime::execute`].
+const MISSING_RECORD_FACT: &str = "the worker must call record_fact";
+
+/// The system-turn reminder appended for the one retry after a worker
+/// answered without calling `record_fact`.
+const RECORD_FACT_RETRY_INSTRUCTION: &str = "CRITICAL: Your previous attempt did not call record_fact. You MUST call record_fact now with the complete result. Do not answer with prose.";
+
+/// Builds the one retry call: the original render with the CRITICAL reminder
+/// appended to its system turn and a distinct `+retry` prompt hash, so the
+/// retry's usage record cannot be mistaken for the first attempt's.
+fn retry_with_record_fact(call: &RenderedCall) -> RenderedCall {
+    let mut retry = call.clone();
+    retry.system = format!("{}\n\n{}", retry.system, RECORD_FACT_RETRY_INSTRUCTION);
+    retry.prompt_hash = format!("{}+retry", call.prompt_hash);
+    retry
+}
+
+/// Whether this is the exact "worker answered with prose" error. Every other
+/// failure (pool, provider, tool, lock) is returned without a retry.
+fn is_missing_record_fact(err: &anyhow::Error) -> bool {
+    err.to_string() == MISSING_RECORD_FACT
+}
+
 /// The worker's native tool sink.
 ///
 /// Exactly one `record_fact` call is accepted. The first draft wins; a second
@@ -1676,7 +1701,7 @@ impl WorkerSink {
             .lock()
             .map_err(|_| anyhow::anyhow!("worker sink lock poisoned"))?
             .clone();
-        draft.ok_or_else(|| anyhow::anyhow!("the worker must call record_fact"))
+        draft.ok_or_else(|| anyhow::anyhow!(MISSING_RECORD_FACT))
     }
 
     fn tools(&self) -> anyhow::Result<Vec<DynamicTool>> {
@@ -1813,6 +1838,11 @@ impl AgentRuntime for RigAgentRuntime {
         })
     }
 
+    /// Executes one intent on the worker role.
+    ///
+    /// A worker that answers without calling `record_fact` gets exactly one
+    /// retry with a CRITICAL system reminder. Only the retry's completion is
+    /// recorded: the failed first attempt's prose and tokens are discarded.
     async fn execute(&self, input: ExecuteInput) -> anyhow::Result<AgentCall<ExecuteOutput>> {
         let call = self.render_execute(&input)?;
         // The run scope: stamped by the runtime before the model sees any
@@ -1833,35 +1863,74 @@ impl AgentRuntime for RigAgentRuntime {
             Some(view) => view.tool_server(),
             None => self.tool_server.clone(),
         };
+        let tool_setup = ToolSetup {
+            context: Some(tool_context),
+            registry: Some(worker_registry),
+        };
+        let max_turns = self.manager_max_turns();
+        let attempt_tools = || {
+            let sink = WorkerSink::default();
+            let mut tools = sink.tools()?;
+            // The manager's delegation tools: one per specialist, sharing a
+            // budget that is fresh for this attempt.
+            if let Some(fleet) = &self.specialists {
+                let budget = RunBudget::new(fleet.max_delegations());
+                tools.extend(fleet.delegation_tools(budget)?);
+            }
+            Ok((sink, tools))
+        };
         let (text, response, latency, candidate, sink) = self
             .complete_via_pool(
                 Role::Worker,
                 input.worker_profile_id,
                 &call,
-                ToolSetup {
-                    context: Some(tool_context),
-                    registry: Some(worker_registry),
-                },
-                || {
-                    let sink = WorkerSink::default();
-                    let mut tools = sink.tools()?;
-                    // The manager's delegation tools: one per specialist,
-                    // sharing a budget that is fresh for this attempt.
-                    if let Some(fleet) = &self.specialists {
-                        let budget = RunBudget::new(fleet.max_delegations());
-                        tools.extend(fleet.delegation_tools(budget)?);
-                    }
-                    Ok((sink, tools))
-                },
-                self.manager_max_turns(),
+                tool_setup.clone(),
+                &attempt_tools,
+                max_turns,
             )
             .await?;
-        let fact = sink.finish()?;
+        // A worker that answered with prose never called `record_fact`, so the
+        // attempt produced no fact. Retry exactly once with a CRITICAL reminder
+        // in the system turn, a fresh sink, and fresh tools; the same tool
+        // context and registry remain attached. Only this exact finish error
+        // triggers the retry — pool and provider failures already returned
+        // above, and a locked sink is a runtime bug, not model behavior.
+        let (text, response, latency, candidate, fact, recorded_call) = match sink.finish() {
+            Ok(fact) => (text, response, latency, candidate, fact, call),
+            Err(err) if is_missing_record_fact(&err) => {
+                let retry_call = retry_with_record_fact(&call);
+                let (retry_text, retry_response, retry_latency, retry_candidate, retry_sink) = self
+                    .complete_via_pool(
+                        Role::Worker,
+                        input.worker_profile_id,
+                        &retry_call,
+                        tool_setup,
+                        &attempt_tools,
+                        max_turns,
+                    )
+                    .await?;
+                // If the retry also fails, its error is returned.
+                let fact = retry_sink.finish()?;
+                // The retry is a second completion call, and its usage is the
+                // one recorded. The failed first attempt's tokens are not
+                // counted (nor is its prose used): only a fact-bearing call
+                // is billed to the run.
+                (
+                    retry_text,
+                    retry_response,
+                    retry_latency,
+                    retry_candidate,
+                    fact,
+                    retry_call,
+                )
+            }
+            Err(err) => return Err(err),
+        };
         let thinking = response_thinking(&response);
         let record = self.call_record(
             Role::Worker,
             &candidate,
-            &call.prompt_hash,
+            &recorded_call.prompt_hash,
             &response,
             latency,
         );
@@ -1874,7 +1943,7 @@ impl AgentRuntime for RigAgentRuntime {
                 usage: record.usage,
                 calls: vec![record],
             },
-            prompt: call.user,
+            prompt: recorded_call.user,
             response: text,
             thinking,
         })
@@ -2895,6 +2964,47 @@ mod tests {
             .finish()
             .expect_err("prose without a record_fact call is not a fact");
         assert!(err.to_string().contains("record_fact"), "{err}");
+    }
+
+    #[test]
+    fn record_fact_retry_appends_the_instruction_and_marks_the_hash() {
+        let runtime = runtime_with("river-planner", "river-worker");
+        let call = runtime.render_execute(&execute_input()).expect("renders");
+        let retry = retry_with_record_fact(&call);
+
+        assert_eq!(retry.role, call.role);
+        assert_eq!(retry.user, call.user, "only the system turn changes");
+        assert_eq!(
+            retry.system,
+            format!("{}\n\n{}", call.system, RECORD_FACT_RETRY_INSTRUCTION)
+        );
+        assert!(
+            retry
+                .system
+                .contains("CRITICAL: Your previous attempt did not call record_fact"),
+            "{}",
+            retry.system
+        );
+        assert_eq!(retry.prompt_hash, format!("{}+retry", call.prompt_hash));
+        assert_ne!(retry.prompt_hash, call.prompt_hash);
+    }
+
+    #[test]
+    fn only_the_missing_record_fact_error_earns_a_retry() {
+        let missing = WorkerSink::default()
+            .finish()
+            .expect_err("an empty sink never recorded a fact");
+        assert!(is_missing_record_fact(&missing));
+
+        for other in [
+            anyhow::anyhow!("worker sink lock poisoned"),
+            anyhow::anyhow!("provider unavailable"),
+        ] {
+            assert!(
+                !is_missing_record_fact(&other),
+                "{other} must not trigger the record_fact retry"
+            );
+        }
     }
 
     #[tokio::test]
