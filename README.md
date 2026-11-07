@@ -28,6 +28,19 @@ The unit of work is a task with a goal and a planning bound. The planner can add
 
 One Rust process, `dhi-server`, serves the JSON API under `/api` and the exported web UI. PostgreSQL is the only durable state store. Docker is used for the task containers that host coding tools and persistent terminals.
 
+### DHI+ orchestration
+
+The planner may choose single, manager-worker, or swarm execution for an intent. Manager-worker runs independent workers in parallel. Swarm exchanges typed findings between peers and stops on its budget and stop rules. Either way, one intent still produces one confirmed fact, and the guard and audit path is unchanged.
+
+The engine budgets are:
+
+```text
+DHI_ENGINE_MAX_ROUNDS
+DHI_ENGINE_NO_PROGRESS_ROUNDS
+```
+
+DHI+ is developed on `feature/dhi-plus`. No Docker image is part of this branch.
+
 Workspace crates:
 
 - `dhi-core` — domain types, task and intent state machines, graph store traits

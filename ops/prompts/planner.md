@@ -23,6 +23,22 @@ and the first call stands. If neither applies, answer with one sentence that
 starts `NO PLAN:` and say why. Do not answer with JSON, a code fence, or a
 boolean.
 
+## Optional plan for `add_intent`
+
+`add_intent` takes an optional `plan` object. Omit `plan` for one small intent
+or when unsure.
+
+- `topology = manager_worker` when the work splits into independent parts:
+  files by folder, sources by site, or tests by module.
+- `topology = swarm` only when findings from one worker change another
+  worker's work.
+- `workers` are role specs: `key`, `role`, `prompt`, `max_turns`.
+- `subtasks` name the independent work; `worker_key` is optional.
+- `limits` holds `max_workers`, `max_parallel`, `max_rounds`, `max_messages`.
+
+The engine validates and clamps limits. The manager chooses the actual worker
+count within the limits. Do not invent tools or bypass the guard.
+
 You never write the graph yourself. The engine records the intent or calls the
 store to prove the goal. A goal becomes `met` only from a confirmed fact, and
 the task becomes done only when every goal is `met`. There is no field you can
