@@ -1,6 +1,58 @@
-# DHI
+# DHI+
 
-**Dynamic Heuristic Intelligence**
+**Dynamic Heuristic Intelligence Plus**
+
+DHI+ is the team-execution upgrade to DHI. A goal still becomes a task and a plan, but the planner can choose a team, not only one worker. The team runs through a planner-selected topology, aggregates its work into one deterministic fact, and proves the goal with that fact. LLMs reason, tools act, PostgreSQL remembers, and the guard checks every action.
+
+## DHI vs DHI+
+
+| | DHI | DHI+ |
+| --- | --- | --- |
+| Execution | One planner, one worker. | Planner-selected `manager_worker` or `swarm`. |
+| Fact | One planner, one worker, one fact. | One deterministic aggregated fact per intent. |
+| Capacity | Engine round and no-progress budgets. | Visible, extendable capacity ledger; exhaustion pauses and extension resumes. |
+| UI | Individual work view. | Team UI for team runs, capacity, and swarm messages. |
+
+## Core architecture
+
+```mermaid
+flowchart LR
+    G[Goal] --> P[Planner]
+    P --> IP[IntentPlan]
+    IP --> T{Topology}
+    T -->|manager_worker| M[Manager selects workers]
+    M --> W[Workers: alpha / beta / gamma]
+    T -->|swarm| S[Seed one subtask per worker]
+    S --> W
+    W --> GU[Guard + audit]
+    GU --> AG[Deterministic aggregate]
+    AG --> F[One confirmed fact]
+    F --> PR[Planner proves goal]
+    C[Capacity ledger] -. pause / resume .-> P
+    UI[Work UI: team, capacity, swarm messages] -. reads .-> F
+```
+
+A DHI+ intent still follows the DHI lifecycle. The difference is the execution layer: the planner can expand one intent into a team, and the engine still records one fact.
+
+## DHI+ orchestration
+
+The planner selects the topology for each intent: `single`, `manager_worker`, or `swarm`. The team topologies, `manager_worker` and `swarm`, are planner-selected. `manager_worker` uses a manager to choose workers and subtasks within the planner's limits, then runs independent workers in parallel. `swarm` seeds one subtask per worker and lets peers exchange typed findings directly, stopping on its budget and stop rules.
+
+Only each worker's seed turn enters the aggregated fact; reaction turns remain visible in the swarm audit and count against capacity. Either team topology still produces one confirmed fact for the intent. The guard and audit path is unchanged: every worker tool call passes through the same guarded executor, and the aggregate fact is recorded only after those decisions are applied.
+
+Each task has a visible capacity ledger: `max_rounds`, `max_model_calls`, `max_wall_secs`, and `max_parallel_workers`. Omitted limits use the engine defaults. `POST /api/tasks` accepts the ledger at creation, `POST /api/tasks/{id}/capacity` extends it, and the Work view shows and edits it. Exhaustion pauses the task (never fails it); an extension resumes a paused task. Swarm broadcasts are durable and readable at `GET /api/tasks/{id}/swarm-messages`.
+
+The engine budgets are:
+
+```text
+DHI_ENGINE_MAX_ROUNDS
+DHI_ENGINE_NO_PROGRESS_ROUNDS
+```
+
+- DHI+ is the default line; legacy DHI is preserved as branch `DHI` and tag `DHI-v1.0.1`.
+- CI builds the container image on GitHub Actions; no local Docker build is required.
+
+## DHI baseline
 
 DHI turns a goal into a task, a task into a plan, a plan into facts, and facts into results. The planner reads the work graph and proposes one intent at a time. A worker carries out that intent with guarded tools and records facts. A confirmed fact proves a goal, and the task is done only when every goal is met. LLMs reason, tools act, PostgreSQL remembers, and the guard checks every action.
 
@@ -28,26 +80,12 @@ The unit of work is a task with a goal and a planning bound. The planner can add
 
 One Rust process, `dhi-server`, serves the JSON API under `/api` and the exported web UI. PostgreSQL is the only durable state store. Docker is used for the task containers that host coding tools and persistent terminals.
 
-### DHI+ orchestration
-
-The planner may choose single, manager-worker, or swarm execution for an intent. Manager-worker runs independent workers in parallel. Swarm exchanges typed findings between peers and stops on its budget and stop rules; only each worker's seed turn enters the aggregated fact, while reaction turns remain visible in the swarm audit and count against capacity. Either way, one intent still produces one confirmed fact, and the guard and audit path is unchanged.
-
-Each task has a visible capacity ledger: `max_rounds`, `max_model_calls`, `max_wall_secs`, and `max_parallel_workers`. Omitted limits use the engine defaults. `POST /api/tasks` accepts the ledger at creation, `POST /api/tasks/{id}/capacity` extends it, and the Work view shows and edits it. Exhaustion pauses the task (never fails it); an extension resumes a paused task. Swarm broadcasts are durable and readable at `GET /api/tasks/{id}/swarm-messages`.
-
-The engine budgets are:
-
-```text
-DHI_ENGINE_MAX_ROUNDS
-DHI_ENGINE_NO_PROGRESS_ROUNDS
-```
-
-DHI+ is developed on `feature/dhi-plus`. No Docker image is part of this branch.
-
 Workspace crates:
 
 - `dhi-core` — domain types, task and intent state machines, graph store traits
 - `dhi-store` — PostgreSQL schema, store implementation, management tables
 - `dhi-engine` — planner/worker task loop and proof-based completion
+- `dhi-orchestrator` — manager-worker and swarm runners, plan validation, deterministic aggregation
 - `dhi-guard` — allow, deny, and ask policy plus the guarded tool executor
 - `dhi-agent` — Rig runtime, prompts, LLM profiles, failover pool, specialists
 - `dhi-exec` — coding tools and per-task containers
@@ -84,22 +122,25 @@ The DHI container mounts the host Docker socket and includes the Docker CLI. It 
 ## Quick start with Docker
 
 ```bash
-cp .env.example .env   # optional: add LLM and web provider keys
-docker compose up --build -d
+export DHI_IMAGE=ghcr.io/akshay93akshay/dhi:sha-<short>
+docker compose pull dhi-server
+docker compose up -d --no-build
 ```
 
 - UI and API: http://127.0.0.1:8080
 - Chess board: http://127.0.0.1:8090
 - Health: `curl -fsS http://127.0.0.1:8080/api/health`
 
-The image build creates the static UI; Compose starts PostgreSQL and `dhi-server`. `scripts/dhi-health.sh` checks the API, UI, PostgreSQL, disk space, and the optional chess board.
+Copy `.env.example` to `.env` if you need LLM or web provider keys, and authenticate to GHCR first if you have not already (see [Container image](#container-image)). The published image contains the static UI; Compose starts PostgreSQL and `dhi-server`. `scripts/dhi-health.sh` checks the API, UI, PostgreSQL, disk space, and the optional chess board.
+
+`docker compose up --build` is only for local image development, not the deployment path.
 
 ## Container image
 
-GitHub Actions publishes the container image on every push to `master` and on `v*` tags.
+GitHub Actions builds the container image on every push and pull request. It pushes to GHCR only on `master` and `v*` tags; feature-branch and pull-request builds are validation-only.
 
 - Registry: `ghcr.io/akshay93akshay/dhi`
-- Tags: `sha-<short>` on every master build and `v1.0.0` on the version tag. There is no `latest` tag.
+- Tags: `sha-<short>` on every master build and the tag name on each `v*` release, such as `v1.0.0`. There is no `latest` tag.
 - The package is private. Authenticate with a GitHub token that has only `read:packages`.
 
 Pull on a server:
@@ -108,7 +149,7 @@ Pull on a server:
 echo "$GHCR_TOKEN" | docker login ghcr.io -u akshay93akshay --password-stdin
 export DHI_IMAGE=ghcr.io/akshay93akshay/dhi:sha-abc1234
 docker compose pull dhi-server
-docker compose up -d
+docker compose up -d --no-build
 ```
 
 To roll back, set `DHI_IMAGE` to the previous `sha-...` tag, then pull and start again. The image contains the Rust server, the static UI, `ops/`, the Docker CLI, and the pinned chess MCP runtime; it has no Rust or Node compiler.
