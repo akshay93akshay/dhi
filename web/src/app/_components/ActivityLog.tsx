@@ -22,6 +22,7 @@ import {
 import type { Activity } from "@/lib/types";
 import { describeApiError } from "@/lib/ui";
 import { formatLocalTimestamp } from "@/lib/localTime";
+import { latestTeamRun, type TeamRun } from "@/lib/teamRun";
 import { CopyButton } from "@/components/ui/copy-button";
 import {
   Card,
@@ -31,6 +32,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { StateBadge } from "@/components/ui/state-badge";
 
 /**
  * The activity timeline and its two riders.
@@ -226,11 +228,84 @@ function ActivityList(props: { rows: readonly Activity[]; max: number }) {
 // Live log (work view)
 // ---------------------------------------------------------------------------
 
+/**
+ * Compact DHI+ summary of the latest `team_run` activity: topology, worker
+ * count, outcome totals, and the per-worker keys/roles/statuses/subtasks.
+ * Rendered only when the feed contains a valid team run — no API call.
+ */
+function TeamRunPanel(props: { run: TeamRun }) {
+  const { run } = props;
+  return (
+    <div className="mb-4 rounded-lg border border-border bg-surface-subtle px-3.5 py-3">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-[12px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Team run
+          </span>
+          <Badge variant="accent" className="font-mono">
+            {run.topology}
+          </Badge>
+          <span className="text-[11.5px] text-muted-foreground">
+            {run.workerCount} worker{run.workerCount === 1 ? "" : "s"}
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <Badge variant="success" className="font-normal">
+            {run.success} success
+          </Badge>
+          <Badge
+            variant={run.failed > 0 ? "destructive" : "muted"}
+            className="font-normal"
+          >
+            {run.failed} failed
+          </Badge>
+          <Badge
+            variant={run.skipped > 0 ? "warning" : "muted"}
+            className="font-normal"
+          >
+            {run.skipped} skipped
+          </Badge>
+        </div>
+      </div>
+      {run.workers.length > 0 ? (
+        <ul className="mt-2.5 space-y-1.5">
+          {run.workers.map((worker, index) => (
+            <li
+              key={`${worker.key}:${index}`}
+              className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border bg-card px-2.5 py-1.5 text-[11.5px]"
+            >
+              <span className="mono font-medium" title={worker.key}>
+                {worker.key}
+              </span>
+              {worker.role !== null ? (
+                <span className="text-muted-foreground">{worker.role}</span>
+              ) : null}
+              {worker.status !== null ? (
+                <StateBadge state={worker.status} />
+              ) : null}
+              {worker.subtask !== null ? (
+                <span className="text-muted-foreground">
+                  subtask <span className="mono">{worker.subtask}</span>
+                </span>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          Worker details were not recorded for this run.
+        </p>
+      )}
+    </div>
+  );
+}
+
 export function LiveActivityFeed(props: {
   taskId: string;
   onSignal?: (signal: FeedSignal) => void;
 }) {
   const snapshot = useLiveActivityFeed(props.taskId, props.onSignal);
+  const teamRun = latestTeamRun(snapshot.rows);
   return (
     <Card>
       <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
@@ -258,6 +333,8 @@ export function LiveActivityFeed(props: {
             snapshot and retrying.
           </div>
         ) : null}
+
+        {teamRun !== null ? <TeamRunPanel run={teamRun} /> : null}
 
         <ActivityList rows={snapshot.rows} max={FEED_MAX_ROWS} />
       </CardContent>
