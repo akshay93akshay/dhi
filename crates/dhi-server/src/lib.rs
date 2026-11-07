@@ -23,6 +23,7 @@ pub mod web_providers;
 pub use task_runs::TaskRunRegistry;
 
 use async_trait::async_trait;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -32,7 +33,7 @@ use axum::{Json, Router};
 use dhi_agent::{AgentRuntime, LlmPool, PoolSnapshot, RawProfile, ResolvedProfile};
 use dhi_core::{
     AgentRole, AgentRun, Approval, ApprovalDecision, ApprovalStatus, GraphStore, GuardStore,
-    GuardVerdict, ReopenOutcome, Task, TaskId, TaskState,
+    GuardVerdict, ReopenOutcome, Task, TaskCapacity, TaskId, TaskState,
 };
 use dhi_engine::Engine;
 use dhi_guard::ToolBackend;
@@ -123,6 +124,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}", get(get_task).delete(delete_task_route))
         .route("/api/tasks/{id}/stop", post(stop_task))
         .route("/api/tasks/{id}/goals", post(add_goal_route))
+        .route("/api/tasks/{id}/capacity", post(set_task_capacity_route))
         .route("/api/tasks/{id}/work", get(get_task_work))
         .route("/api/tasks/{id}/activity", get(get_task_activity))
         .route("/api/tasks/{id}/usage", get(get_task_usage))
@@ -328,6 +330,23 @@ struct AddGoalRequest {
 struct AddGoalResponse {
     task: Task,
     goal: dhi_core::Goal,
+}
+
+/// `POST /api/tasks/{id}/capacity` input.
+///
+/// Every field is optional and, when present, must be a positive integer.
+/// Omitted fields keep the task's current value; there is no way to clear a
+/// limit through this route.
+#[derive(Debug, Default, Deserialize)]
+struct TaskCapacityRequest {
+    #[serde(default)]
+    max_rounds: Option<i64>,
+    #[serde(default)]
+    max_model_calls: Option<i64>,
+    #[serde(default)]
+    max_wall_secs: Option<i64>,
+    #[serde(default)]
+    max_parallel_workers: Option<i64>,
 }
 
 /// `POST /api/tasks/stop` and `POST /api/tasks/delete` input.
@@ -581,6 +600,82 @@ async fn add_goal_route(
             spawn_task_loop(&state.store, &state.task_runs, &state.engine, task.id);
             Ok((StatusCode::OK, Json(AddGoalResponse { task, goal })))
         }
+    }
+}
+
+/// `POST /api/tasks/{id}/capacity`.
+///
+/// Extends or lowers one task's capacity ledger. Omitted fields keep their
+/// stored value. A paused task is moved back to `running` and its loop is
+/// respawned, exactly like a reopened task. Terminal tasks are refused: their
+/// ledger is audit data, not a lever to revive them.
+async fn set_task_capacity_route(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    payload: Result<Json<TaskCapacityRequest>, JsonRejection>,
+) -> Result<Json<Task>, ApiError> {
+    let Json(body) = payload.map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
+
+    let task = require_task(state.store.as_ref(), id).await?;
+    if task.state.is_terminal() {
+        return Err(ApiError::conflict(format!(
+            "task {id} is {}; its capacity cannot be extended",
+            task.state
+        )));
+    }
+
+    let capacity = TaskCapacity {
+        max_rounds: positive_capacity("max_rounds", body.max_rounds)?.or(task.capacity.max_rounds),
+        max_model_calls: positive_capacity("max_model_calls", body.max_model_calls)?
+            .or(task.capacity.max_model_calls),
+        max_wall_secs: positive_wall_secs(body.max_wall_secs)?.or(task.capacity.max_wall_secs),
+        max_parallel_workers: positive_capacity("max_parallel_workers", body.max_parallel_workers)?
+            .or(task.capacity.max_parallel_workers),
+    };
+
+    let mut updated = state
+        .store
+        .set_task_capacity(id, capacity)
+        .await
+        .map_err(ApiError::internal)?;
+
+    // Only a paused task gets a new loop. A running task reads its ledger at
+    // run start, so an extension applies to its next run.
+    if updated.state == TaskState::Paused
+        && state
+            .store
+            .set_task_state_guarded(id, TaskState::Running)
+            .await
+            .map_err(ApiError::internal)?
+    {
+        updated.state = TaskState::Running;
+        spawn_task_loop(&state.store, &state.task_runs, &state.engine, id);
+    }
+
+    Ok(Json(updated))
+}
+
+fn positive_capacity(name: &str, value: Option<i64>) -> Result<Option<usize>, ApiError> {
+    match value {
+        None => Ok(None),
+        Some(value) if value > 0 => usize::try_from(value)
+            .map(Some)
+            .map_err(|_| ApiError::bad_request(format!("{name} must be a positive integer"))),
+        Some(_) => Err(ApiError::bad_request(format!(
+            "{name} must be a positive integer"
+        ))),
+    }
+}
+
+fn positive_wall_secs(value: Option<i64>) -> Result<Option<u64>, ApiError> {
+    match value {
+        None => Ok(None),
+        Some(value) if value > 0 => u64::try_from(value)
+            .map(Some)
+            .map_err(|_| ApiError::bad_request("max_wall_secs must be a positive integer")),
+        Some(_) => Err(ApiError::bad_request(
+            "max_wall_secs must be a positive integer",
+        )),
     }
 }
 
@@ -3183,6 +3278,10 @@ mod tests {
         )
     }
 
+    fn post_capacity(task_id: TaskId, body: Value) -> Request<Body> {
+        post_json(&format!("/api/tasks/{task_id}/capacity"), body)
+    }
+
     /// Moves a freshly seeded task to one terminal state through the public
     /// guard, exactly as an engine run would.
     async fn make_terminal(store: &MemoryStore, task: &Task, state: TaskState) {
@@ -3968,6 +4067,156 @@ mod tests {
             "the target task was reopened"
         );
         assert_eq!(store.goals(target.id).len(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task capacity extension
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn capacity_extension_merges_omitted_fields() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("extend my capacity", 3);
+        GraphStore::set_task_capacity(
+            store.as_ref(),
+            task.id,
+            TaskCapacity {
+                max_rounds: Some(5),
+                max_wall_secs: Some(60),
+                ..TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+        let app = router(test_state_with_store(store.clone()));
+
+        let (status, json) = send(
+            app,
+            post_capacity(task.id, json!({ "max_rounds": 80, "max_model_calls": 120 })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["id"], task.id.to_string());
+        assert_eq!(json["state"], "created");
+        assert_eq!(json["capacity"]["max_rounds"], 80);
+        assert_eq!(json["capacity"]["max_model_calls"], 120);
+        assert_eq!(
+            json["capacity"]["max_wall_secs"], 60,
+            "an omitted field keeps its stored value"
+        );
+        assert!(json["capacity"]["max_parallel_workers"].is_null());
+
+        let stored = store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(stored.capacity.max_rounds, Some(80));
+        assert_eq!(stored.capacity.max_model_calls, Some(120));
+        assert_eq!(stored.capacity.max_wall_secs, Some(60));
+    }
+
+    #[tokio::test]
+    async fn capacity_extension_resumes_a_paused_task() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("resume me", 3);
+        GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
+            .await
+            .unwrap();
+        GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Paused)
+            .await
+            .unwrap();
+        let app = router(test_state_with_store(store.clone()));
+
+        let (status, json) = send(app, post_capacity(task.id, json!({ "max_rounds": 80 }))).await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["state"], "running",
+            "extending a paused task restarts its loop"
+        );
+        assert_eq!(json["capacity"]["max_rounds"], 80);
+        wait_for_task_state(&store, task.id, TaskState::Done).await;
+        assert!(
+            store
+                .activities(task.id)
+                .iter()
+                .any(|row| row.kind == "intent_claimed"),
+            "the respawned engine must do work"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_extension_rejects_non_positive_values() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("validate capacity", 3);
+        let app = router(test_state_with_store(store.clone()));
+
+        for body in [
+            json!({ "max_rounds": 0 }),
+            json!({ "max_model_calls": -1 }),
+            json!({ "max_wall_secs": 0 }),
+            json!({ "max_parallel_workers": -2 }),
+        ] {
+            let (status, json) = send(app.clone(), post_capacity(task.id, body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert!(json["error"].is_string());
+        }
+
+        let malformed = Request::builder()
+            .method("POST")
+            .uri(format!("/api/tasks/{}/capacity", task.id))
+            .header("content-type", "application/json")
+            .body(Body::from("{not json"))
+            .unwrap();
+        let (status, json) = send(app.clone(), malformed).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+
+        let wrong_shape = post_capacity(task.id, json!({ "max_rounds": "many" }));
+        let (status, json) = send(app, wrong_shape).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+
+        assert_eq!(
+            store.get_task(task.id).await.unwrap().unwrap().capacity,
+            TaskCapacity::default(),
+            "rejected input never mutates the ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_extension_unknown_task_returns_404() {
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store));
+        let missing = Uuid::new_v4();
+
+        let (status, json) = send(app, post_capacity(missing, json!({ "max_rounds": 80 }))).await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+        assert!(json["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn capacity_extension_rejects_terminal_tasks() {
+        for state in [
+            TaskState::Done,
+            TaskState::Failed,
+            TaskState::Timeout,
+            TaskState::Cancelled,
+        ] {
+            let store = Arc::new(MemoryStore::new());
+            let task = store.seed_task("terminal capacity", 3);
+            make_terminal(&store, &task, state).await;
+            let app = router(test_state_with_store(store.clone()));
+
+            let (status, json) =
+                send(app, post_capacity(task.id, json!({ "max_rounds": 80 }))).await;
+
+            assert_eq!(status, StatusCode::CONFLICT, "{state}: {json}");
+            let stored = store.get_task(task.id).await.unwrap().unwrap();
+            assert_eq!(stored.state, state);
+            assert_eq!(
+                stored.capacity,
+                TaskCapacity::default(),
+                "{state}: a refused extension must not write the ledger"
+            );
+        }
     }
 
     #[tokio::test]

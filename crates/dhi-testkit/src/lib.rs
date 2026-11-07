@@ -13,7 +13,7 @@ use dhi_core::{
     GuardVerdict, Intent, IntentId, IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome,
     ResultRecord, ResultStatus, RunId, SideQuestionRequest, SideQuestionSession,
     SideQuestionSessionStatus, SideQuestionStatus, SideQuestionThread, SwarmMessageRecord, Task,
-    TaskId, TaskState, ToolCall, ToolCallId,
+    TaskCapacity, TaskId, TaskState, ToolCall, ToolCallId,
 };
 use uuid::Uuid;
 
@@ -253,6 +253,20 @@ impl GraphStore for MemoryStore {
         task.state = state;
         task.updated_at = Utc::now();
         Ok(true)
+    }
+
+    async fn set_task_capacity(
+        &self,
+        task_id: TaskId,
+        capacity: TaskCapacity,
+    ) -> anyhow::Result<Task> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(task) = inner.tasks.get_mut(&task_id) else {
+            anyhow::bail!("task not found: {task_id}");
+        };
+        task.capacity = capacity;
+        task.updated_at = Utc::now();
+        Ok(task.clone())
     }
 
     async fn add_goal(&self, task_id: TaskId, description: String) -> anyhow::Result<Goal> {

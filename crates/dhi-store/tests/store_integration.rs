@@ -5,8 +5,8 @@
 //! allowed to create databases.
 
 use dhi_core::{
-    CapabilityLimits, CoreError, FactState, IntentPlan, IntentState, Subtask, TaskState, Topology,
-    WorkerSpec,
+    CapabilityLimits, CoreError, FactState, IntentPlan, IntentState, Subtask, TaskCapacity,
+    TaskState, Topology, WorkerSpec,
 };
 use dhi_store::{Store, StoreError};
 use sqlx::PgPool;
@@ -473,6 +473,88 @@ async fn activity_appends_accumulate(pool: PgPool) {
     let after = activity_count(store.pool(), task.id).await;
 
     assert_eq!(after, before + 2);
+}
+
+/// Capacity defaults to the empty ledger, round-trips through JSONB, and a
+/// later write replaces the whole value.
+#[sqlx::test]
+async fn task_capacity_defaults_round_trips_and_updates(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store.create_task("capacity task", 4).await.unwrap();
+    assert_eq!(task.capacity, TaskCapacity::default());
+
+    let persisted = store.get_task(task.id).await.unwrap().expect("task exists");
+    assert_eq!(
+        persisted.capacity,
+        TaskCapacity::default(),
+        "a new task has an empty ledger"
+    );
+    let raw: serde_json::Value = sqlx::query_scalar("SELECT capacity FROM tasks WHERE id = $1")
+        .bind(task.id)
+        .fetch_one(store.pool())
+        .await
+        .unwrap();
+    assert_eq!(raw, serde_json::json!({}), "the column defaults to {{}}");
+
+    let capacity = TaskCapacity {
+        max_rounds: Some(3),
+        max_model_calls: Some(9),
+        max_wall_secs: Some(60),
+        max_parallel_workers: Some(2),
+    };
+    let updated = store.set_task_capacity(task.id, capacity).await.unwrap();
+    assert_eq!(updated.capacity, capacity);
+    assert_eq!(
+        store
+            .get_task(task.id)
+            .await
+            .unwrap()
+            .expect("task exists")
+            .capacity,
+        capacity
+    );
+
+    let extended = TaskCapacity {
+        max_rounds: Some(80),
+        ..capacity
+    };
+    let updated = store.set_task_capacity(task.id, extended).await.unwrap();
+    assert_eq!(updated.capacity, extended);
+    assert_eq!(
+        store
+            .get_task(task.id)
+            .await
+            .unwrap()
+            .expect("task exists")
+            .capacity,
+        extended
+    );
+}
+
+/// An unknown task is a normal not-found error, not a panic.
+#[sqlx::test]
+async fn set_task_capacity_unknown_task_is_not_found(pool: PgPool) {
+    let store = Store::new(pool);
+    let err = store
+        .set_task_capacity(Uuid::new_v4(), TaskCapacity::default())
+        .await
+        .expect_err("an unknown task cannot be updated");
+    assert!(matches!(err, StoreError::NotFound(_)), "{err:?}");
+}
+
+/// A malformed ledger decodes as the default so the task still loads.
+#[sqlx::test]
+async fn invalid_task_capacity_decodes_to_default(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store.create_task("bad ledger", 4).await.unwrap();
+    sqlx::query("UPDATE tasks SET capacity = '\"not-an-object\"'::jsonb WHERE id = $1")
+        .bind(task.id)
+        .execute(store.pool())
+        .await
+        .unwrap();
+
+    let persisted = store.get_task(task.id).await.unwrap().expect("task exists");
+    assert_eq!(persisted.capacity, TaskCapacity::default());
 }
 
 fn sample_intent_plan(intent: &str) -> IntentPlan {

@@ -9,8 +9,8 @@ use dhi_core::{
     CheckpointId, CoreError, Fact, FactState, Goal, GoalState, GuardDecision, GuardVerdict, Intent,
     IntentId, IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord,
     ResultStatus, RunId, SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus,
-    SideQuestionStatus, SideQuestionThread, SwarmMessageRecord, Task, TaskId, TaskState, ToolCall,
-    ToolCallId,
+    SideQuestionStatus, SideQuestionThread, SwarmMessageRecord, Task, TaskCapacity, TaskId,
+    TaskState, ToolCall, ToolCallId,
 };
 use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
@@ -91,12 +91,14 @@ impl Store {
         task.pinned_planner_profile_id = planner_pin;
         task.pinned_worker_profile_id = worker_pin;
         let origin = task.origin_fact();
+        let capacity =
+            serde_json::to_value(task.capacity).expect("task capacity is always serializable");
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
             "INSERT INTO tasks (id, goal, bound, state, exploration_id, origin_fact_id, \
-             pinned_planner_profile_id, pinned_worker_profile_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+             pinned_planner_profile_id, pinned_worker_profile_id, capacity, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
         )
         .bind(task.id)
         .bind(&task.goal)
@@ -106,6 +108,7 @@ impl Store {
         .bind(task.origin_fact_id)
         .bind(planner_pin)
         .bind(worker_pin)
+        .bind(capacity)
         .bind(task.created_at)
         .bind(task.updated_at)
         .execute(&mut *tx)
@@ -143,7 +146,7 @@ impl Store {
     pub async fn get_task(&self, id: Uuid) -> Result<Option<Task>, StoreError> {
         let row = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, bound, state, exploration_id, origin_fact_id, \
-                    pinned_planner_profile_id, pinned_worker_profile_id, created_at, updated_at
+                    pinned_planner_profile_id, pinned_worker_profile_id, capacity, created_at, updated_at
              FROM tasks WHERE id = $1",
         )
         .bind(id)
@@ -155,7 +158,7 @@ impl Store {
     pub async fn list_tasks(&self, limit: i64) -> Result<Vec<Task>, StoreError> {
         let rows = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, bound, state, exploration_id, origin_fact_id, \
-                    pinned_planner_profile_id, pinned_worker_profile_id, created_at, updated_at
+                    pinned_planner_profile_id, pinned_worker_profile_id, capacity, created_at, updated_at
              FROM tasks ORDER BY created_at DESC LIMIT $1",
         )
         .bind(limit)
@@ -185,6 +188,30 @@ impl Store {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Replaces one task's capacity ledger and returns the persisted task.
+    /// Missing tasks surface as [`StoreError::NotFound`].
+    pub async fn set_task_capacity(
+        &self,
+        task_id: TaskId,
+        capacity: TaskCapacity,
+    ) -> Result<Task, StoreError> {
+        let capacity =
+            serde_json::to_value(capacity).expect("task capacity is always serializable");
+        let row = sqlx::query_as::<_, TaskRow>(
+            "UPDATE tasks SET capacity = $2, updated_at = now()
+             WHERE id = $1
+             RETURNING id, goal, bound, state, exploration_id, origin_fact_id, \
+                       pinned_planner_profile_id, pinned_worker_profile_id, capacity, \
+                       created_at, updated_at",
+        )
+        .bind(task_id)
+        .bind(capacity)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
+        Task::try_from(row)
     }
 
     /// Deletes one terminal task and every task-owned row that cascades from
@@ -313,7 +340,7 @@ impl Store {
 
         let row = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, bound, state, exploration_id, origin_fact_id, \
-                    pinned_planner_profile_id, pinned_worker_profile_id, created_at, updated_at
+                    pinned_planner_profile_id, pinned_worker_profile_id, capacity, created_at, updated_at
              FROM tasks WHERE id = $1 FOR UPDATE",
         )
         .bind(task_id)
@@ -364,7 +391,8 @@ impl Store {
             "UPDATE tasks SET state = 'running', updated_at = now()
              WHERE id = $1
              RETURNING id, goal, bound, state, exploration_id, origin_fact_id, \
-                       pinned_planner_profile_id, pinned_worker_profile_id, created_at, updated_at",
+                       pinned_planner_profile_id, pinned_worker_profile_id, capacity, \
+                       created_at, updated_at",
         )
         .bind(task_id)
         .fetch_one(&mut *tx)
@@ -1582,6 +1610,7 @@ struct TaskRow {
     origin_fact_id: Uuid,
     pinned_planner_profile_id: Option<i64>,
     pinned_worker_profile_id: Option<i64>,
+    capacity: serde_json::Value,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -1598,6 +1627,9 @@ impl TryFrom<TaskRow> for Task {
             origin_fact_id: r.origin_fact_id,
             pinned_planner_profile_id: r.pinned_planner_profile_id,
             pinned_worker_profile_id: r.pinned_worker_profile_id,
+            // A missing or malformed ledger is no ledger: the task keeps the
+            // engine defaults instead of failing to load.
+            capacity: serde_json::from_value(r.capacity).unwrap_or_default(),
             created_at: r.created_at,
             updated_at: r.updated_at,
         })

@@ -20,7 +20,8 @@ use chrono::Utc;
 use dhi_agent::{AgentCall, AgentCallRecord, AgentRuntime, ExecuteInput, PlanInput, PlanOutcome};
 use dhi_core::{
     AgentRun, ApprovalDecision, Fact, FactState, Goal, GoalState, GraphStore, GuardStore, Intent,
-    IntentPlan, IntentState, Task, TaskState, ToolCallOutcome, ToolCallRequest, Topology,
+    IntentPlan, IntentState, Task, TaskCapacity, TaskState, ToolCallOutcome, ToolCallRequest,
+    Topology,
 };
 use dhi_guard::ToolExecutor;
 use dhi_orchestrator::{
@@ -724,6 +725,70 @@ impl Engine {
         Ok(())
     }
 
+    /// The capacity limit this run has already reached, if any.
+    ///
+    /// Checked only between steps. A check in the middle of a model call would
+    /// pause a task whose claimed intent has no worker to resume it.
+    fn capacity_pause_reason(
+        wall_limit: Option<u64>,
+        model_call_limit: Option<usize>,
+        started: std::time::Instant,
+        model_calls: usize,
+    ) -> Option<&'static str> {
+        if wall_limit.is_some_and(|limit| started.elapsed().as_secs() >= limit) {
+            return Some("wall_time");
+        }
+        if model_call_limit.is_some_and(|limit| model_calls >= limit) {
+            return Some("model_calls");
+        }
+        None
+    }
+
+    /// Pauses a task at a capacity boundary.
+    ///
+    /// This is a normal stop, not a failure: no intent is finished and no
+    /// `task_failed` row is written. Extending the capacity and restarting the
+    /// loop resumes the open work.
+    #[allow(clippy::too_many_arguments)]
+    async fn pause_for_capacity(
+        &self,
+        task_id: Uuid,
+        mut task: Task,
+        capacity: TaskCapacity,
+        reason: &str,
+        rounds: usize,
+        model_calls: usize,
+        started: std::time::Instant,
+    ) -> anyhow::Result<EngineResult> {
+        if self
+            .set_task_state_guarded(task_id, TaskState::Paused)
+            .await?
+        {
+            task.state = TaskState::Paused;
+        }
+        self.log_activity(
+            task_id,
+            "capacity_exhausted",
+            format!("task paused: {reason} capacity exhausted"),
+            serde_json::json!({
+                "reason": reason,
+                "rounds": rounds,
+                "model_calls": model_calls,
+                "elapsed_secs": started.elapsed().as_secs(),
+                "max_rounds": capacity.max_rounds,
+                "max_model_calls": capacity.max_model_calls,
+                "max_wall_secs": capacity.max_wall_secs,
+            }),
+        )
+        .await?;
+        Ok(EngineResult {
+            task,
+            rounds,
+            facts: self.store.list_facts(task_id).await?.len(),
+            intents: self.store.list_open_intents(task_id, 1_000).await?.len(),
+        })
+    }
+
     /// Ends a run as `cancelled` and reports it as a normal result.
     ///
     /// The guarded write is first-terminal-wins: if completion raced with the
@@ -806,6 +871,14 @@ impl Engine {
         }
 
         let mut rounds = 0;
+        // DHI+ capacity is fixed for this run: an extension while the loop is
+        // live is not observed until the next run.
+        let capacity = task.capacity;
+        let round_limit = capacity.max_rounds.unwrap_or(self.max_rounds);
+        let model_call_limit = capacity.max_model_calls;
+        let wall_limit = capacity.max_wall_secs;
+        let started = std::time::Instant::now();
+        let mut model_calls = 0;
         // Consecutive spent rounds without a new confirmed fact. The baseline
         // is the task's current confirmed count, so a reopened task does not
         // count facts from its previous epoch as new progress.
@@ -825,6 +898,21 @@ impl Engine {
                     )
                     .await;
             }
+            if let Some(reason) =
+                Self::capacity_pause_reason(wall_limit, model_call_limit, started, model_calls)
+            {
+                return self
+                    .pause_for_capacity(
+                        task_id,
+                        task,
+                        capacity,
+                        reason,
+                        rounds,
+                        model_calls,
+                        started,
+                    )
+                    .await;
+            }
             let open = self.store.list_open_intents(task_id, 8).await?;
             if open.is_empty() {
                 // Nothing to claim is idle time. Expire any overdue approval
@@ -839,6 +927,22 @@ impl Engine {
                     .into_iter()
                     .filter(|goal| goal.state == GoalState::Open)
                     .collect();
+                // Before an expensive step: a planner call is a model call.
+                if let Some(reason) =
+                    Self::capacity_pause_reason(wall_limit, model_call_limit, started, model_calls)
+                {
+                    return self
+                        .pause_for_capacity(
+                            task_id,
+                            task,
+                            capacity,
+                            reason,
+                            rounds,
+                            model_calls,
+                            started,
+                        )
+                        .await;
+                }
                 let plan = match self
                     .agent
                     .plan(PlanInput {
@@ -875,8 +979,12 @@ impl Engine {
                     }
                 };
                 // Usage is recorded before the output is read; a failed save
-                // warns and the plan still applies.
+                // warns and the plan still applies. Only calls that produced
+                // `AgentCallMeta` are counted: a runtime call that fails before
+                // reporting its metadata is invisible to the ledger.
+                let planner_calls = plan.meta.calls.len();
                 self.record_agent_calls(task_id, None, None, &plan).await;
+                model_calls += planner_calls;
                 let plan = plan.output;
 
                 if stop_requested(stop.as_ref()) {
@@ -958,7 +1066,20 @@ impl Engine {
                         anyhow::bail!("{message}");
                     }
                     PlanOutcome::AddIntent { description, plan } => {
-                        if rounds >= self.max_rounds {
+                        if rounds >= round_limit {
+                            if capacity.max_rounds.is_some() {
+                                return self
+                                    .pause_for_capacity(
+                                        task_id,
+                                        task,
+                                        capacity,
+                                        "rounds",
+                                        rounds,
+                                        model_calls,
+                                        started,
+                                    )
+                                    .await;
+                            }
                             let reason =
                                 format!("engine exceeded max rounds ({})", self.max_rounds);
                             self.fail_task(task_id, &mut task, reason.clone(), "engine")
@@ -1049,7 +1170,20 @@ impl Engine {
                         fact_id,
                         reason,
                     } => {
-                        if rounds >= self.max_rounds {
+                        if rounds >= round_limit {
+                            if capacity.max_rounds.is_some() {
+                                return self
+                                    .pause_for_capacity(
+                                        task_id,
+                                        task,
+                                        capacity,
+                                        "rounds",
+                                        rounds,
+                                        model_calls,
+                                        started,
+                                    )
+                                    .await;
+                            }
                             let reason =
                                 format!("engine exceeded max rounds ({})", self.max_rounds);
                             self.fail_task(task_id, &mut task, reason.clone(), "engine")
@@ -1131,7 +1265,20 @@ impl Engine {
                 }
             }
 
-            if rounds >= self.max_rounds {
+            if rounds >= round_limit {
+                if capacity.max_rounds.is_some() {
+                    return self
+                        .pause_for_capacity(
+                            task_id,
+                            task,
+                            capacity,
+                            "rounds",
+                            rounds,
+                            model_calls,
+                            started,
+                        )
+                        .await;
+                }
                 let reason = format!("engine exceeded max rounds ({})", self.max_rounds);
                 self.fail_task(task_id, &mut task, reason.clone(), "engine")
                     .await?;
@@ -1199,6 +1346,14 @@ impl Engine {
                 // runner-owned aggregate fact is recorded below, so usage is
                 // saved first. A worker with no completion record (a mock, or
                 // a failure before the call was made) is skipped.
+                //
+                // Failed calls that produced no `AgentCallMeta` cannot be
+                // counted; the ledger only sees calls a runtime reported.
+                model_calls += result
+                    .worker_results
+                    .iter()
+                    .map(|worker| worker.call_meta.calls.len())
+                    .sum::<usize>();
                 for worker in &result.worker_results {
                     if worker.call_meta.calls.is_empty() {
                         continue;
@@ -1413,7 +1568,9 @@ impl Engine {
                 }
             };
             // The row names the intent the worker was claimed for. A failed
-            // save warns and the worker's fact is still written.
+            // save warns and the worker's fact is still written. A failed call
+            // that returned no `AgentCallMeta` is not counted at all.
+            model_calls += executed.meta.calls.len();
             self.record_agent_calls(task_id, Some(claimed.id), Some("worker-1"), &executed)
                 .await;
             let output = executed.output;
@@ -3557,6 +3714,181 @@ mod tests {
         assert_eq!(failed.payload["source"], "engine");
     }
 
+    /// A per-task round ledger pauses the task instead of failing it, and the
+    /// pause happens before the open intent is claimed.
+    #[tokio::test]
+    async fn capacity_round_limit_pauses_before_claiming() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("pause on rounds", 100);
+        let goal = seed_goal(&store, &task).await;
+        GraphStore::set_task_capacity(
+            store.as_ref(),
+            task.id,
+            TaskCapacity {
+                max_rounds: Some(1),
+                ..TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+        let engine = Engine::new(
+            store.clone(),
+            Arc::new(ScriptedAgent::with_plans(
+                completion_plans("first", goal.id),
+                vec![execute_output("first fact", vec![])],
+            )),
+        )
+        .with_max_rounds(16);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Paused);
+        assert_eq!(result.rounds, 1);
+        assert_eq!(
+            store.get_task(task.id).await.unwrap().unwrap().state,
+            TaskState::Paused
+        );
+        let exhausted = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "capacity_exhausted")
+            .expect("capacity_exhausted activity");
+        assert_eq!(exhausted.payload["reason"], "rounds");
+        assert_eq!(exhausted.payload["rounds"], 1);
+        assert_eq!(exhausted.payload["max_rounds"], 1);
+        assert!(
+            !store
+                .activities(task.id)
+                .iter()
+                .any(|activity| activity.kind == "task_failed"),
+            "a capacity pause must not fail the task"
+        );
+        assert_eq!(
+            store.intents(task.id)[0].state,
+            IntentState::Open,
+            "the pause comes before the intent is claimed"
+        );
+    }
+
+    /// Extending the ledger and restarting the loop finishes the paused work.
+    #[tokio::test]
+    async fn capacity_extension_completes_a_paused_task() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("extend after pause", 100);
+        let goal = seed_goal(&store, &task).await;
+        GraphStore::set_task_capacity(
+            store.as_ref(),
+            task.id,
+            TaskCapacity {
+                max_rounds: Some(1),
+                ..TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+        let engine = Engine::new(
+            store.clone(),
+            Arc::new(ScriptedAgent::with_plans(
+                completion_plans("first", goal.id),
+                vec![execute_output("first fact", vec![])],
+            )),
+        )
+        .with_max_rounds(16);
+
+        let paused = engine.run_task(task.id).await.unwrap();
+        assert_eq!(paused.task.state, TaskState::Paused);
+
+        GraphStore::set_task_capacity(
+            store.as_ref(),
+            task.id,
+            TaskCapacity {
+                max_rounds: Some(16),
+                ..TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
+                .await
+                .unwrap()
+        );
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(result.facts, 2, "the origin fact plus the worker fact");
+        assert!(
+            store
+                .activities(task.id)
+                .iter()
+                .any(|activity| activity.kind == "capacity_exhausted")
+        );
+    }
+
+    /// Model calls reported by the planner count against the ledger.
+    #[tokio::test]
+    async fn capacity_model_call_limit_pauses_a_task() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("pause on model calls", 100);
+        GraphStore::set_task_capacity(
+            store.as_ref(),
+            task.id,
+            TaskCapacity {
+                max_model_calls: Some(1),
+                ..TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+        let engine =
+            Engine::new(store.clone(), Arc::new(RecordingAgent::new())).with_max_rounds(16);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Paused);
+        assert_eq!(result.rounds, 1, "the planner added one intent");
+        let exhausted = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "capacity_exhausted")
+            .expect("capacity_exhausted activity");
+        assert_eq!(exhausted.payload["reason"], "model_calls");
+        assert_eq!(exhausted.payload["model_calls"], 1);
+        assert_eq!(exhausted.payload["max_model_calls"], 1);
+    }
+
+    /// A zero wall budget is already exhausted at the top of the first loop:
+    /// the task pauses without making a model call and without sleeping.
+    #[tokio::test]
+    async fn capacity_wall_limit_pauses_a_task() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("pause on wall time", 100);
+        GraphStore::set_task_capacity(
+            store.as_ref(),
+            task.id,
+            TaskCapacity {
+                max_wall_secs: Some(0),
+                ..TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+        let engine = Engine::new(store.clone(), Arc::new(IdleAgent));
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Paused);
+        assert_eq!(result.rounds, 0);
+        let exhausted = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "capacity_exhausted")
+            .expect("capacity_exhausted activity");
+        assert_eq!(exhausted.payload["reason"], "wall_time");
+        assert_eq!(exhausted.payload["max_wall_secs"], 0);
+    }
+
     #[tokio::test]
     async fn no_progress_guard_does_not_stop_a_task_that_confirms_facts() {
         let store = Arc::new(MemoryStore::new());
@@ -3633,6 +3965,14 @@ mod tests {
             state: TaskState,
         ) -> anyhow::Result<bool> {
             self.inner.set_task_state_guarded(id, state).await
+        }
+
+        async fn set_task_capacity(
+            &self,
+            task_id: TaskId,
+            capacity: TaskCapacity,
+        ) -> anyhow::Result<Task> {
+            self.inner.set_task_capacity(task_id, capacity).await
         }
 
         async fn add_goal(&self, task_id: TaskId, description: String) -> anyhow::Result<Goal> {

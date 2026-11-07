@@ -7,8 +7,8 @@ use crate::{
     Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, Fact, FactId, Goal, GoalId,
     GuardDecision, GuardDecisionId, GuardVerdict, Intent, IntentId, IntentPlan, IntentState,
     NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus, SideQuestionRequest,
-    SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task, TaskId, TaskState, ToolCall,
-    ToolCallId,
+    SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task, TaskCapacity, TaskId,
+    TaskState, ToolCall, ToolCallId,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -41,6 +41,16 @@ pub trait GraphStore: Send + Sync {
     /// `failed`, or `timeout`, no further write applies, including a
     /// non-terminal target such as `running`. Returns whether a row changed.
     async fn set_task_state_guarded(&self, id: TaskId, state: TaskState) -> anyhow::Result<bool>;
+
+    /// Replaces one task's capacity ledger and returns the updated task.
+    ///
+    /// An unknown task is a normal error (not a panic). There is no terminal
+    /// guard here; the API refuses terminal tasks before calling this.
+    async fn set_task_capacity(
+        &self,
+        task_id: TaskId,
+        capacity: TaskCapacity,
+    ) -> anyhow::Result<Task>;
 
     async fn add_goal(&self, task_id: TaskId, description: String) -> anyhow::Result<Goal>;
     async fn list_goals(&self, task_id: TaskId) -> anyhow::Result<Vec<Goal>>;

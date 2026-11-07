@@ -1,0 +1,2 @@
+ALTER TABLE tasks
+    ADD COLUMN IF NOT EXISTS capacity JSONB NOT NULL DEFAULT '{}'::jsonb;

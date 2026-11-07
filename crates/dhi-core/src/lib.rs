@@ -300,6 +300,24 @@ impl AgentRole {
     }
 }
 
+/// One task's DHI+ capacity ledger.
+///
+/// Every field is optional: `None` means the engine keeps its own default
+/// (rounds) or applies no limit of that kind (model calls, wall time, workers).
+/// The store keeps the whole value in one JSONB column so an extension is one
+/// atomic row write.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCapacity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_rounds: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_model_calls: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_wall_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_workers: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
@@ -314,6 +332,8 @@ pub struct Task {
     /// Optional per-task worker profile pin. `None` follows the role default
     /// chain. Stored in `tasks.pinned_worker_profile_id`.
     pub pinned_worker_profile_id: Option<i64>,
+    /// Optional capacity limits. Stored in `tasks.capacity`.
+    pub capacity: TaskCapacity,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -330,6 +350,7 @@ impl Task {
             origin_fact_id: Uuid::new_v4(),
             pinned_planner_profile_id: None,
             pinned_worker_profile_id: None,
+            capacity: TaskCapacity::default(),
             created_at: now,
             updated_at: now,
         }

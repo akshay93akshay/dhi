@@ -7,8 +7,8 @@ use dhi_core::{
     Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, Fact, FactId, Goal, GoalId,
     GraphStore, GuardDecision, GuardDecisionId, GuardStore, GuardVerdict, Intent, IntentId,
     IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus,
-    SideQuestionRequest, SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task, TaskId,
-    TaskState, ToolCall, ToolCallId,
+    SideQuestionRequest, SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task,
+    TaskCapacity, TaskId, TaskState, ToolCall, ToolCallId,
 };
 use uuid::Uuid;
 
@@ -40,6 +40,14 @@ impl GraphStore for Store {
 
     async fn set_task_state_guarded(&self, id: TaskId, state: TaskState) -> anyhow::Result<bool> {
         Ok(Store::set_task_state_guarded(self, id, state).await?)
+    }
+
+    async fn set_task_capacity(
+        &self,
+        task_id: TaskId,
+        capacity: TaskCapacity,
+    ) -> anyhow::Result<Task> {
+        Ok(Store::set_task_capacity(self, task_id, capacity).await?)
     }
 
     async fn add_goal(&self, task_id: TaskId, description: String) -> anyhow::Result<Goal> {
