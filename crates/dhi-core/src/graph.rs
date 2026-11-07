@@ -42,6 +42,21 @@ pub trait GraphStore: Send + Sync {
     /// non-terminal target such as `running`. Returns whether a row changed.
     async fn set_task_state_guarded(&self, id: TaskId, state: TaskState) -> anyhow::Result<bool>;
 
+    /// Atomically moves a paused task back to running.
+    ///
+    /// Only one concurrent capacity extension may win this transition; the
+    /// losers must not spawn a second engine loop. The default is a
+    /// read-then-write fallback for test stores; durable stores override it
+    /// with one conditional UPDATE.
+    async fn resume_paused_task(&self, id: TaskId) -> anyhow::Result<bool> {
+        match self.get_task(id).await? {
+            Some(task) if task.state == TaskState::Paused => {
+                self.set_task_state_guarded(id, TaskState::Running).await
+            }
+            _ => Ok(false),
+        }
+    }
+
     /// Replaces one task's capacity ledger and returns the updated task.
     ///
     /// An unknown task is a normal error (not a panic). There is no terminal

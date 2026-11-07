@@ -8,15 +8,17 @@
  * {
  *   "intent_id": "…",
  *   "topology": "manager_worker" | "swarm",
- *   "workers": [{"key": "…", "role": "…", "status": "ok|failed|skipped", "subtask": "…"}],
+ *   "workers": 2,
+ *   "worker_details": [{"key": "…", "role": "…", "status": "ok|failed|skipped", "subtask": "…"}],
  *   "worker_keys": ["…"],
  *   "success": 2, "failed": 0, "skipped": 0
  * }
  * ```
  *
- * Older engine builds wrote `workers` as the worker COUNT and named the
- * workers only through `worker_keys`, so the parser accepts both shapes and
- * fills key-only worker rows from `worker_keys`. Every field is read
+ * Older engine builds wrote per-worker objects under `workers`; newer builds
+ * write the count there and the detail array under `worker_details`. The
+ * parser accepts every shape and falls back to key-only rows from
+ * `worker_keys`. Every field is read
  * defensively: malformed activities/payloads yield `null` and malformed
  * worker entries are dropped instead of throwing. React-free so the unit
  * tests can drive it directly under `node --test`.
@@ -174,12 +176,17 @@ export function parseTeamRunPayload(
   }
 
   const workers: TeamRunWorker[] = [];
-  if (Array.isArray(payload.workers)) {
-    for (const item of payload.workers) {
-      const worker = parseWorker(item);
-      if (worker !== null) {
-        workers.push(worker);
-      }
+  // Prefer the explicit detail array; older payloads use `workers` itself as
+  // the array. A numeric `workers` is only the count.
+  const detailItems = Array.isArray(payload.worker_details)
+    ? payload.worker_details
+    : Array.isArray(payload.workers)
+      ? payload.workers
+      : [];
+  for (const item of detailItems) {
+    const worker = parseWorker(item);
+    if (worker !== null) {
+      workers.push(worker);
     }
   }
 

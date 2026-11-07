@@ -242,6 +242,9 @@ function TeamRunPanel(props: { run: TeamRun }) {
           <span className="text-[12px] font-semibold uppercase tracking-wide text-muted-foreground">
             Team run
           </span>
+          <Badge variant="outline" className="font-normal">
+            DHI+
+          </Badge>
           <Badge variant="accent" className="font-mono">
             {run.topology}
           </Badge>

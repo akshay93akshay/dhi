@@ -110,6 +110,29 @@ test("parseTeamRunPayload fills key-only workers from the older worker_keys payl
   );
 });
 
+test("parseTeamRunPayload reads numeric workers with worker_details", () => {
+  const parsed = parseTeamRunPayload({
+    intent_id: "intent-3",
+    topology: "manager_worker",
+    workers: 2,
+    worker_details: [
+      { key: "beta", role: "critic", status: "failed", subtask: "s2" },
+      { key: "alpha", role: "researcher", status: "ok", subtask: "s1" },
+    ],
+    worker_keys: ["beta", "alpha"],
+    success: 1,
+    failed: 1,
+    skipped: 0,
+  });
+  assert.deepEqual(parsed?.workers, [
+    worker(),
+    worker({ key: "beta", role: "critic", status: "failed", subtask: "s2" }),
+  ]);
+  assert.equal(parsed?.workerCount, 2);
+  assert.equal(parsed?.success, 1);
+  assert.equal(parsed?.failed, 1);
+});
+
 test("parseTeamRunPayload merges worker_keys without duplicating described workers", () => {
   const parsed = parseTeamRunPayload({
     topology: "swarm",

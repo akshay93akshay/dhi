@@ -117,6 +117,10 @@ pub struct ExecuteInput {
     /// chain.
     #[serde(default)]
     pub worker_profile_id: Option<i64>,
+    /// The planner's per-worker turn budget for a DHI+ team turn. `None` uses
+    /// the runtime's role/manager budget (the legacy single-worker path).
+    #[serde(default)]
+    pub max_turns: Option<usize>,
 }
 
 /// One advisory side question about a task.
@@ -1897,7 +1901,12 @@ impl AgentRuntime for RigAgentRuntime {
             context: Some(tool_context),
             registry: Some(worker_registry),
         };
-        let max_turns = self.manager_max_turns();
+        // The planner's per-worker budget wins for a DHI+ team turn; the
+        // legacy single-worker path keeps the runtime's role/manager budget.
+        let max_turns = input
+            .max_turns
+            .unwrap_or_else(|| self.manager_max_turns())
+            .max(1);
         let attempt_tools = || {
             let sink = WorkerSink::default();
             let mut tools = sink.tools()?;
@@ -2164,6 +2173,7 @@ mod tests {
             intent: "Check whether the bishop pin holds".to_string(),
             context: vec!["fact 89abcdef: bishop on c1".to_string()],
             worker_profile_id: None,
+            max_turns: None,
         }
     }
 
@@ -2699,6 +2709,7 @@ mod tests {
                 intent: "check the pin".to_string(),
                 context: vec![],
                 worker_profile_id: None,
+                max_turns: None,
             })
             .await
             .unwrap();

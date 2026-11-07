@@ -915,12 +915,6 @@ impl Engine {
         }
 
         let mut rounds = 0;
-        // DHI+ capacity is fixed for this run: an extension while the loop is
-        // live is not observed until the next run.
-        let capacity = task.capacity;
-        let round_limit = capacity.max_rounds.unwrap_or(self.max_rounds);
-        let model_call_limit = capacity.max_model_calls;
-        let wall_limit = capacity.max_wall_secs;
         let started = std::time::Instant::now();
         let mut model_calls = 0;
         // Consecutive spent rounds without a new confirmed fact. The baseline
@@ -932,6 +926,17 @@ impl Engine {
         // intent, so only a genuinely stuck task ever exhausts this budget.
         let mut idle_ticks = 0;
         loop {
+            // Re-read the ledger every round. An extension made while this
+            // loop is live (for example during a long team run) applies at
+            // the next boundary instead of waiting for a new engine run.
+            if let Some(fresh) = self.store.get_task(task_id).await? {
+                task = fresh;
+            }
+            let capacity = task.capacity;
+            let round_limit = capacity.max_rounds.unwrap_or(self.max_rounds);
+            let model_call_limit = capacity.max_model_calls;
+            let wall_limit = capacity.max_wall_secs;
+
             if stop_requested(stop.as_ref()) {
                 return self
                     .stopped_result(
@@ -1394,12 +1399,20 @@ impl Engine {
                 // Failed calls that produced no `AgentCallMeta` cannot be
                 // counted; the ledger only sees calls a runtime reported.
                 model_calls += manager_model_calls;
-                model_calls += result
+                // Seed turns are the aggregate fact; reaction turns are
+                // audit/capacity work. Both are real completion calls, so
+                // both count against `max_model_calls` and become
+                // `agent_runs` rows.
+                let all_results: Vec<&dhi_orchestrator::WorkerResult> = result
                     .worker_results
+                    .iter()
+                    .chain(result.audit_results.iter())
+                    .collect();
+                model_calls += all_results
                     .iter()
                     .map(|worker| worker.call_meta.calls.len())
                     .sum::<usize>();
-                for worker in &result.worker_results {
+                for worker in &all_results {
                     if worker.call_meta.calls.is_empty() {
                         continue;
                     }
@@ -1431,7 +1444,7 @@ impl Engine {
                 // denial is audited and does not run, and the aggregate still
                 // records its fact. An executor error fails the task before
                 // the team fact exists.
-                for worker in &result.worker_results {
+                for worker in &all_results {
                     if worker.tool_calls.is_empty() {
                         continue;
                     }
@@ -1517,11 +1530,47 @@ impl Engine {
                             .iter()
                             .map(|worker| worker.worker_key.as_str())
                             .collect::<Vec<_>>(),
+                        "worker_details": result
+                            .worker_results
+                            .iter()
+                            .map(|worker| {
+                                let role = team_plan
+                                    .workers
+                                    .iter()
+                                    .find(|spec| spec.key == worker.worker_key)
+                                    .map(|spec| spec.role.clone())
+                                    .unwrap_or_default();
+                                let subtask = team_plan
+                                    .subtasks
+                                    .iter()
+                                    .find(|subtask| subtask.id == worker.subtask_id)
+                                    .map(|subtask| subtask.description.clone())
+                                    .unwrap_or_else(|| worker.subtask_id.clone());
+                                serde_json::json!({
+                                    "key": worker.worker_key,
+                                    "role": role,
+                                    "status": worker.status.to_string(),
+                                    "subtask": subtask,
+                                    "error": worker.error,
+                                })
+                            })
+                            .collect::<Vec<_>>(),
                         "max_parallel": team_plan.limits.max_parallel,
                         "success": successes,
                         "failed": failures,
                         "skipped": skipped,
                         "manager_model_calls": manager_model_calls,
+                        "reactions": result.audit_results.len(),
+                        "reaction_failures": result
+                            .audit_results
+                            .iter()
+                            .filter(|worker| worker.status == WorkerStatus::Failed)
+                            .map(|worker| serde_json::json!({
+                                "key": worker.worker_key,
+                                "subtask": worker.subtask_id,
+                                "error": worker.error,
+                            }))
+                            .collect::<Vec<_>>(),
                     }),
                 )
                 .await?;
@@ -1588,6 +1637,7 @@ impl Engine {
                     intent: claimed.description.clone(),
                     context: facts.iter().map(|f| f.claim.clone()).collect(),
                     worker_profile_id: task.pinned_worker_profile_id,
+                    max_turns: None,
                 })
                 .await
             {
@@ -2019,6 +2069,63 @@ mod tests {
 
         fn name(&self) -> &str {
             "team"
+        }
+    }
+
+    /// Planner plus a worker that records every turn, including swarm
+    /// reactions. Used to prove reaction usage reaches capacity and
+    /// `agent_runs`.
+    struct AllTurnsAgent {
+        planner: ScriptedAgent,
+        calls: Mutex<usize>,
+    }
+
+    impl AllTurnsAgent {
+        fn new(plans: Vec<ScriptedPlan>) -> Self {
+            Self {
+                planner: ScriptedAgent::with_plans(plans, vec![]),
+                calls: Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRuntime for AllTurnsAgent {
+        async fn plan(
+            &self,
+            input: PlanInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<PlanOutcome>> {
+            self.planner.plan(input).await
+        }
+
+        async fn execute(
+            &self,
+            input: ExecuteInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<dhi_agent::ExecuteOutput>> {
+            let turn = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            let record = call_record(Role::Worker, "team-worker-m");
+            Ok(dhi_agent::AgentCall {
+                output: execute_output(&format!("swarm finding {turn}"), vec![]),
+                meta: dhi_agent::AgentCallMeta {
+                    usage: record.usage,
+                    calls: vec![record],
+                },
+                prompt: input.intent.clone(),
+                response: format!("swarm finding {turn}"),
+                thinking: None,
+            })
+        }
+
+        fn name(&self) -> &str {
+            "all-turns"
         }
     }
 
@@ -5682,6 +5789,85 @@ mod tests {
                 .iter()
                 .all(|message| message.payload["type"].is_string()),
             "the payload is the serialized typed message"
+        );
+    }
+
+    /// Reaction turns are real model calls: they must count against
+    /// `max_model_calls`, become `agent_runs`, and never enter the fact.
+    #[tokio::test]
+    async fn swarm_reactions_count_against_capacity_and_become_agent_runs() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("swarm reaction capacity", 4);
+        let goal = seed_goal(&store, &task).await;
+        let mut plan = two_worker_plan("swarm reaction capacity", Topology::Swarm);
+        for worker in &mut plan.workers {
+            worker.max_turns = 2;
+        }
+        plan.limits.max_rounds = 2;
+        plan.limits.max_messages = 32;
+        GraphStore::set_task_capacity(
+            store.as_ref(),
+            task.id,
+            TaskCapacity {
+                max_model_calls: Some(3),
+                ..TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+        let agent = Arc::new(AllTurnsAgent::new(team_completion_plans(
+            "swarm reaction capacity",
+            plan,
+            goal.id,
+        )));
+        let engine = Engine::new(store.clone(), agent.clone()).with_max_rounds(16);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Paused);
+        assert_eq!(agent.calls(), 4, "two seeds plus two reactions");
+        let team_run = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "team_run")
+            .expect("team_run activity");
+        assert_eq!(team_run.payload["success"], 2);
+        assert_eq!(
+            team_run.payload["reactions"], 2,
+            "reaction turns are counted in the run summary"
+        );
+        let exhausted = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "capacity_exhausted")
+            .expect("capacity_exhausted activity");
+        assert_eq!(
+            exhausted.payload["model_calls"], 4,
+            "all four worker calls are charged"
+        );
+        let runs = store.agent_runs(task.id);
+        let worker_runs: Vec<_> = runs
+            .iter()
+            .filter(|run| {
+                run.worker_key.as_deref() == Some("alpha")
+                    || run.worker_key.as_deref() == Some("beta")
+            })
+            .collect();
+        assert_eq!(
+            worker_runs.len(),
+            4,
+            "each seed and reaction has one agent_runs row"
+        );
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 2, "origin plus exactly one team fact");
+        let fact = facts
+            .iter()
+            .find(|fact| fact.id != task.origin_fact_id)
+            .expect("team fact");
+        assert!(
+            !fact.claim.contains("swarm finding 3") && !fact.claim.contains("swarm finding 4"),
+            "reaction turns never enter the fact: {}",
+            fact.claim
         );
     }
 

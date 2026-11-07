@@ -700,6 +700,18 @@ async fn swarm_reactions_are_audit_only_and_never_enter_the_fact() {
         3,
         "only the three seed turns are aggregated"
     );
+    assert_eq!(
+        result.audit_results.len(),
+        3,
+        "reaction turns are kept for engine audit and capacity accounting"
+    );
+    assert!(
+        result
+            .audit_results
+            .iter()
+            .all(|worker| worker.subtask_id.contains(":r")),
+        "audit results identify their reaction subtask"
+    );
     for worker in ["a", "b", "c"] {
         assert!(
             result.fact.summary.contains(&format!("- {worker} [seed-")),

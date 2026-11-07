@@ -25,8 +25,8 @@ use crate::{CapabilityLimits, IntentPlan, Subtask, WorkerSpec};
 /// selector is opt-in through
 /// [`ManagerRunner::with_selector`](crate::ManagerRunner::with_selector).
 ///
-/// [`ManagerPrompt`] is the structured input a future LLM-backed selector
-/// receives; see its docs for the exact fields.
+/// [`ManagerPrompt`] is the structured input the live LLM manager receives;
+/// see its docs for the exact fields.
 #[async_trait]
 pub trait TeamSelector: Send + Sync {
     async fn select(&self, plan: &IntentPlan) -> anyhow::Result<IntentPlan>;
@@ -69,11 +69,11 @@ impl TeamSelector for BoundedSelector {
     }
 }
 
-/// The exact input a future LLM manager receives.
+/// The exact input the live LLM manager receives.
 ///
 /// This type is the contract for the LLM seam; it is not itself a model call.
-/// A selector implementation would render or serialize this value, ask the
-/// model to pick workers/subtasks, parse the answer, and return the resulting
+/// The engine's runtime selector renders this value, asks the model to pick
+/// workers/subtasks, parses the answer, and returns the resulting
 /// [`IntentPlan`]. The runner then validates that plan exactly as it validates
 /// [`BoundedSelector`]'s output.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

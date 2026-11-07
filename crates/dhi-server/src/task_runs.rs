@@ -6,7 +6,7 @@
 //! its own entry on exit, so the registry never keeps a stale worker.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use dhi_core::TaskId;
@@ -15,6 +15,9 @@ use dhi_pty::PtyTools;
 use tokio::task::AbortHandle;
 
 struct Entry {
+    /// Identifies the exact loop that registered this entry. A replaced loop
+    /// must not remove its successor's entry.
+    token: u64,
     stop: Arc<AtomicBool>,
     abort: AbortHandle,
 }
@@ -22,6 +25,7 @@ struct Entry {
 /// Tracks the live task loops of one server process.
 pub struct TaskRunRegistry {
     inner: Mutex<HashMap<TaskId, Entry>>,
+    next_token: AtomicU64,
     enabled: bool,
     pty: Option<Arc<PtyTools>>,
     containers: Option<Arc<TaskContainers>>,
@@ -39,6 +43,7 @@ impl TaskRunRegistry {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            next_token: AtomicU64::new(0),
             enabled: true,
             pty: None,
             containers: None,
@@ -50,6 +55,7 @@ impl TaskRunRegistry {
     pub fn with_cleanup(pty: Arc<PtyTools>, containers: Arc<TaskContainers>) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            next_token: AtomicU64::new(0),
             enabled: true,
             pty: Some(pty),
             containers: Some(containers),
@@ -61,6 +67,7 @@ impl TaskRunRegistry {
     pub fn disabled() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            next_token: AtomicU64::new(0),
             enabled: false,
             pty: None,
             containers: None,
@@ -71,6 +78,30 @@ impl TaskRunRegistry {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Adds or replaces the entry for a running task and returns the token
+    /// that identifies this exact loop. `None` means the registry is
+    /// disabled.
+    pub fn register_token(
+        &self,
+        task_id: TaskId,
+        stop_flag: Arc<AtomicBool>,
+        abort_handle: AbortHandle,
+    ) -> Option<u64> {
+        if !self.enabled {
+            return None;
+        }
+        let token = self.next_token.fetch_add(1, Ordering::SeqCst) + 1;
+        self.lock().insert(
+            task_id,
+            Entry {
+                token,
+                stop: stop_flag,
+                abort: abort_handle,
+            },
+        );
+        Some(token)
+    }
+
     /// Adds or replaces the entry for a running task. Returns whether the
     /// registry is enabled and accepted the entry.
     pub fn register(
@@ -79,22 +110,25 @@ impl TaskRunRegistry {
         stop_flag: Arc<AtomicBool>,
         abort_handle: AbortHandle,
     ) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        self.lock().insert(
-            task_id,
-            Entry {
-                stop: stop_flag,
-                abort: abort_handle,
-            },
-        );
-        true
+        self.register_token(task_id, stop_flag, abort_handle)
+            .is_some()
     }
 
     /// Removes an entry, normally called by the loop itself on exit.
     pub fn remove(&self, task_id: TaskId) -> bool {
         self.lock().remove(&task_id).is_some()
+    }
+
+    /// Removes the entry only when it still belongs to `token`. A loop that
+    /// was replaced by a newer loop must not untrack its successor.
+    pub fn remove_token(&self, task_id: TaskId, token: u64) -> bool {
+        let mut map = self.lock();
+        if map.get(&task_id).is_some_and(|entry| entry.token == token) {
+            map.remove(&task_id);
+            true
+        } else {
+            false
+        }
     }
 
     /// Flips the cooperative stop flag. Returns `false` when there is no
@@ -187,6 +221,38 @@ mod tests {
         assert!(!registry.contains(task_id));
         assert!(!registry.abort_and_remove(task_id));
         assert_eq!(registry.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_loop_cannot_remove_its_successor() {
+        let registry = TaskRunRegistry::new();
+        let task_id = uuid::Uuid::new_v4();
+        let first = tokio::spawn(std::future::pending::<()>());
+        let second = tokio::spawn(std::future::pending::<()>());
+
+        let first_token = registry
+            .register_token(
+                task_id,
+                Arc::new(AtomicBool::new(false)),
+                first.abort_handle(),
+            )
+            .expect("enabled registry");
+        let second_token = registry
+            .register_token(
+                task_id,
+                Arc::new(AtomicBool::new(false)),
+                second.abort_handle(),
+            )
+            .expect("enabled registry");
+        assert_ne!(first_token, second_token);
+
+        assert!(
+            !registry.remove_token(task_id, first_token),
+            "the replaced loop must not remove the successor"
+        );
+        assert!(registry.contains(task_id));
+        assert!(registry.remove_token(task_id, second_token));
+        assert!(!registry.contains(task_id));
     }
 
     #[tokio::test]

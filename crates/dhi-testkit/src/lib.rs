@@ -255,6 +255,19 @@ impl GraphStore for MemoryStore {
         Ok(true)
     }
 
+    async fn resume_paused_task(&self, id: TaskId) -> anyhow::Result<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(task) = inner.tasks.get_mut(&id) else {
+            return Ok(false);
+        };
+        if task.state != TaskState::Paused {
+            return Ok(false);
+        }
+        task.state = TaskState::Running;
+        task.updated_at = Utc::now();
+        Ok(true)
+    }
+
     async fn set_task_capacity(
         &self,
         task_id: TaskId,

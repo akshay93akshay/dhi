@@ -190,6 +190,19 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Atomically moves a paused task back to running. Concurrent capacity
+    /// extensions race on one conditional UPDATE; exactly one wins.
+    pub async fn resume_paused_task(&self, id: Uuid) -> Result<bool, StoreError> {
+        let result = sqlx::query(
+            "UPDATE tasks SET state = 'running', updated_at = now()
+             WHERE id = $1 AND state = 'paused'",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Replaces one task's capacity ledger and returns the persisted task.
     /// Missing tasks surface as [`StoreError::NotFound`].
     pub async fn set_task_capacity(

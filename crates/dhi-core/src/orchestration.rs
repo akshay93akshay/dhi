@@ -160,6 +160,30 @@ impl IntentPlan {
             }
         }
 
+        if self.topology == Topology::Swarm {
+            // A swarm seeds one turn per worker. More subtasks than workers
+            // would be silently dropped by the runner, so reject the plan
+            // instead of confirming a fact that omits planned work.
+            if self.subtasks.len() > self.workers.len() {
+                return Err(OrchestrationError::SwarmSubtaskCount {
+                    workers: self.workers.len(),
+                    subtasks: self.subtasks.len(),
+                });
+            }
+            // A worker can seed only one subtask. Duplicate explicit
+            // assignments would leave one of the declared subtasks unseeded.
+            let mut assigned = HashSet::with_capacity(self.subtasks.len());
+            for subtask in &self.subtasks {
+                if let Some(key) = subtask.worker_key.as_deref()
+                    && !assigned.insert(key)
+                {
+                    return Err(OrchestrationError::SwarmDuplicateAssignment {
+                        worker_key: key.to_owned(),
+                    });
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -195,6 +219,12 @@ pub enum OrchestrationError {
         subtask_id: String,
         worker_key: String,
     },
+    #[error(
+        "swarm topology has {subtasks} subtasks for {workers} workers; a swarm seeds one subtask per worker"
+    )]
+    SwarmSubtaskCount { workers: usize, subtasks: usize },
+    #[error("swarm worker {worker_key:?} is assigned more than one seed subtask")]
+    SwarmDuplicateAssignment { worker_key: String },
 }
 
 #[cfg(test)]
@@ -249,6 +279,45 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Topology::ManagerWorker).unwrap(),
             "\"manager_worker\""
+        );
+    }
+
+    #[test]
+    fn swarm_rejects_more_subtasks_than_workers() {
+        let plan = IntentPlan {
+            intent: "ship it".to_owned(),
+            topology: Topology::Swarm,
+            workers: vec![worker("a"), worker("b")],
+            subtasks: vec![
+                subtask("s0", None),
+                subtask("s1", None),
+                subtask("s2", None),
+            ],
+            limits: CapabilityLimits::default(),
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(OrchestrationError::SwarmSubtaskCount {
+                workers: 2,
+                subtasks: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn swarm_rejects_duplicate_seed_assignments() {
+        let plan = IntentPlan {
+            intent: "ship it".to_owned(),
+            topology: Topology::Swarm,
+            workers: vec![worker("a"), worker("b")],
+            subtasks: vec![subtask("s0", Some("a")), subtask("s1", Some("a"))],
+            limits: CapabilityLimits::default(),
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(OrchestrationError::SwarmDuplicateAssignment {
+                worker_key: "a".to_owned(),
+            })
         );
     }
 

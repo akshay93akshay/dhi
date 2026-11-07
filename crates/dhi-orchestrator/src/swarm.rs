@@ -151,9 +151,10 @@ impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
         let (report_tx, mut report_rx) = mpsc::unbounded_channel::<WorkerReport>();
         let mut tasks = JoinSet::new();
         let mut identities: HashMap<Id, (String, String)> = HashMap::with_capacity(worker_count);
+        let seeds = swarm_seeds(plan);
 
         for (index, worker) in plan.workers.iter().cloned().enumerate() {
-            let seed = plan.subtasks[index % plan.subtasks.len()].clone();
+            let seed = seeds[index].clone();
             let inbox = inboxes[index].take().expect("swarm inbox exists");
             let worker_peers = peers[index].clone();
             let worker_reports = report_tx.clone();
@@ -228,7 +229,7 @@ impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
         }
         while tasks.join_next().await.is_some() {}
 
-        let (results, stats) = {
+        let (results, audit_results, stats) = {
             let state = board_lock(&board);
             let stats = SwarmStats {
                 rounds: round as usize,
@@ -236,7 +237,11 @@ impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
                 findings: state.findings,
                 completed_workers: state.done.union(&dead).count(),
             };
-            (sorted_results(&state.results), stats)
+            (
+                sorted_results(&state.results),
+                sorted_results(&state.audit_results),
+                stats,
+            )
         };
         *self
             .last_stats
@@ -258,6 +263,7 @@ impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
             summary: aggregation.summary,
             fact: aggregation.fact,
             worker_results: results,
+            audit_results,
         })
     }
 }
@@ -270,7 +276,10 @@ struct WorkerReport {
 
 #[derive(Debug, Default)]
 struct BoardState {
+    /// Seed turns only: the deterministic aggregator reads this list.
     results: Vec<WorkerResult>,
+    /// Reaction turns: real audit/capacity work that is never aggregated.
+    audit_results: Vec<WorkerResult>,
     messages: usize,
     findings: usize,
     last_finding_round: u64,
@@ -305,6 +314,44 @@ fn stop_reason(
         return Some(StopReason::NoNewFindings);
     }
     None
+}
+
+/// One seed per worker, honoring explicit planner assignments.
+///
+/// An explicit `worker_key` gets exactly that subtree (plan validation
+/// rejects a duplicate key and unknown keys). Unassigned subtasks fill the
+/// remaining workers in plan order; when there are fewer subtasks than
+/// workers, the planner's list cycles, as the runner's contract documents.
+fn swarm_seeds(plan: &IntentPlan) -> Vec<Subtask> {
+    let mut explicit: HashMap<&str, Subtask> = HashMap::new();
+    for subtask in &plan.subtasks {
+        if let Some(key) = subtask.worker_key.as_deref() {
+            explicit.entry(key).or_insert_with(|| subtask.clone());
+        }
+    }
+    let unassigned: Vec<Subtask> = plan
+        .subtasks
+        .iter()
+        .filter(|subtask| subtask.worker_key.is_none())
+        .cloned()
+        .collect();
+    let mut next_unassigned = 0usize;
+
+    plan.workers
+        .iter()
+        .enumerate()
+        .map(|(index, worker)| {
+            if let Some(seed) = explicit.remove(worker.key.as_str()) {
+                return seed;
+            }
+            if next_unassigned < unassigned.len() {
+                let seed = unassigned[next_unassigned].clone();
+                next_unassigned += 1;
+                return seed;
+            }
+            plan.subtasks[index % plan.subtasks.len()].clone()
+        })
+        .collect()
 }
 
 /// Wait until every live worker reports the current round, or until workers
@@ -579,8 +626,12 @@ fn record_result(
         // A reaction is peer traffic, not the worker's assigned result. Only
         // the seed turn enters the board that the deterministic aggregator
         // reads, so a peer's topic can never overwrite a worker's finding.
+        // The reaction still enters the audit list: its model calls, usage,
+        // failure, and post-hoc tool requests must reach the engine.
         if aggregate {
             state.results.push(result.clone());
+        } else {
+            state.audit_results.push(result.clone());
         }
         if result.status == WorkerStatus::Ok {
             state.findings += 1;
@@ -804,6 +855,61 @@ mod tests {
                 reaction.description
             );
         }
+    }
+
+    fn worker_spec(key: &str) -> WorkerSpec {
+        WorkerSpec {
+            key: key.to_string(),
+            role: "peer".to_string(),
+            prompt: "report".to_string(),
+            max_turns: 2,
+        }
+    }
+
+    #[test]
+    fn explicit_seed_assignments_are_honored() {
+        let plan = IntentPlan {
+            intent: "swarm".to_string(),
+            topology: crate::Topology::Swarm,
+            workers: vec![worker_spec("alpha"), worker_spec("beta")],
+            subtasks: vec![
+                Subtask {
+                    id: "s0".to_string(),
+                    description: "do s0".to_string(),
+                    worker_key: Some("beta".to_string()),
+                },
+                Subtask {
+                    id: "s1".to_string(),
+                    description: "do s1".to_string(),
+                    worker_key: Some("alpha".to_string()),
+                },
+            ],
+            limits: crate::CapabilityLimits::default(),
+        };
+
+        let seeds = swarm_seeds(&plan);
+        assert_eq!(seeds[0].id, "s1");
+        assert_eq!(seeds[1].id, "s0");
+    }
+
+    #[test]
+    fn fewer_subtasks_cycle_for_unassigned_workers() {
+        let plan = IntentPlan {
+            intent: "swarm".to_string(),
+            topology: crate::Topology::Swarm,
+            workers: vec![worker_spec("alpha"), worker_spec("beta")],
+            subtasks: vec![Subtask {
+                id: "s0".to_string(),
+                description: "do s0".to_string(),
+                worker_key: None,
+            }],
+            limits: crate::CapabilityLimits::default(),
+        };
+
+        let seeds = swarm_seeds(&plan);
+        assert_eq!(seeds.len(), 2);
+        assert_eq!(seeds[0].id, "s0");
+        assert_eq!(seeds[1].id, "s0");
     }
 
     #[test]

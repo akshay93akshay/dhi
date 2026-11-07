@@ -166,6 +166,7 @@ impl<E: WorkerExecutor + 'static> ManagerRunner<E> {
             summary: aggregation.summary,
             fact: aggregation.fact,
             worker_results: results,
+            audit_results: Vec::new(),
         })
     }
 }

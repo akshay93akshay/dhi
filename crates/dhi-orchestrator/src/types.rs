@@ -164,5 +164,13 @@ impl WorkerResult {
 pub struct IntentResult {
     pub summary: String,
     pub fact: FactDraft,
+    /// The seed result of every worker. These are the only results the
+    /// deterministic aggregator reads.
     pub worker_results: Vec<WorkerResult>,
+    /// Real worker turns that must never enter the aggregate fact: swarm
+    /// peer-reaction turns (and their model calls, usage, failures, and
+    /// post-hoc tool requests). The engine records and guards these exactly
+    /// like seed results, but the aggregator never sees them.
+    #[serde(default)]
+    pub audit_results: Vec<WorkerResult>,
 }

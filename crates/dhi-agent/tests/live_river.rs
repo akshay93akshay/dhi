@@ -85,6 +85,7 @@ async fn live_river_worker_smoke() {
                 "This is a local reasoning task; no domain tools are available.".to_string(),
             ],
             worker_profile_id: None,
+            max_turns: None,
         })
         .await
         .expect("the live worker call must succeed");

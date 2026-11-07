@@ -591,14 +591,16 @@ fn spawn_task_loop(
 ) {
     let stop = Arc::new(AtomicBool::new(false));
     let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+    let (token_tx, token_rx) = tokio::sync::oneshot::channel::<Option<u64>>();
     let engine = engine.clone();
     let registry = registry.clone();
     let loop_registry = registry.clone();
     let store = store.clone();
     let loop_stop = stop.clone();
     let handle = tokio::spawn(async move {
-        // `register` runs before this permit is sent; the loop cannot race
-        // ahead and remove an entry that does not exist yet.
+        // `register_token` runs before this permit is sent; the loop cannot
+        // race ahead and remove an entry that does not exist yet.
+        let token = token_rx.await.ok().flatten();
         let _ = start_rx.await;
         let result = engine.run_task_with_stop(task_id, Some(loop_stop)).await;
         if let Err(err) = result {
@@ -614,10 +616,14 @@ fn spawn_task_loop(
             .await;
         }
         // A graceful stop and a normal completion both land here. The entry
-        // goes away only after the task reached its terminal state.
-        loop_registry.remove(task_id);
+        // goes away only after the task reached its terminal state, and only
+        // if this loop still owns it.
+        if let Some(token) = token {
+            loop_registry.remove_token(task_id, token);
+        }
     });
-    registry.register(task_id, stop, handle.abort_handle());
+    let token = registry.register_token(task_id, stop, handle.abort_handle());
+    let _ = token_tx.send(token);
     let _ = start_tx.send(());
 }
 
@@ -693,17 +699,21 @@ async fn set_task_capacity_route(
         .await
         .map_err(ApiError::internal)?;
 
-    // Only a paused task gets a new loop. A running task reads its ledger at
-    // run start, so an extension applies to its next run.
-    if updated.state == TaskState::Paused
-        && state
-            .store
-            .set_task_state_guarded(id, TaskState::Running)
-            .await
-            .map_err(ApiError::internal)?
+    // Only one concurrent extension may resume a paused task; the atomic
+    // transition prevents two engine loops for one task. A running task
+    // re-reads its ledger at the next round, so the extension applies there.
+    if state
+        .store
+        .resume_paused_task(id)
+        .await
+        .map_err(ApiError::internal)?
     {
         updated.state = TaskState::Running;
         spawn_task_loop(&state.store, &state.task_runs, &state.engine, id);
+    } else if updated.state == TaskState::Paused {
+        // Another request won the resume; return its current state instead of
+        // the stale paused snapshot.
+        updated = require_task(state.store.as_ref(), id).await?;
     }
 
     Ok(Json(updated))
@@ -4233,6 +4243,28 @@ mod tests {
     // -----------------------------------------------------------------------
     // Task capacity extension
     // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn resume_paused_task_is_a_single_winner() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("resume race", 2);
+        GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Paused)
+            .await
+            .unwrap();
+
+        assert!(
+            store.resume_paused_task(task.id).await.unwrap(),
+            "the first resumed transition wins"
+        );
+        assert!(
+            !store.resume_paused_task(task.id).await.unwrap(),
+            "a second extension cannot resume a running task"
+        );
+        assert_eq!(
+            store.get_task(task.id).await.unwrap().unwrap().state,
+            TaskState::Running
+        );
+    }
 
     #[tokio::test]
     async fn capacity_extension_merges_omitted_fields() {

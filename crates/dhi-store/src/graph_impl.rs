@@ -42,6 +42,10 @@ impl GraphStore for Store {
         Ok(Store::set_task_state_guarded(self, id, state).await?)
     }
 
+    async fn resume_paused_task(&self, id: TaskId) -> anyhow::Result<bool> {
+        Ok(Store::resume_paused_task(self, id).await?)
+    }
+
     async fn set_task_capacity(
         &self,
         task_id: TaskId,

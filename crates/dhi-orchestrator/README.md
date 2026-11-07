@@ -16,8 +16,9 @@ The orchestration foundation for DHI+ intents. This crate turns one
 - **TeamSelector**: the manager's worker-choice seam. It runs after the
   planner's plan validates and before any assignment. `ManagerRunner::new`
   keeps the planner's plan unchanged; `with_selector` opts into a choice.
-  `BoundedSelector` is the deterministic testable selector. `ManagerPrompt`
-  names the exact input a future LLM selector receives.
+  `BoundedSelector` is the deterministic selector; the engine's
+  `RuntimeTeamSelector` is the live LLM manager. `ManagerPrompt` names the
+  exact input the manager receives.
 - **Aggregator**: combines worker results into the single `IntentResult`
   summary and `FactDraft`. `DeterministicAggregator` orders results by worker
   and subtask key so output does not depend on completion order. An LLM
@@ -27,8 +28,12 @@ The orchestration foundation for DHI+ intents. This crate turns one
 
 - One intent produces one `IntentResult` and one fact draft. Runners never
   write facts; the caller persists the returned draft.
-- A failed worker does not discard other workers' results. Failures appear in
-  the aggregate evidence.
+- A swarm's aggregate reads only each worker's seed turn. Peer-reaction turns
+  are returned in `audit_results` for the engine's capacity, usage, failure,
+  and post-hoc tool accounting; they never enter the fact.
+- A failed worker does not discard other workers' results. Seed failures
+  appear in the aggregate evidence; reaction failures appear in the team-run
+  audit payload.
 - `max_workers`, `max_parallel`, `max_rounds`, and `max_messages` are enforced
   by the runtime. A selector cannot widen the planner's limits.
 - A selected manager plan keeps the `manager_worker` topology, a non-empty

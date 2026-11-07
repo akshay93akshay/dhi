@@ -30,7 +30,9 @@ One Rust process, `dhi-server`, serves the JSON API under `/api` and the exporte
 
 ### DHI+ orchestration
 
-The planner may choose single, manager-worker, or swarm execution for an intent. Manager-worker runs independent workers in parallel. Swarm exchanges typed findings between peers and stops on its budget and stop rules. Either way, one intent still produces one confirmed fact, and the guard and audit path is unchanged.
+The planner may choose single, manager-worker, or swarm execution for an intent. Manager-worker runs independent workers in parallel. Swarm exchanges typed findings between peers and stops on its budget and stop rules; only each worker's seed turn enters the aggregated fact, while reaction turns remain visible in the swarm audit and count against capacity. Either way, one intent still produces one confirmed fact, and the guard and audit path is unchanged.
+
+Each task has a visible capacity ledger: `max_rounds`, `max_model_calls`, `max_wall_secs`, and `max_parallel_workers`. Omitted limits use the engine defaults. `POST /api/tasks` accepts the ledger at creation, `POST /api/tasks/{id}/capacity` extends it, and the Work view shows and edits it. Exhaustion pauses the task (never fails it); an extension resumes a paused task. Swarm broadcasts are durable and readable at `GET /api/tasks/{id}/swarm-messages`.
 
 The engine budgets are:
 
