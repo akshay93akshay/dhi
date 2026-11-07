@@ -19,7 +19,7 @@ use uuid::Uuid;
 #[async_trait]
 pub trait GraphStore: Send + Sync {
     /// Creates a task with its origin fact and one `task_created` activity.
-    async fn create_task(&self, goal: String, bound: i32) -> anyhow::Result<Task>;
+    async fn create_task(&self, goal: String) -> anyhow::Result<Task>;
 
     /// Like [`GraphStore::create_task`] with optional per-task role pins.
     /// `None` keeps the task on the role's default chain; a present id must
@@ -27,7 +27,6 @@ pub trait GraphStore: Send + Sync {
     async fn create_task_with_pins(
         &self,
         goal: String,
-        bound: i32,
         planner_pin: Option<i64>,
         worker_pin: Option<i64>,
     ) -> anyhow::Result<Task>;

@@ -53,7 +53,6 @@ pub use tools::{
 pub struct PlanInput {
     pub task_id: Uuid,
     pub goal: String,
-    pub bound: i32,
     /// Open goals, with their full ids, so a proof can name one.
     pub goals: Vec<dhi_core::Goal>,
     /// Facts of the task, with their full ids and states.
@@ -102,7 +101,7 @@ pub enum PlanOutcome {
 /// rules: the snapshot is frozen, the answer is advisory, and there are no
 /// tools or graph writes.
 pub const SIDE_QUESTION_PREAMBLE: &str = "\
-You are a read-only side-question assistant for one DHI task. \
+You are a read-only side-question assistant for one DHI+ task. \
 The task snapshot in the user message was frozen when this conversation began; \
 answer only from that snapshot. You are advisory only: your answer cannot \
 change the task, its goals, intents, facts, or its work graph, and it is never \
@@ -342,10 +341,7 @@ impl AgentRuntime for MockAgentRuntime {
                 reason: "mock planner proves from the first confirmed fact".to_string(),
             },
             _ => PlanOutcome::AddIntent {
-                description: format!(
-                    "Investigate the next step for: {} (bound {})",
-                    input.goal, input.bound
-                ),
+                description: format!("Investigate the next step for: {}", input.goal),
                 plan: None,
             },
         };
@@ -612,7 +608,7 @@ pub fn apply_manager_choice(
 /// the manager may not widen.
 pub fn manager_selection_prompt(plan: &dhi_core::IntentPlan) -> (String, String) {
     let system = format!(
-        "You are the DHI manager. Choose only from the allowed_workers in the input; \
+        "You are the DHI+ manager. Choose only from the allowed_workers in the input; \
          never invent a worker. You are the selector, not a worker: do not add \
          yourself to the selection. Return JSON only, with this schema: \
          {{\"worker_keys\":[\"...\"],\"assignments\":[{{\"subtask_id\":\"...\",\"worker_key\":\"...\"}}]}}. \
@@ -827,7 +823,7 @@ impl RigAgentRuntime {
             tool_server: ToolServer::new().run(),
             worker_tool_view: None,
             specialists: None,
-            limits: DelegationLimits::from_env(),
+            limits: DelegationLimits::default(),
         }
     }
 
@@ -880,7 +876,7 @@ impl RigAgentRuntime {
             tool_server: ToolServer::new().run(),
             worker_tool_view: None,
             specialists: None,
-            limits: DelegationLimits::from_env(),
+            limits: DelegationLimits::default(),
         }
     }
 
@@ -980,7 +976,6 @@ impl RigAgentRuntime {
     pub fn render_plan(&self, input: &PlanInput) -> Result<RenderedCall, PromptError> {
         let vars = PlannerVars {
             goal: input.goal.clone(),
-            bound: input.bound,
             goals: goal_lines(&input.goals),
             facts: fact_lines(&input.facts),
             open_intents: input.open_intents,
@@ -1375,12 +1370,12 @@ fn failure_lines(failures: &[String]) -> String {
 /// bad constant is a bug in this crate, not configuration.
 fn fallback_prompts() -> PromptSet {
     let planner = PromptTemplate::parse(
-        "# Planner prompt\n\nYou are the DHI planner.\n\n{{goal}}\n\nFacts:\n\n{{facts}}\n"
+        "# Planner prompt\n\nYou are the DHI+ planner.\n\n{{goal}}\n\nFacts:\n\n{{facts}}\n"
             .to_string(),
         Role::Planner,
     );
     let worker = PromptTemplate::parse(
-        "# Worker prompt\n\nYou are the DHI worker.\n\n{{intent}}\n\nContext:\n\n{{context}}\n"
+        "# Worker prompt\n\nYou are the DHI+ worker.\n\n{{intent}}\n\nContext:\n\n{{context}}\n"
             .to_string(),
         Role::Worker,
     );
@@ -2100,7 +2095,6 @@ impl AgentRuntime for RigAgentRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
 
     fn prompts() -> PromptSet {
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/prompts");
@@ -2119,34 +2113,6 @@ mod tests {
         RigAgentRuntime::with_parts(profiles, prompts())
     }
 
-    const LIMIT_KEYS: &[&str] = &["DHI_MANAGER_MAX_TURNS", "DHI_MAX_DELEGATIONS"];
-
-    /// Runs `f` with exactly the given delegation-limit variables and restores
-    /// every previous value afterwards, including when `f` panics.
-    fn with_limit_env(vars: &[(&'static str, &str)], f: impl FnOnce()) {
-        let saved: Vec<(&str, Option<String>)> = LIMIT_KEYS
-            .iter()
-            .map(|key| (*key, std::env::var(key).ok()))
-            .collect();
-        for key in LIMIT_KEYS {
-            // Edition 2024: `remove_var` is unsafe because env is global.
-            unsafe { std::env::remove_var(key) };
-        }
-        for (key, value) in vars {
-            unsafe { std::env::set_var(key, value) };
-        }
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-        for (key, value) in saved {
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-        if let Err(panic) = outcome {
-            std::panic::resume_unwind(panic);
-        }
-    }
-
     fn test_specialist(name: &str) -> SpecialistSpec {
         SpecialistSpec {
             name: name.to_string(),
@@ -2159,7 +2125,7 @@ mod tests {
     }
 
     fn plan_input() -> PlanInput {
-        let task = dhi_core::Task::new("forced mate in 4", 4);
+        let task = dhi_core::Task::new("forced mate in 4");
         let origin = task.origin_fact();
         let goal = dhi_core::Goal {
             id: Uuid::new_v4(),
@@ -2172,7 +2138,6 @@ mod tests {
         PlanInput {
             task_id: task.id,
             goal: task.goal,
-            bound: 4,
             goals: vec![goal],
             facts: vec![origin],
             open_intents: 1,
@@ -2342,94 +2307,38 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn manager_max_turns_env_reaches_attached_specialists() {
-        with_limit_env(&[("DHI_MANAGER_MAX_TURNS", "40")], || {
-            let mut runtime = runtime_with("planner-x", "worker-y");
-            runtime
-                .with_specialists(vec![test_specialist("researcher")], None)
-                .expect("specialists attach");
+    fn delegation_limits_use_the_compiled_defaults() {
+        let mut runtime = runtime_with("planner-x", "worker-y");
+        runtime
+            .with_specialists(vec![test_specialist("researcher")], None)
+            .expect("specialists attach");
 
-            let fleet = runtime.specialists().expect("a fleet is attached");
-            assert_eq!(fleet.manager_max_turns(), 40);
-            assert_eq!(
-                runtime.manager_max_turns(),
-                40,
-                "execute uses the manager cap"
-            );
-        });
+        let fleet = runtime.specialists().expect("a fleet is attached");
+        assert_eq!(fleet.manager_max_turns(), DEFAULT_MANAGER_MAX_TURNS);
+        assert_eq!(fleet.max_delegations(), DEFAULT_MAX_DELEGATIONS);
+        assert_eq!(runtime.manager_max_turns(), DEFAULT_MANAGER_MAX_TURNS);
     }
 
     #[test]
-    #[serial]
-    fn max_delegations_env_reaches_the_fleet() {
-        with_limit_env(&[("DHI_MAX_DELEGATIONS", "3")], || {
-            let mut runtime = runtime_with("planner-x", "worker-y");
-            runtime
-                .with_specialists(vec![test_specialist("researcher")], None)
-                .expect("specialists attach");
-
-            let fleet = runtime.specialists().expect("a fleet is attached");
-            assert_eq!(fleet.max_delegations(), 3);
-            assert_eq!(fleet.manager_max_turns(), DEFAULT_MANAGER_MAX_TURNS);
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn delegation_limits_default_when_the_env_is_unset() {
-        with_limit_env(&[], || {
-            let mut runtime = runtime_with("planner-x", "worker-y");
-            runtime
-                .with_specialists(vec![test_specialist("researcher")], None)
-                .expect("specialists attach");
-
-            let fleet = runtime.specialists().expect("a fleet is attached");
-            assert_eq!(fleet.manager_max_turns(), 12);
-            assert_eq!(fleet.max_delegations(), 8);
-            assert_eq!(runtime.manager_max_turns(), 12);
-        });
-    }
-
-    #[test]
-    #[serial]
     fn worker_profile_budget_is_unchanged_without_specialists() {
-        with_limit_env(
-            &[
-                ("DHI_MANAGER_MAX_TURNS", "40"),
-                ("DHI_MAX_DELEGATIONS", "3"),
-            ],
-            || {
-                let runtime = runtime_with("planner-x", "worker-y");
+        let runtime = runtime_with("planner-x", "worker-y");
 
-                assert!(runtime.specialists().is_none());
-                assert_eq!(runtime.worker_profile().max_turns, 24);
-                assert_eq!(runtime.manager_max_turns(), 24);
-            },
-        );
+        assert!(runtime.specialists().is_none());
+        assert_eq!(runtime.worker_profile().max_turns, 24);
+        assert_eq!(runtime.manager_max_turns(), 24);
     }
 
     #[test]
-    #[serial]
     fn with_pool_resolves_the_same_delegation_limits() {
-        with_limit_env(
-            &[
-                ("DHI_MANAGER_MAX_TURNS", "40"),
-                ("DHI_MAX_DELEGATIONS", "3"),
-            ],
-            || {
-                let mut runtime =
-                    RigAgentRuntime::with_pool(Arc::new(LlmPool::default()), prompts());
-                runtime
-                    .with_specialists(vec![test_specialist("researcher")], None)
-                    .expect("specialists attach");
+        let mut runtime = RigAgentRuntime::with_pool(Arc::new(LlmPool::default()), prompts());
+        runtime
+            .with_specialists(vec![test_specialist("researcher")], None)
+            .expect("specialists attach");
 
-                let fleet = runtime.specialists().expect("a fleet is attached");
-                assert_eq!(fleet.manager_max_turns(), 40);
-                assert_eq!(fleet.max_delegations(), 3);
-                assert_eq!(runtime.manager_max_turns(), 40);
-            },
-        );
+        let fleet = runtime.specialists().expect("a fleet is attached");
+        assert_eq!(fleet.manager_max_turns(), DEFAULT_MANAGER_MAX_TURNS);
+        assert_eq!(fleet.max_delegations(), DEFAULT_MAX_DELEGATIONS);
+        assert_eq!(runtime.manager_max_turns(), DEFAULT_MANAGER_MAX_TURNS);
     }
 
     #[test]
@@ -2936,7 +2845,7 @@ mod tests {
         let plan = manager_plan();
         let (system, user) = manager_selection_prompt(&plan);
 
-        assert!(system.contains("DHI manager"), "{system}");
+        assert!(system.contains("DHI+ manager"), "{system}");
         assert!(system.contains("allowed_workers"), "{system}");
         assert!(system.contains("JSON only"), "{system}");
         assert!(

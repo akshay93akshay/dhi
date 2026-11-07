@@ -29,12 +29,11 @@ Planner: you never run tools. You add one intent or prove one goal from a confir
 Worker: you never create intents. Write one fact draft through `record_fact`; domain tool calls are decided by the guard.\n\
 Use only the output mechanism this role is given. Never answer in JSON text.\n";
 
-/// The only variables this crate defines: `goal`, `bound`, `goals`, `facts`,
+/// The only variables this crate defines: `goal`, `goals`, `facts`,
 /// `open_intents`, `failures`, `intent`, `context`. Nothing else is
 /// renderable.
 pub const DECLARED_VARIABLES: &[&str] = &[
     "goal",
-    "bound",
     "goals",
     "facts",
     "open_intents",
@@ -48,7 +47,6 @@ pub const DECLARED_VARIABLES: &[&str] = &[
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlannerVars {
     pub goal: String,
-    pub bound: i32,
     pub goals: String,
     pub facts: String,
     pub open_intents: usize,
@@ -67,7 +65,6 @@ impl PlannerVars {
     pub fn to_variables(&self) -> serde_json::Value {
         serde_json::json!({
             "goal": self.goal,
-            "bound": self.bound,
             "goals": self.goals,
             "facts": self.facts,
             "open_intents": self.open_intents,
@@ -75,10 +72,9 @@ impl PlannerVars {
         })
     }
 
-    fn pairs(&self) -> [(&'static str, String); 6] {
+    fn pairs(&self) -> [(&'static str, String); 5] {
         [
             ("goal", self.goal.clone()),
-            ("bound", self.bound.to_string()),
             ("goals", self.goals.clone()),
             ("facts", self.facts.clone()),
             ("open_intents", self.open_intents.to_string()),
@@ -338,7 +334,6 @@ mod tests {
     fn planner_vars() -> PlannerVars {
         PlannerVars {
             goal: "prove a forced mate".to_string(),
-            bound: 4,
             goals: "- [open] 0123abcd-0000-0000-0000-000000000001 prove a forced mate".to_string(),
             facts: "- [origin] 0123abcd-0000-0000-0000-000000000002 Origin: prove a forced mate\n\
                     - [confirmed] 89abcd00-0000-0000-0000-000000000003 found a rook lift"
@@ -444,8 +439,8 @@ mod tests {
         assert!(system.contains("at most one"));
         assert!(system.contains("confirmed fact"));
         assert!(system.contains("no field you can"));
-        // A variable used twice is filled on both sides of the boundary.
-        assert!(user.contains("Planning bound: 4"));
+        assert!(!user.contains("Planning bound"));
+        assert!(!system.contains("Planning bound"));
         assert!(!system.contains("{{"));
     }
 
@@ -609,7 +604,6 @@ mod tests {
     fn variables_record_form_is_typed() {
         let planner = planner_vars().to_variables();
         assert_eq!(planner["goal"], "prove a forced mate");
-        assert_eq!(planner["bound"], 4);
         assert_eq!(planner["open_intents"], 2);
         let worker = worker_vars().to_variables();
         assert_eq!(worker["intent"], "Evaluate the rook lift");

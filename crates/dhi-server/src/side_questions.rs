@@ -62,7 +62,7 @@ pub(crate) struct SessionsResponse {
 }
 
 /// Builds the JSON frozen at session creation:
-/// `{task: {id, goal, state, bound, pins, created_at}, goals, facts, activity}`.
+/// `{task: {id, goal, state, pins, created_at}, goals, facts, activity}`.
 ///
 /// Goals carry their full row (including the proof fact id); facts carry the
 /// advisory-relevant trio (`claim`, `state`, `provenance`); activity is the

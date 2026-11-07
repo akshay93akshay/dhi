@@ -24,10 +24,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-
-const DEFAULT_BOUND = "3";
 
 /**
  * Start page: one centered animated brand, one question, and the create-task
@@ -92,7 +89,7 @@ export default function Home() {
           id="start-heading"
           className="mt-5 text-[32px] font-medium tracking-[-0.03em] text-foreground sm:text-[40px]"
         >
-          What should DHI work on?
+          What should DHI<sup>+</sup> work on?
         </h1>
         <div className="mt-8 w-full text-left">
           <CreateTaskCard
@@ -119,7 +116,6 @@ function CreateTaskCard(props: {
   const { profiles, profilesError, onCreated, onActivity } = props;
 
   const [goal, setGoal] = useState("");
-  const [bound, setBound] = useState(DEFAULT_BOUND);
   const [plannerPin, setPlannerPin] = useState("");
   const [workerPin, setWorkerPin] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
@@ -159,7 +155,7 @@ function CreateTaskCard(props: {
     event.preventDefault();
     reportActivity("submit");
     setFormError(null);
-    const parsed = buildCreateTaskInput({ goal, bound, plannerPin, workerPin });
+    const parsed = buildCreateTaskInput({ goal, plannerPin, workerPin });
     if (!parsed.ok) {
       setFormError(parsed.error);
       reportTimedActivity("error", 2_600);
@@ -217,25 +213,6 @@ function CreateTaskCard(props: {
                   setFormError(null);
                 }
               }}
-            />
-          </div>
-
-          <div className="max-w-[180px] space-y-1.5">
-            <label
-              className="text-xs font-semibold text-foreground"
-              htmlFor="create-bound"
-            >
-              Planner round bound
-            </label>
-            <Input
-              id="create-bound"
-              type="number"
-              min={0}
-              step={1}
-              value={bound}
-              onFocus={() => reportActivity("focus-bound")}
-              onBlur={() => reportActivity("idle")}
-              onChange={(event) => setBound(event.target.value)}
             />
           </div>
 

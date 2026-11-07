@@ -113,7 +113,7 @@ export function SwarmMessagesCard(props: {
           <div>
             <CardTitle className="text-base">Swarm messages</CardTitle>
             <CardDescription className="mt-0.5">
-              Typed peer broadcasts from DHI+ swarm runs.
+              Typed peer broadcasts from DHI<sup>+</sup> swarm runs.
             </CardDescription>
           </div>
         </div>

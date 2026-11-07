@@ -112,8 +112,8 @@ function hasOwn(object: JsonObject, key: string): boolean {
  * Turns a `Fact.provenance` object into display lines, detecting the two
  * documented producer conventions by shape (see `types.ts`):
  *
- * - **origin** — task creation writes `{ "goal": ..., "bound": ... }`;
- *   detected when both `goal` and `bound` keys are present.
+ * - **origin** — task creation writes `{ "goal": ... }`;
+ *   detected when the `goal` key is present.
  * - **worker** — intent completion writes
  *   `{ "intent_id", "detail", "evidence", "confidence" }` (`detail` may be
  *   `""`); detected when any of `intent_id`/`detail`/`evidence` is present.
@@ -126,13 +126,10 @@ function hasOwn(object: JsonObject, key: string): boolean {
  * through `raw`.
  */
 export function renderProvenance(provenance: JsonObject): ProvenanceView {
-  if (hasOwn(provenance, "goal") && hasOwn(provenance, "bound")) {
+  if (hasOwn(provenance, "goal")) {
     return {
       kind: "origin",
-      lines: [
-        `Goal: ${stringifyValue(provenance.goal)}`,
-        `Bound: ${stringifyValue(provenance.bound)}`,
-      ],
+      lines: [`Goal: ${stringifyValue(provenance.goal)}`],
     };
   }
   if (
@@ -192,7 +189,6 @@ export function parsePin(raw: string): number | null {
 /** Raw create-form state (HTML inputs hand us strings). */
 export type CreateFormValues = {
   goal: string;
-  bound: string;
   plannerPin: string;
   workerPin: string;
 };
@@ -205,8 +201,6 @@ export type CreateFormResult =
  * Pure form → request-body mapper for `POST /api/tasks`.
  *
  * - the goal is trimmed; empty (after trim) refuses submission;
- * - `bound` must be a whole number ≥ 0 — the server has no default for the
- *   field (`CreateTaskRequest.bound: i32`), so the form always supplies one;
  * - pins map through {@link parsePin}; unset pins are OMITTED from the body
  *   entirely so the server defaults apply (matching the "omits absent pin
  *   fields" behavior covered in api.test.ts).
@@ -218,13 +212,8 @@ export function buildCreateTaskInput(
   if (goalError !== null) {
     return { ok: false, error: goalError };
   }
-  const boundTrimmed = values.bound.trim();
-  if (!/^\d+$/.test(boundTrimmed)) {
-    return { ok: false, error: "Bound must be a whole number of 0 or more." };
-  }
   const input: CreateTaskInput = {
     goal: values.goal.trim(),
-    bound: Number(boundTrimmed),
   };
   const planner = parsePin(values.plannerPin);
   if (planner !== null) {

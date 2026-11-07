@@ -89,27 +89,24 @@ test("parsePin maps select values onto ids or null", () => {
 test("buildCreateTaskInput omits unset pins and trims the goal", () => {
   const result = buildCreateTaskInput({
     goal: "  mate in two  ",
-    bound: "3",
     plannerPin: "",
     workerPin: "",
   });
   assert.ok(result.ok);
-  // Exactly `goal` + `bound`: absent keys, matching the server defaults path.
-  assert.deepEqual(Object.keys(result.input).sort(), ["bound", "goal"]);
-  assert.deepEqual(result.input, { goal: "mate in two", bound: 3 });
+  // Exactly `goal`: absent keys, matching the server defaults path.
+  assert.deepEqual(Object.keys(result.input).sort(), ["goal"]);
+  assert.deepEqual(result.input, { goal: "mate in two" });
 });
 
 test("buildCreateTaskInput carries numeric pins into the canonical fields", () => {
   const result = buildCreateTaskInput({
     goal: "g",
-    bound: "0",
     plannerPin: "7",
     workerPin: "9",
   });
   assert.ok(result.ok);
   assert.deepEqual(result.input, {
     goal: "g",
-    bound: 0,
     planner_profile_id: 7,
     worker_profile_id: 9,
   });
@@ -119,7 +116,6 @@ test("buildCreateTaskInput refuses an empty goal without submitting", () => {
   for (const goal of ["", "   "]) {
     const result = buildCreateTaskInput({
       goal,
-      bound: "3",
       plannerPin: "1",
       workerPin: "",
     });
@@ -127,30 +123,15 @@ test("buildCreateTaskInput refuses an empty goal without submitting", () => {
   }
 });
 
-test("buildCreateTaskInput rejects malformed bounds (server has no default)", () => {
-  for (const bound of ["", "abc", "-1", "1.5", "  "]) {
-    const result = buildCreateTaskInput({
-      goal: "g",
-      bound,
-      plannerPin: "",
-      workerPin: "",
-    });
-    assert.equal(result.ok, false);
-    if (!result.ok) {
-      assert.match(result.error, /Bound/);
-    }
-  }
-});
-
 // ---------------------------------------------------------------------------
 // renderProvenance
 // ---------------------------------------------------------------------------
 
-test("renderProvenance recognizes the origin convention { goal, bound }", () => {
-  const view = renderProvenance({ goal: "mate in two", bound: 3 });
+test("renderProvenance recognizes the origin convention { goal }", () => {
+  const view = renderProvenance({ goal: "mate in two" });
   assert.deepEqual(view, {
     kind: "origin",
-    lines: ["Goal: mate in two", "Bound: 3"],
+    lines: ["Goal: mate in two"],
   });
 });
 
@@ -205,12 +186,11 @@ test("renderProvenance treats partial worker shapes as worker, skipping gaps", (
 test("renderProvenance prefers the origin convention when both shapes appear", () => {
   const view = renderProvenance({
     goal: "g",
-    bound: 1,
     intent_id: "i4",
     evidence: "e",
   });
   assert.equal(view.kind, "origin");
-  assert.deepEqual(view.lines, ["Goal: g", "Bound: 1"]);
+  assert.deepEqual(view.lines, ["Goal: g"]);
 });
 
 test("renderProvenance falls back to raw JSON for unknown shapes", () => {
@@ -236,12 +216,11 @@ test("renderProvenance falls back to raw JSON for unknown shapes", () => {
 });
 
 test("renderProvenance never crashes on hostile value types", () => {
-  // Goal arriving as the wrong type, bound as a string, arrays as evidence.
+  // Goal arriving as the wrong type, arrays as evidence.
   const oddTypes = renderProvenance({
     goal: 42,
-    bound: "three",
   } as never);
-  assert.deepEqual(oddTypes, { kind: "origin", lines: ["Goal: 42", "Bound: three"] });
+  assert.deepEqual(oddTypes, { kind: "origin", lines: ["Goal: 42"] });
 
   const nested = renderProvenance({
     intent_id: "i5",

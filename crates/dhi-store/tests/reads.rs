@@ -16,7 +16,7 @@ use uuid::Uuid;
 #[tokio::test]
 async fn list_intents_returns_all_states() {
     let store = MemoryStore::new();
-    let task = store.seed_task("forced mate", 4);
+    let task = store.seed_task("forced mate");
     let origin = task.origin_fact_id;
 
     let a = store.seed_intent(task.id, origin, "a");
@@ -59,7 +59,7 @@ async fn list_intents_returns_all_states() {
     let limited = GraphStore::list_intents(&store, task.id, 2).await.unwrap();
     assert_eq!(limited.len(), 2, "limit is honored");
 
-    let other = store.seed_task("another task", 4);
+    let other = store.seed_task("another task");
     assert!(
         GraphStore::list_intents(&store, other.id, 100)
             .await
@@ -73,7 +73,7 @@ async fn list_intents_returns_all_states() {
 #[tokio::test]
 async fn list_results_returns_rows() {
     let store = MemoryStore::new();
-    let task = store.seed_task("forced mate", 4);
+    let task = store.seed_task("forced mate");
     let intent = store.seed_intent(task.id, task.origin_fact_id, "mate in one");
 
     let first = GraphStore::record_result(
@@ -117,7 +117,7 @@ async fn list_results_returns_rows() {
 #[tokio::test]
 async fn list_agent_runs_returns_rows() {
     let store = MemoryStore::new();
-    let task = store.seed_task("forced mate", 4);
+    let task = store.seed_task("forced mate");
     let run = dhi_testkit::fixtures::agent_run(task.id, Uuid::new_v4(), 0);
 
     GraphStore::save_agent_run(&store, &run).await.unwrap();
@@ -127,7 +127,7 @@ async fn list_agent_runs_returns_rows() {
     assert_eq!(runs[0].id, run.id);
     assert_eq!(runs[0].call_index, 0);
 
-    let other = store.seed_task("another task", 4);
+    let other = store.seed_task("another task");
     assert!(
         GraphStore::list_agent_runs(&store, other.id)
             .await
@@ -167,7 +167,7 @@ async fn list_pending_approvals_all_returns_pending_only() {
 #[sqlx::test]
 async fn postgres_list_intents_returns_all_states(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
 
     let done = store
         .add_intent(task.id, task.origin_fact_id, "done intent")
@@ -214,7 +214,7 @@ async fn postgres_list_intents_returns_all_states(pool: PgPool) {
 #[sqlx::test]
 async fn postgres_list_results_returns_rows(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
     let intent = store
         .add_intent(task.id, task.origin_fact_id, "mate in one")
         .await
@@ -260,7 +260,7 @@ async fn postgres_list_results_returns_rows(pool: PgPool) {
 #[sqlx::test]
 async fn postgres_list_agent_runs_returns_rows(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
     let run = dhi_testkit::fixtures::agent_run(task.id, Uuid::new_v4(), 0);
     GraphStore::save_agent_run(&store, &run).await.unwrap();
 
@@ -301,7 +301,7 @@ async fn postgres_list_pending_approvals_all_returns_pending_only(pool: PgPool) 
 // ---------- helpers ----------
 
 async fn memory_tool_call(store: &MemoryStore, goal: &str) -> (TaskId, Uuid) {
-    let task = store.seed_task(goal, 4);
+    let task = store.seed_task(goal);
     let intent = store.seed_intent(task.id, task.origin_fact_id, "act");
     let call = GuardStore::record_tool_call(
         store,
@@ -316,7 +316,7 @@ async fn memory_tool_call(store: &MemoryStore, goal: &str) -> (TaskId, Uuid) {
 }
 
 async fn postgres_tool_call(store: &Store, goal: &str) -> (TaskId, Uuid) {
-    let task = store.create_task(goal, 4).await.unwrap();
+    let task = store.create_task(goal).await.unwrap();
     let intent = store
         .add_intent(task.id, task.origin_fact_id, "act")
         .await

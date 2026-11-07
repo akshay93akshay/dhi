@@ -10,7 +10,7 @@ use dhi_testkit::MemoryStore;
 #[tokio::test]
 async fn prove_goal_requires_confirmed_fact() {
     let store = MemoryStore::new();
-    let task = store.seed_task("origin cannot prove", 3);
+    let task = store.seed_task("origin cannot prove");
     let goal = store
         .add_goal(task.id, "reach the goal".to_string())
         .await
@@ -35,7 +35,7 @@ async fn prove_goal_requires_confirmed_fact() {
 #[tokio::test]
 async fn prove_goal_marks_goal_met() {
     let store = MemoryStore::new();
-    let task = store.seed_task("prove it", 3);
+    let task = store.seed_task("prove it");
     let goal = store
         .add_goal(task.id, "reach the goal".to_string())
         .await
@@ -62,7 +62,7 @@ async fn prove_goal_marks_goal_met() {
 #[tokio::test]
 async fn prove_goal_records_proof_fact_id() {
     let store = MemoryStore::new();
-    let task = store.seed_task("record the proof", 3);
+    let task = store.seed_task("record the proof");
     let goal = store
         .add_goal(task.id, "reach the goal".to_string())
         .await
@@ -96,8 +96,8 @@ async fn prove_goal_records_proof_fact_id() {
 #[tokio::test]
 async fn prove_goal_rejects_fact_from_another_task() {
     let store = MemoryStore::new();
-    let task = store.seed_task("task A", 3);
-    let other = store.seed_task("task B", 3);
+    let task = store.seed_task("task A");
+    let other = store.seed_task("task B");
     let goal = store
         .add_goal(task.id, "reach the goal".to_string())
         .await
@@ -123,7 +123,7 @@ async fn prove_goal_rejects_fact_from_another_task() {
 #[tokio::test]
 async fn all_goals_met_sets_task_done() {
     let store = MemoryStore::new();
-    let task = store.seed_task("prove both", 3);
+    let task = store.seed_task("prove both");
     let first = store
         .add_goal(task.id, "first goal".to_string())
         .await

@@ -23,7 +23,7 @@ fn ok_request(session_id: Uuid, question: &str) -> NewSideQuestionRequest {
 #[sqlx::test]
 async fn side_question_roundtrip_closes_the_previous_session(pool: PgPool) {
     let store = Store::new(pool);
-    let task = GraphStore::create_task(&store, "ask about it".into(), 3)
+    let task = GraphStore::create_task(&store, "ask about it".into())
         .await
         .unwrap();
 
@@ -97,7 +97,7 @@ async fn side_question_roundtrip_closes_the_previous_session(pool: PgPool) {
 #[sqlx::test]
 async fn deleting_a_task_cascades_side_question_sessions_and_requests(pool: PgPool) {
     let store = Store::new(pool);
-    let task = GraphStore::create_task(&store, "cascade".into(), 3)
+    let task = GraphStore::create_task(&store, "cascade".into())
         .await
         .unwrap();
     let session = store

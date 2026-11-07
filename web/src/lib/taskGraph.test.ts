@@ -34,7 +34,6 @@ function taskGraphFixture(): TaskWork {
   const task: Task = {
     id: "task-1",
     goal: "Prove the sample is mate in two",
-    bound: 3,
     state: "running",
     exploration_id: "exploration-1",
     origin_fact_id: "fact-origin",
@@ -96,7 +95,7 @@ function taskGraphFixture(): TaskWork {
       task_id: task.id,
       claim: "Origin: task started",
       state: "origin",
-      provenance: { goal: task.goal, bound: task.bound },
+      provenance: { goal: task.goal },
       origin_of: null,
       created_at: LOOKUP_ISO,
     },

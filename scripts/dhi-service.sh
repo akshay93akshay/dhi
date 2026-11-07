@@ -76,7 +76,6 @@ start() {
   MIGRATION_DATABASE_URL="${MIGRATION_DATABASE_URL:-postgres://dhi_owner:dhi_owner@127.0.0.1:5432/dhi}" \
   DHI_BIND="${DHI_BIND:-127.0.0.1:8080}" \
   DHI_WEB_DIR="${DHI_WEB_DIR:-$PWD/web/out}" \
-  DHI_MANAGER_MAX_TURNS="${DHI_MANAGER_MAX_TURNS:-24}" \
   RUST_LOG="${RUST_LOG:-dhi=info}" \
   nohup "$BIN" >>"$LOG" 2>&1 &
   echo $! >"$PID_FILE"

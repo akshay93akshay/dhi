@@ -257,7 +257,7 @@ async fn concurrent_decide_has_one_winner(pool: PgPool) {
 async fn expire_pending_approvals_is_scoped_by_task(pool: PgPool) {
     let store = Store::new(pool);
     let (task_a, intent_a) = seeded_task_and_intent(&store).await;
-    let path_b = store.create_task("second task", 4).await.unwrap();
+    let path_b = store.create_task("second task").await.unwrap();
     let intent_b = store
         .add_intent(path_b.id, path_b.origin_fact_id, "call a tool")
         .await
@@ -370,7 +370,7 @@ async fn concurrent_expire_and_decide_have_one_winner(pool: PgPool) {
 #[sqlx::test]
 async fn terminal_task_rejects_every_public_write(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("settle once", 4).await.unwrap();
+    let task = store.create_task("settle once").await.unwrap();
     assert!(
         GraphStore::set_task_state_guarded(&store, task.id, dhi_core::TaskState::Running)
             .await
@@ -418,8 +418,8 @@ async fn terminal_task_rejects_every_public_write(pool: PgPool) {
 #[sqlx::test]
 async fn reset_running_intents_releases_abandoned_work(pool: PgPool) {
     let store = Store::new(pool);
-    let task_a = store.create_task("restart A", 4).await.unwrap();
-    let task_b = store.create_task("restart B", 4).await.unwrap();
+    let task_a = store.create_task("restart A").await.unwrap();
+    let task_b = store.create_task("restart B").await.unwrap();
     let running_a = store
         .add_intent(task_a.id, task_a.origin_fact_id, "in flight")
         .await
@@ -480,7 +480,7 @@ async fn reset_running_intents_releases_abandoned_work(pool: PgPool) {
 #[tokio::test]
 async fn memory_store_resets_running_intents_on_restart() {
     let store = MemoryStore::new();
-    let task = store.seed_task("restart", 4);
+    let task = store.seed_task("restart");
     let running = store.seed_intent(task.id, task.origin_fact_id, "in flight");
     GraphStore::claim_intent(&store, running.id, "worker-1")
         .await
@@ -555,7 +555,7 @@ async fn expire_pending_approvals_is_timer_driven(pool: PgPool) {
 #[sqlx::test]
 async fn tool_call_requires_an_existing_intent(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("guard", 4).await.unwrap();
+    let task = store.create_task("guard").await.unwrap();
 
     let err = GuardStore::record_tool_call(
         &store,
@@ -644,7 +644,7 @@ async fn paused_intent_cannot_finish_directly(pool: PgPool) {
 #[sqlx::test]
 async fn terminal_status_is_first_writer_wins(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("settle once", 4).await.unwrap();
+    let task = store.create_task("settle once").await.unwrap();
     GraphStore::set_task_state_guarded(&store, task.id, dhi_core::TaskState::Running)
         .await
         .unwrap();
@@ -675,7 +675,7 @@ async fn terminal_status_is_first_writer_wins(pool: PgPool) {
 #[tokio::test]
 async fn memory_store_implements_the_same_guard_flow() {
     let store = MemoryStore::new();
-    let task = store.seed_task("guard", 4);
+    let task = store.seed_task("guard");
     let intent = store.seed_intent(task.id, task.origin_fact_id, "call a tool");
 
     let call = GuardStore::record_tool_call(
@@ -768,7 +768,7 @@ async fn memory_store_implements_the_same_guard_flow() {
 #[tokio::test]
 async fn memory_store_enforces_the_paused_and_terminal_rules() {
     let store = MemoryStore::new();
-    let task = store.seed_task("rules", 4);
+    let task = store.seed_task("rules");
     let intent = store.seed_intent(task.id, task.origin_fact_id, "one step");
 
     GraphStore::claim_intent(&store, intent.id, "worker-1")
@@ -1090,7 +1090,7 @@ async fn orphaned_paused_intent_is_blocked(pool: PgPool) {
 #[tokio::test]
 async fn memory_store_finishes_atomically_and_blocks_orphans() {
     let store = MemoryStore::new();
-    let task = store.seed_task("memory rules", 4);
+    let task = store.seed_task("memory rules");
     let intent = store.seed_intent(task.id, task.origin_fact_id, "one step");
     GraphStore::claim_intent(&store, intent.id, "worker-1")
         .await
@@ -1157,7 +1157,7 @@ fn sqlstate(err: &anyhow::Error) -> Option<String> {
 }
 
 async fn seeded_task_and_intent(store: &Store) -> (dhi_core::Task, dhi_core::Intent) {
-    let task = store.create_task("guard", 4).await.unwrap();
+    let task = store.create_task("guard").await.unwrap();
     let intent = store
         .add_intent(task.id, task.origin_fact_id, "call a tool")
         .await

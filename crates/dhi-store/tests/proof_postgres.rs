@@ -13,7 +13,7 @@ use std::time::Duration;
 #[sqlx::test]
 async fn prove_goal_rejects_a_fact_older_than_the_goal(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("fresh evidence", 3).await.unwrap();
+    let task = store.create_task("fresh evidence").await.unwrap();
     let old_fact = GraphStore::record_fact(
         &store,
         task.id,
@@ -56,10 +56,7 @@ async fn prove_goal_rejects_a_fact_older_than_the_goal(pool: PgPool) {
 #[sqlx::test]
 async fn prove_goal_accepts_a_fact_recorded_after_the_goal(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store
-        .create_task("fresh evidence accepted", 3)
-        .await
-        .unwrap();
+    let task = store.create_task("fresh evidence accepted").await.unwrap();
     let goal = GraphStore::add_goal(&store, task.id, "a human-added goal".into())
         .await
         .unwrap();
@@ -92,7 +89,7 @@ async fn prove_goal_accepts_a_fact_recorded_after_the_goal(pool: PgPool) {
 #[sqlx::test]
 async fn prove_goal_requires_confirmed_fact(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("origin cannot prove", 3).await.unwrap();
+    let task = store.create_task("origin cannot prove").await.unwrap();
     let goal = GraphStore::add_goal(&store, task.id, "reach the goal".into())
         .await
         .unwrap();
@@ -122,7 +119,7 @@ async fn prove_goal_requires_confirmed_fact(pool: PgPool) {
 #[sqlx::test]
 async fn prove_goal_marks_goal_met(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("prove it", 3).await.unwrap();
+    let task = store.create_task("prove it").await.unwrap();
     let goal = GraphStore::add_goal(&store, task.id, "reach the goal".into())
         .await
         .unwrap();
@@ -152,7 +149,7 @@ async fn prove_goal_marks_goal_met(pool: PgPool) {
 #[sqlx::test]
 async fn prove_goal_records_proof_fact_id(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("record the proof", 3).await.unwrap();
+    let task = store.create_task("record the proof").await.unwrap();
     let goal = GraphStore::add_goal(&store, task.id, "reach the goal".into())
         .await
         .unwrap();
@@ -186,8 +183,8 @@ async fn prove_goal_records_proof_fact_id(pool: PgPool) {
 #[sqlx::test]
 async fn prove_goal_rejects_fact_from_another_task(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("task A", 3).await.unwrap();
-    let other = store.create_task("task B", 3).await.unwrap();
+    let task = store.create_task("task A").await.unwrap();
+    let other = store.create_task("task B").await.unwrap();
     let goal = GraphStore::add_goal(&store, task.id, "reach the goal".into())
         .await
         .unwrap();
@@ -216,7 +213,7 @@ async fn prove_goal_rejects_fact_from_another_task(pool: PgPool) {
 #[sqlx::test]
 async fn all_goals_met_sets_task_done(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("prove both", 3).await.unwrap();
+    let task = store.create_task("prove both").await.unwrap();
     let first = GraphStore::add_goal(&store, task.id, "first goal".into())
         .await
         .unwrap();

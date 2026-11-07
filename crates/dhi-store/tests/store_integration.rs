@@ -17,7 +17,7 @@ use uuid::Uuid;
 async fn create_task_writes_one_origin_fact(pool: PgPool) {
     let store = Store::new(pool);
 
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
     assert_eq!(task.state, TaskState::Created);
 
     let persisted = store.get_task(task.id).await.unwrap().expect("task exists");
@@ -34,7 +34,7 @@ async fn create_task_writes_one_origin_fact(pool: PgPool) {
 #[sqlx::test]
 async fn concurrent_claim_has_one_winner(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
     let intent = store
         .add_intent(task.id, task.origin_fact_id, "find the mating move")
         .await
@@ -72,7 +72,7 @@ async fn concurrent_claim_has_one_winner(pool: PgPool) {
 #[sqlx::test]
 async fn concurrent_claim_with_eight_workers_has_one_winner(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
     let intent = store
         .add_intent(task.id, task.origin_fact_id, "find the mating move")
         .await
@@ -124,7 +124,7 @@ async fn concurrent_claim_with_eight_workers_has_one_winner(pool: PgPool) {
 #[sqlx::test]
 async fn intent_with_unknown_fact_is_rejected(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
 
     let err = store
         .add_intent(task.id, Uuid::new_v4(), "investigate a missing fact")
@@ -142,7 +142,7 @@ async fn intent_with_unknown_fact_is_rejected(pool: PgPool) {
 #[sqlx::test]
 async fn intent_with_nil_fact_is_rejected(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
 
     let err = store
         .add_intent(task.id, Uuid::nil(), "investigate nothing")
@@ -159,8 +159,8 @@ async fn intent_with_nil_fact_is_rejected(pool: PgPool) {
 #[sqlx::test]
 async fn intent_cannot_reference_another_tasks_fact(pool: PgPool) {
     let store = Store::new(pool);
-    let task_a = store.create_task("task A", 4).await.unwrap();
-    let task_b = store.create_task("task B", 4).await.unwrap();
+    let task_a = store.create_task("task A").await.unwrap();
+    let task_b = store.create_task("task B").await.unwrap();
     let fact_a = store.list_facts(task_a.id).await.unwrap().remove(0);
 
     let err = store
@@ -179,15 +179,14 @@ async fn intent_cannot_reference_another_tasks_fact(pool: PgPool) {
 #[sqlx::test]
 async fn duplicate_exploration_is_rejected(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("first exploration", 4).await.unwrap();
+    let task = store.create_task("first exploration").await.unwrap();
 
     let err = sqlx::query(
-        "INSERT INTO tasks (id, goal, bound, state, exploration_id, origin_fact_id)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO tasks (id, goal, state, exploration_id, origin_fact_id)
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(Uuid::new_v4())
     .bind("second exploration")
-    .bind(4)
     .bind(TaskState::Created.as_str())
     .bind(task.exploration_id)
     .bind(Uuid::new_v4())
@@ -223,7 +222,7 @@ async fn migration_creates_25_tables_and_is_idempotent_from_clean_database(pool:
 #[sqlx::test]
 async fn intent_plan_round_trips_upserts_and_unknown_returns_none(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("team task", 4).await.unwrap();
+    let task = store.create_task("team task").await.unwrap();
     let intent = store
         .add_intent(task.id, task.origin_fact_id, "team work")
         .await
@@ -267,7 +266,7 @@ async fn intent_plan_round_trips_upserts_and_unknown_returns_none(pool: PgPool) 
 #[sqlx::test]
 async fn swarm_messages_append_and_list_ordered_by_id(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("swarm audit", 4).await.unwrap();
+    let task = store.create_task("swarm audit").await.unwrap();
     let intent = store
         .add_intent(task.id, task.origin_fact_id, "swarm work")
         .await
@@ -327,7 +326,7 @@ async fn swarm_messages_append_and_list_ordered_by_id(pool: PgPool) {
 #[sqlx::test]
 async fn record_fact_for_intent_allows_one_fact_per_intent(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("one fact per intent", 4).await.unwrap();
+    let task = store.create_task("one fact per intent").await.unwrap();
     let intent = store
         .add_intent(task.id, task.origin_fact_id, "the one intent")
         .await
@@ -381,7 +380,7 @@ async fn record_fact_for_intent_allows_one_fact_per_intent(pool: PgPool) {
 #[sqlx::test]
 async fn different_intents_each_record_their_own_fact(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("two intents", 4).await.unwrap();
+    let task = store.create_task("two intents").await.unwrap();
     let first = store
         .add_intent(task.id, task.origin_fact_id, "first intent")
         .await
@@ -432,7 +431,7 @@ async fn different_intents_each_record_their_own_fact(pool: PgPool) {
 #[sqlx::test]
 async fn record_fact_for_intent_rejects_a_missing_intent(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("missing intent", 4).await.unwrap();
+    let task = store.create_task("missing intent").await.unwrap();
 
     let err = store
         .record_fact_for_intent(
@@ -459,7 +458,7 @@ async fn record_fact_for_intent_rejects_a_missing_intent(pool: PgPool) {
 #[sqlx::test]
 async fn activity_appends_accumulate(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
 
     let before = activity_count(store.pool(), task.id).await;
     store
@@ -480,7 +479,7 @@ async fn activity_appends_accumulate(pool: PgPool) {
 #[sqlx::test]
 async fn task_capacity_defaults_round_trips_and_updates(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("capacity task", 4).await.unwrap();
+    let task = store.create_task("capacity task").await.unwrap();
     assert_eq!(task.capacity, TaskCapacity::default());
 
     let persisted = store.get_task(task.id).await.unwrap().expect("task exists");
@@ -546,7 +545,7 @@ async fn set_task_capacity_unknown_task_is_not_found(pool: PgPool) {
 #[sqlx::test]
 async fn invalid_task_capacity_decodes_to_default(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("bad ledger", 4).await.unwrap();
+    let task = store.create_task("bad ledger").await.unwrap();
     sqlx::query("UPDATE tasks SET capacity = '\"not-an-object\"'::jsonb WHERE id = $1")
         .bind(task.id)
         .execute(store.pool())

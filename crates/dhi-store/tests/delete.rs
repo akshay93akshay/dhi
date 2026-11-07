@@ -31,7 +31,7 @@ async fn make_terminal(store: &Store, task_id: Uuid, state: TaskState) {
 #[sqlx::test]
 async fn delete_task_cascades_every_task_owned_row(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("delete me", 4).await.unwrap();
+    let task = store.create_task("delete me").await.unwrap();
     let goal = store.add_goal(task.id, "one goal").await.unwrap();
     store
         .add_goal(task.id, "another goal".to_string())
@@ -116,7 +116,7 @@ async fn delete_task_cascades_every_task_owned_row(pool: PgPool) {
 #[sqlx::test]
 async fn delete_task_refuses_active_and_unknown_tasks(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("still active", 4).await.unwrap();
+    let task = store.create_task("still active").await.unwrap();
     let intent = store
         .add_intent(task.id, task.origin_fact_id, "live work")
         .await
@@ -139,7 +139,7 @@ async fn delete_task_refuses_active_and_unknown_tasks(pool: PgPool) {
 #[sqlx::test]
 async fn cancelled_is_deletable(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("cancel then delete", 2).await.unwrap();
+    let task = store.create_task("cancel then delete").await.unwrap();
     make_terminal(&store, task.id, TaskState::Cancelled).await;
 
     assert!(store.delete_task(task.id).await.unwrap());
@@ -150,9 +150,9 @@ async fn cancelled_is_deletable(pool: PgPool) {
 #[sqlx::test]
 async fn delete_tasks_removes_only_terminal_ids(pool: PgPool) {
     let store = Store::new(pool);
-    let done = store.create_task("done", 2).await.unwrap();
-    let cancelled = store.create_task("cancelled", 2).await.unwrap();
-    let active = store.create_task("active", 2).await.unwrap();
+    let done = store.create_task("done").await.unwrap();
+    let cancelled = store.create_task("cancelled").await.unwrap();
+    let active = store.create_task("active").await.unwrap();
     make_terminal(&store, done.id, TaskState::Done).await;
     make_terminal(&store, cancelled.id, TaskState::Cancelled).await;
     make_terminal(&store, active.id, TaskState::Running).await;

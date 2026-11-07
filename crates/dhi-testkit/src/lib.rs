@@ -54,8 +54,8 @@ impl MemoryStore {
         Self::default()
     }
 
-    pub fn seed_task(&self, goal: impl Into<String>, bound: i32) -> Task {
-        let task = Task::new(goal, bound);
+    pub fn seed_task(&self, goal: impl Into<String>) -> Task {
+        let task = Task::new(goal);
         let origin = task.origin_fact();
         let mut inner = self.inner.lock().unwrap();
         inner.facts.insert(origin.id, origin);
@@ -188,8 +188,8 @@ impl MemoryStore {
 impl GraphStore for MemoryStore {
     /// Creates a task the way the Postgres store does: the task row, its
     /// origin fact, and one `task_created` activity in a single step.
-    async fn create_task(&self, goal: String, bound: i32) -> anyhow::Result<Task> {
-        let task = Task::new(goal, bound);
+    async fn create_task(&self, goal: String) -> anyhow::Result<Task> {
+        let task = Task::new(goal);
         let origin = task.origin_fact();
         let mut inner = self.inner.lock().unwrap();
         inner.facts.insert(origin.id, origin);
@@ -200,7 +200,7 @@ impl GraphStore for MemoryStore {
             task_id: task.id,
             kind: "task_created".to_string(),
             message: format!("Task created: {}", task.goal),
-            payload: serde_json::json!({ "bound": task.bound }),
+            payload: serde_json::json!({}),
             created_at: Utc::now(),
         };
         inner.activities.push(activity);
@@ -211,11 +211,10 @@ impl GraphStore for MemoryStore {
     async fn create_task_with_pins(
         &self,
         goal: String,
-        bound: i32,
         planner_pin: Option<i64>,
         worker_pin: Option<i64>,
     ) -> anyhow::Result<Task> {
-        let task = self.create_task(goal, bound).await?;
+        let task = self.create_task(goal).await?;
         let mut inner = self.inner.lock().unwrap();
         let stored = inner
             .tasks

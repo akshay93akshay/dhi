@@ -1,12 +1,12 @@
-# DHI+
+# DHI<sup>+</sup>
 
-**Dynamic Heuristic Intelligence Plus**
+**Dynamic Heuristic Intelligence<sup>+</sup>**
 
-DHI+ is the team-execution upgrade to DHI. A goal still becomes a task and a plan, but the planner can choose a team, not only one worker. The team runs through a planner-selected topology, aggregates its work into one deterministic fact, and proves the goal with that fact. LLMs reason, tools act, PostgreSQL remembers, and the guard checks every action.
+DHI<sup>+</sup> is the team-execution upgrade to DHI. A goal still becomes a task and a plan, but the planner can choose a team, not only one worker. The team runs through a planner-selected topology, aggregates its work into one deterministic fact, and proves the goal with that fact. LLMs reason, tools act, PostgreSQL remembers, and the guard checks every action.
 
-## DHI vs DHI+
+## DHI vs DHI<sup>+</sup>
 
-| | DHI | DHI+ |
+| | DHI | DHI<sup>+</sup> |
 | --- | --- | --- |
 | Execution | One planner, one worker. | Planner-selected `manager_worker` or `swarm`. |
 | Fact | One planner, one worker, one fact. | One deterministic aggregated fact per intent. |
@@ -42,17 +42,17 @@ flowchart TD
     PF -->|give up| STOP[Goal abandoned; task stops]
 
     C[Capacity ledger] -. pause / resume .-> P
-    H[Host guards: bound, no-progress, rounds] -. stop .-> P
+    H[Host guards: no-progress, rounds] -. stop .-> P
 ```
 
 A zero-success team run becomes a rejected result and a `team_failed` row.
 The planner reviews that failure and can retry with a different plan or a
 larger worker `max_turns`, change approach, or give up. Host guards still
-bound the loop.
+cap the loop.
 
-A DHI+ intent still follows the DHI lifecycle. The difference is the execution layer: the planner can expand one intent into a team, and the engine still records one fact.
+A DHI<sup>+</sup> intent still follows the DHI lifecycle. The difference is the execution layer: the planner can expand one intent into a team, and the engine still records one fact.
 
-## DHI+ orchestration
+## DHI<sup>+</sup> orchestration
 
 The planner selects the topology for each intent: `single`, `manager_worker`, or `swarm`. The team topologies, `manager_worker` and `swarm`, are planner-selected. `manager_worker` uses a manager to choose workers and subtasks within the planner's limits, then runs independent workers in parallel. `swarm` seeds one subtask per worker and lets peers exchange typed findings directly, stopping on its budget and stop rules.
 
@@ -60,27 +60,24 @@ Only each worker's seed turn enters the aggregated fact; reaction turns remain v
 
 Each task has a visible capacity ledger: `max_rounds`, `max_model_calls`, `max_wall_secs`, and `max_parallel_workers`. Omitted limits use the engine defaults. `POST /api/tasks` accepts the ledger at creation, `POST /api/tasks/{id}/capacity` extends it, and the Work view shows and edits it. Exhaustion pauses the task (never fails it); an extension resumes a paused task. Swarm broadcasts are durable and readable at `GET /api/tasks/{id}/swarm-messages`.
 
-The engine budgets are:
+The host keeps compiled engine safety ceilings for rounds and no-progress
+rounds. They are internal defaults, not task settings.
 
-```text
-DHI_ENGINE_MAX_ROUNDS
-DHI_ENGINE_NO_PROGRESS_ROUNDS
-```
-
-- DHI+ is the default line; legacy DHI is preserved as branch `DHI` and tag `DHI-v1.0.1`.
+- DHI<sup>+</sup> is the default line; legacy DHI is preserved as branch `DHI` and tag `DHI-v1.0.1`.
 - CI builds the container image on GitHub Actions; no local Docker build is required.
 
-## DHI baseline
+## Historical DHI baseline
 
-DHI turns a goal into a task, a task into a plan, a plan into facts, and facts into results. The planner reads the work graph and proposes one intent at a time. A worker carries out that intent with guarded tools and records facts. A confirmed fact proves a goal, and the task is done only when every goal is met. LLMs reason, tools act, PostgreSQL remembers, and the guard checks every action.
+Legacy DHI is the historical single-worker baseline, preserved unchanged on the
+branch and tag above. The shared foundations below still apply to DHI<sup>+</sup>.
 
-## What DHI is
+## Shared DHI foundations
 
-The unit of work is a task with a goal and a planning bound. The planner can add one intent, prove one open goal with a confirmed fact, or give up on a goal. Each intent is executed by a worker that records facts through tools. Every tool call is recorded, evaluated against guard rules, and then allowed, denied, or held for human approval. PostgreSQL is the system of record for tasks, goals, intents, facts, results, approvals, tool calls, agent runs, and activity.
+The unit of work is a task with a goal. The planner can add one intent, prove one open goal with a confirmed fact, or give up on a goal. Each intent is executed by a worker that records facts through tools. Every tool call is recorded, evaluated against guard rules, and then allowed, denied, or held for human approval. PostgreSQL is the system of record for tasks, goals, intents, facts, results, approvals, tool calls, agent runs, and activity.
 
 ## Features
 
-- **Task lifecycle** — create a task from a goal and a bound, follow its planner/worker loop, stop or delete it, and restart recovery for unfinished work. Adding a goal to a finished task reopens it.
+- **Task lifecycle** — create a task from a goal with optional capacity and profile pins, follow its planner/worker loop, stop or delete it, and restart recovery for unfinished work. Adding a goal to a finished task reopens it.
 - **Graph and work views** — each task has a work graph and a work view, with its activity log and live activity stream.
 - **Approvals** — a guard rule may return `ask`. The call waits for a human decision or expires on its approval deadline.
 - **MCP tools** — standard `mcpServers` configuration, guarded tool names of the form `mcp__<server>__<tool>`, live server management, refresh, reload, and deferred schemas above a tool threshold.
@@ -127,7 +124,7 @@ Every model tool call passes through one `GuardedExecutor`: record, evaluate the
 
 ### Docker socket
 
-The DHI container mounts the host Docker socket and includes the Docker CLI. It starts one task container per task through that socket. Task containers do not get the socket. The DHI container can control Docker on the host; do not use this on a host with other important services without isolation.
+The DHI<sup>+</sup> container mounts the host Docker socket and includes the Docker CLI. It starts one task container per task through that socket. Task containers do not get the socket. The DHI<sup>+</sup> container can control Docker on the host; do not use this on a host with other important services without isolation.
 
 ## Requirements
 
@@ -217,13 +214,9 @@ Main settings:
 - `DHI_WORKSPACE_HOST_ROOT` — host path of that root, used as the bind-mount source for task containers; set it when the server runs in a container
 - `DHI_MCP_CONFIG` — MCP config path; when unset, the nearest `ops/mcp.json`
 - `DHI_LLM_BASE_URL`, `DHI_LLM_API_KEY`, `DHI_LLM_PLANNER_MODEL`, `DHI_LLM_WORKER_MODEL` — LLM endpoint and models; other OpenAI-compatible endpoints work
-- `DHI_MANAGER_MAX_TURNS` — manager turn budget when specialists are enabled
-- `DHI_MAX_DELEGATIONS` — maximum delegation calls per manager run
-- `DHI_ENGINE_MAX_ROUNDS` — total planner rounds for a task run before the engine stops it; default `64`
-- `DHI_ENGINE_NO_PROGRESS_ROUNDS` — consecutive rounds without a new confirmed fact before the engine stops the task; default `16`
 - `TINYFISH_API_KEY`, `PARALLEL_API_KEY`, `FIRECRAWL_API_KEY`, `DHI_WEB_PROVIDER` — web tool providers
 
-On first boot, DHI seeds guard rules plus LLM profiles and settings when an LLM key is configured. After that, PostgreSQL is the source of truth and profiles and rules are managed from the settings UI or API.
+On first boot, DHI<sup>+</sup> seeds guard rules plus LLM profiles and settings when an LLM key is configured. After that, PostgreSQL is the source of truth and profiles and rules are managed from the settings UI or API.
 
 Never put secrets in Git. Keep local secret files at mode 600: `.env`, `ops/mcp.json`, `config/dhi.config.json`, and `web.env`.
 
@@ -270,7 +263,7 @@ All API routes are under `/api`. Most return JSON; `/api/stream` is a server-sen
 
 ## Security
 
-DHI has no login or authentication layer. Keep the default localhost bind, or put the server behind a protected tunnel or reverse proxy. Do not expose port 8080 directly to an untrusted network.
+DHI<sup>+</sup> has no login or authentication layer. Keep the default localhost bind, or put the server behind a protected tunnel or reverse proxy. Do not expose port 8080 directly to an untrusted network.
 
 - Keep `.env`, `ops/mcp.json`, `config/dhi.config.json`, and other key files out of Git and at mode 600.
 - `ops/mcp.json` is ignored. The example and Docker configs contain no secrets.
@@ -284,5 +277,5 @@ DHI has no login or authentication layer. Keep the default localhost bind, or pu
 - **Missing `web/out`** — the server logs a warning and serves the API only. Build the export with `cd web && npm ci && NEXT_EXPORT=1 npm run build`, or point `DHI_WEB_DIR` at a directory that contains `index.html`.
 - **Missing `uvx`** — host chess fails to start. Install `uv`, which provides `uvx`, or use the Docker image, which has the chess server installed at `/opt/chess`.
 - **PostgreSQL is unhealthy** — check `docker compose ps`, then run `docker compose exec postgres pg_isready -U dhi_owner -d dhi`. Re-run `scripts/migrate.sh` if the schema is missing.
-- **Port conflicts** — DHI uses 8080 (API/UI), 8090 (chess), 5432 (PostgreSQL), and 3000 (Next dev). Set `DHI_BIND` or the compose port mappings, or stop the process using the port.
+- **Port conflicts** — DHI<sup>+</sup> uses 8080 (API/UI), 8090 (chess), 5432 (PostgreSQL), and 3000 (Next dev). Set `DHI_BIND` or the compose port mappings, or stop the process using the port.
 - **`DHI_WEB_DIR` does not take effect** — relative paths resolve from the server's working directory, and the directory must contain `index.html`. An empty value falls back to `web/out` when it exists.

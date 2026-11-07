@@ -31,27 +31,6 @@ const APPROVAL_TTL_MINUTES: i64 = 15;
 const DEFAULT_ENGINE_MAX_ROUNDS: usize = 64;
 const DEFAULT_ENGINE_NO_PROGRESS_ROUNDS: usize = 16;
 
-/// Reads a positive integer engine limit from the environment. A missing
-/// variable keeps the default; an invalid or zero value logs a warning and
-/// also keeps it.
-fn engine_limit_from_env(name: &str, default: usize) -> usize {
-    let Ok(raw) = std::env::var(name) else {
-        return default;
-    };
-    match raw.trim().parse::<usize>() {
-        Ok(value) if value > 0 => value,
-        _ => {
-            warn!(
-                variable = name,
-                value = %raw,
-                default,
-                "invalid engine round limit; using the default"
-            );
-            default
-        }
-    }
-}
-
 /// The first-boot seed material from the same environment variables
 /// `dhi_agent::LlmProfile::from_env` reads. `None` keeps mock-mode boots
 /// profile-free: env is only ever the initial fallback.
@@ -753,22 +732,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let engine_max_rounds =
-        engine_limit_from_env("DHI_ENGINE_MAX_ROUNDS", DEFAULT_ENGINE_MAX_ROUNDS);
-    let engine_no_progress_rounds = engine_limit_from_env(
-        "DHI_ENGINE_NO_PROGRESS_ROUNDS",
-        DEFAULT_ENGINE_NO_PROGRESS_ROUNDS,
-    );
     info!(
-        max_rounds = engine_max_rounds,
-        no_progress_rounds = engine_no_progress_rounds,
+        max_rounds = DEFAULT_ENGINE_MAX_ROUNDS,
+        no_progress_rounds = DEFAULT_ENGINE_NO_PROGRESS_ROUNDS,
         "engine round budgets configured"
     );
     let engine = Arc::new(
         Engine::new(store.clone(), agent.clone())
             .with_executor(executor, guard_store.clone())
-            .with_max_rounds(engine_max_rounds)
-            .with_max_no_progress_rounds(engine_no_progress_rounds),
+            .with_max_rounds(DEFAULT_ENGINE_MAX_ROUNDS)
+            .with_max_no_progress_rounds(DEFAULT_ENGINE_NO_PROGRESS_ROUNDS),
     );
 
     // Restart recovery: deny stale approvals, release running intents, and

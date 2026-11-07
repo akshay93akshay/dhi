@@ -243,7 +243,7 @@ function TeamRunPanel(props: { run: TeamRun }) {
             Team run
           </span>
           <Badge variant="outline" className="font-normal">
-            DHI+
+            DHI<sup>+</sup>
           </Badge>
           <Badge variant="accent" className="font-mono">
             {run.topology}

@@ -162,7 +162,6 @@ export type TaskCapacityPatch = Partial<{
 export type Task = {
   id: string;
   goal: string;
-  bound: number;
   state: TaskState;
   exploration_id: string;
   origin_fact_id: string;
@@ -210,8 +209,7 @@ export type Fact = {
   state: FactState;
   /**
    * Free-form provenance object with two producer conventions:
-   * - origin fact (written by task creation): `{ "goal": <task goal>,
-   *   "bound": <task bound> }`;
+   * - origin fact (written by task creation): `{ "goal": <task goal> }`;
    * - worker fact (written on intent completion): `{ "intent_id": <uuid>,
    *   "detail": <string>, "evidence": <string>, "confidence": <string> }`.
    */
@@ -241,8 +239,7 @@ export type Activity = {
   message: string;
   /**
    * Free-form payload object, convention-dependent: structured markers such
-   * as `{ "bound": 3 }` on `task_created` or
-   * `{ "approval_id": ..., "tool_call_id": ..., "reason": ... }` on
+   * as `{ "approval_id": ..., "tool_call_id": ..., "reason": ... }` on
    * `approval_denied`; workers/steps attach their own extras.
    */
   payload: JsonObject;
@@ -868,9 +865,9 @@ export type ToggleRuleResponse = {
  */
 export type CreateTaskInput = {
   goal: string;
-  bound: number;
   planner_profile_id?: number | null;
   worker_profile_id?: number | null;
+  capacity?: TaskCapacity;
 };
 
 /**

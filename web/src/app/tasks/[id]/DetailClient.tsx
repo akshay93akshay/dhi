@@ -325,8 +325,6 @@ function TaskDetail() {
           <span aria-hidden="true">·</span>
           <StateBadge state={task.state} />
           <span aria-hidden="true">·</span>
-          <span>bound {task.bound}</span>
-          <span aria-hidden="true">·</span>
           <span>updated {formatLocalTimestamp(task.updated_at)}</span>
         </div>
         <div className="mt-5 flex flex-wrap items-center gap-2">
@@ -491,9 +489,6 @@ function TaskDetail() {
               {shortenId(task.origin_fact_id)}
             </span>
           </dd>
-
-          <dt className="text-xs leading-5 text-muted-foreground">Bound</dt>
-          <dd className="m-0 text-[13px] tabular-nums">{task.bound}</dd>
 
           <dt className="text-xs leading-5 text-muted-foreground">
             Planner pin

@@ -322,7 +322,6 @@ pub struct TaskCapacity {
 pub struct Task {
     pub id: TaskId,
     pub goal: String,
-    pub bound: i32,
     pub state: TaskState,
     pub exploration_id: Uuid,
     pub origin_fact_id: FactId,
@@ -339,12 +338,11 @@ pub struct Task {
 }
 
 impl Task {
-    pub fn new(goal: impl Into<String>, bound: i32) -> Self {
+    pub fn new(goal: impl Into<String>) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
             goal: goal.into(),
-            bound,
             state: TaskState::Created,
             exploration_id: Uuid::new_v4(),
             origin_fact_id: Uuid::new_v4(),
@@ -364,7 +362,6 @@ impl Task {
             state: FactState::Origin,
             provenance: serde_json::json!({
                 "goal": self.goal,
-                "bound": self.bound,
             }),
             origin_of: None,
             created_at: self.created_at,
@@ -616,7 +613,7 @@ mod tests {
 
     #[test]
     fn task_starts_with_one_exploration_and_origin_fact() {
-        let task = Task::new("forced mate", 4);
+        let task = Task::new("forced mate");
         assert_eq!(task.state, TaskState::Created);
         assert_eq!(task.origin_fact().state, FactState::Origin);
         assert!(!task.exploration_id.is_nil());
@@ -624,7 +621,7 @@ mod tests {
 
     #[test]
     fn task_transition_is_checked() {
-        let mut task = Task::new("goal", 1);
+        let mut task = Task::new("goal");
         task.transition(TaskState::Running).unwrap();
         task.transition(TaskState::Done).unwrap();
         assert!(task.transition(TaskState::Paused).is_err());
@@ -656,7 +653,7 @@ mod tests {
 
     #[test]
     fn intent_requires_a_fact() {
-        let task = Task::new("goal", 1);
+        let task = Task::new("goal");
         assert!(Intent::new(task.id, Uuid::nil(), "move").is_err());
         let intent = Intent::new(task.id, task.origin_fact_id, "move").unwrap();
         assert_eq!(intent.state, IntentState::Open);
@@ -664,7 +661,7 @@ mod tests {
 
     #[test]
     fn intent_claim_is_single_step() {
-        let task = Task::new("goal", 1);
+        let task = Task::new("goal");
         let mut intent = Intent::new(task.id, task.origin_fact_id, "move").unwrap();
         intent.claim("worker-1").unwrap();
         assert_eq!(intent.state, IntentState::Running);

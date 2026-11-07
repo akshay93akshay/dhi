@@ -364,7 +364,7 @@ async fn task_creation_validates_role_pins(pg: sqlx::PgPool) {
         app.clone(),
         post_json(
             "/api/tasks",
-            json!({ "goal": "mate in two", "bound": 2, "planner_profile_id": 424242 }),
+            json!({ "goal": "mate in two", "planner_profile_id": 424242 }),
         ),
     )
     .await;
@@ -378,7 +378,6 @@ async fn task_creation_validates_role_pins(pg: sqlx::PgPool) {
             "/api/tasks",
             json!({
                 "goal": "fork the queen",
-                "bound": 2,
                 "planner_profile_id": spare,
                 "worker_profile_id": spare
             }),
@@ -399,7 +398,6 @@ async fn task_creation_validates_role_pins(pg: sqlx::PgPool) {
             "/api/tasks",
             json!({
                 "goal": "alias spelling",
-                "bound": 2,
                 "pinned_planner_profile_id": spare,
                 "pinned_worker_profile_id": spare
             }),
@@ -875,9 +873,9 @@ async fn deleting_a_profile_clears_its_breaker_state(pg: sqlx::PgPool) {
 #[sqlx::test(migrations = "../dhi-store/migrations")]
 async fn task_delete_removes_terminal_tasks_only(pg: sqlx::PgPool) {
     let (state, store, _guard) = live_state(pg).await;
-    let done = store.create_task("delete done", 2).await.unwrap();
-    let cancelled = store.create_task("delete cancelled", 2).await.unwrap();
-    let active = store.create_task("keep active", 2).await.unwrap();
+    let done = store.create_task("delete done").await.unwrap();
+    let cancelled = store.create_task("delete cancelled").await.unwrap();
+    let active = store.create_task("keep active").await.unwrap();
     for (id, terminal) in [
         (done.id, dhi_core::TaskState::Done),
         (cancelled.id, dhi_core::TaskState::Cancelled),

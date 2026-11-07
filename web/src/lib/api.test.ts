@@ -82,7 +82,6 @@ function jsonResponse(body: unknown, status = 200): Response {
 const sampleTask: Task = {
   id: "00000000-0000-4000-8000-000000000001",
   goal: "mate in two",
-  bound: 3,
   state: "running",
   exploration_id: "00000000-0000-4000-8000-000000000002",
   origin_fact_id: "00000000-0000-4000-8000-000000000003",
@@ -103,7 +102,7 @@ const sampleActivity: Activity = {
   task_id: sampleTask.id,
   kind: "task_created",
   message: "Task created: mate in two",
-  payload: { bound: 3 },
+  payload: {},
   created_at: "2026-10-30T00:00:00Z",
 };
 
@@ -181,7 +180,7 @@ test("getHealth reads the bare health object", async () => {
   assert.deepEqual(health, { status: "ok", service: "dhi", version: "0.1.0" });
 });
 
-test("createTask posts the goal/bound/pins body to POST /api/tasks", async () => {
+test("createTask posts the goal/pins body to POST /api/tasks", async () => {
   const recorder = stubFetch((_url, init) => {
     assert.equal(init?.method, "POST");
     return jsonResponse(sampleTask, 201);
@@ -189,7 +188,6 @@ test("createTask posts the goal/bound/pins body to POST /api/tasks", async () =>
 
   const task = await createTask({
     goal: "mate in two",
-    bound: 3,
     planner_profile_id: 7,
     worker_profile_id: null,
   });
@@ -199,7 +197,6 @@ test("createTask posts the goal/bound/pins body to POST /api/tasks", async () =>
     recorder.calls[0]?.init?.body,
     JSON.stringify({
       goal: "mate in two",
-      bound: 3,
       planner_profile_id: 7,
       worker_profile_id: null,
     }),
@@ -210,11 +207,11 @@ test("createTask posts the goal/bound/pins body to POST /api/tasks", async () =>
 test("createTask omits absent pin fields (server defaults apply)", async () => {
   const recorder = stubFetch(() => jsonResponse(sampleTask, 201));
 
-  await createTask({ goal: "solo", bound: 1 });
+  await createTask({ goal: "solo" });
 
   assert.equal(
     recorder.calls[0]?.init?.body,
-    JSON.stringify({ goal: "solo", bound: 1 }),
+    JSON.stringify({ goal: "solo" }),
   );
 });
 
@@ -354,7 +351,7 @@ test("getTaskWork returns the { task, goals, intents, facts, results } shape", a
     task_id: sampleTask.id,
     claim: "Origin: mate in two",
     state: "origin" as const,
-    provenance: { goal: "mate in two", bound: 3 },
+    provenance: { goal: "mate in two" },
     origin_of: null,
     created_at: "2026-10-30T00:00:00Z",
   };

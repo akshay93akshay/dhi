@@ -16,18 +16,17 @@ use crate::Store;
 
 #[async_trait]
 impl GraphStore for Store {
-    async fn create_task(&self, goal: String, bound: i32) -> anyhow::Result<Task> {
-        Ok(Store::create_task(self, &goal, bound).await?)
+    async fn create_task(&self, goal: String) -> anyhow::Result<Task> {
+        Ok(Store::create_task(self, &goal).await?)
     }
 
     async fn create_task_with_pins(
         &self,
         goal: String,
-        bound: i32,
         planner_pin: Option<i64>,
         worker_pin: Option<i64>,
     ) -> anyhow::Result<Task> {
-        Ok(Store::create_task_with_pins(self, &goal, bound, planner_pin, worker_pin).await?)
+        Ok(Store::create_task_with_pins(self, &goal, planner_pin, worker_pin).await?)
     }
 
     async fn get_task(&self, id: TaskId) -> anyhow::Result<Option<Task>> {

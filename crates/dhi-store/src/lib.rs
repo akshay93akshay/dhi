@@ -73,8 +73,8 @@ impl Store {
         &self.pool
     }
 
-    pub async fn create_task(&self, goal: &str, bound: i32) -> Result<Task, StoreError> {
-        self.create_task_with_pins(goal, bound, None, None).await
+    pub async fn create_task(&self, goal: &str) -> Result<Task, StoreError> {
+        self.create_task_with_pins(goal, None, None).await
     }
 
     /// Pins are validated by the caller (`profile_exists`); the SQL foreign
@@ -82,11 +82,10 @@ impl Store {
     pub async fn create_task_with_pins(
         &self,
         goal: &str,
-        bound: i32,
         planner_pin: Option<i64>,
         worker_pin: Option<i64>,
     ) -> Result<Task, StoreError> {
-        let mut task = Task::new(goal, bound);
+        let mut task = Task::new(goal);
         // The returned task must describe the persisted row, pins included.
         task.pinned_planner_profile_id = planner_pin;
         task.pinned_worker_profile_id = worker_pin;
@@ -96,13 +95,12 @@ impl Store {
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
-            "INSERT INTO tasks (id, goal, bound, state, exploration_id, origin_fact_id, \
+            "INSERT INTO tasks (id, goal, state, exploration_id, origin_fact_id, \
              pinned_planner_profile_id, pinned_worker_profile_id, capacity, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(task.id)
         .bind(&task.goal)
-        .bind(task.bound)
         .bind(task.state.as_str())
         .bind(task.exploration_id)
         .bind(task.origin_fact_id)
@@ -135,7 +133,7 @@ impl Store {
         .bind(task.id)
         .bind("task_created")
         .bind(format!("Task created: {}", task.goal))
-        .bind(serde_json::json!({"bound": task.bound}))
+        .bind(serde_json::json!({}))
         .execute(&mut *tx)
         .await?;
 
@@ -145,7 +143,7 @@ impl Store {
 
     pub async fn get_task(&self, id: Uuid) -> Result<Option<Task>, StoreError> {
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, goal, bound, state, exploration_id, origin_fact_id, \
+            "SELECT id, goal, state, exploration_id, origin_fact_id, \
                     pinned_planner_profile_id, pinned_worker_profile_id, capacity, created_at, updated_at
              FROM tasks WHERE id = $1",
         )
@@ -157,7 +155,7 @@ impl Store {
 
     pub async fn list_tasks(&self, limit: i64) -> Result<Vec<Task>, StoreError> {
         let rows = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, goal, bound, state, exploration_id, origin_fact_id, \
+            "SELECT id, goal, state, exploration_id, origin_fact_id, \
                     pinned_planner_profile_id, pinned_worker_profile_id, capacity, created_at, updated_at
              FROM tasks ORDER BY created_at DESC LIMIT $1",
         )
@@ -215,7 +213,7 @@ impl Store {
         let row = sqlx::query_as::<_, TaskRow>(
             "UPDATE tasks SET capacity = $2, updated_at = now()
              WHERE id = $1
-             RETURNING id, goal, bound, state, exploration_id, origin_fact_id, \
+             RETURNING id, goal, state, exploration_id, origin_fact_id, \
                        pinned_planner_profile_id, pinned_worker_profile_id, capacity, \
                        created_at, updated_at",
         )
@@ -352,7 +350,7 @@ impl Store {
         let mut tx = self.pool.begin().await?;
 
         let row = sqlx::query_as::<_, TaskRow>(
-            "SELECT id, goal, bound, state, exploration_id, origin_fact_id, \
+            "SELECT id, goal, state, exploration_id, origin_fact_id, \
                     pinned_planner_profile_id, pinned_worker_profile_id, capacity, created_at, updated_at
              FROM tasks WHERE id = $1 FOR UPDATE",
         )
@@ -403,7 +401,7 @@ impl Store {
         let row = sqlx::query_as::<_, TaskRow>(
             "UPDATE tasks SET state = 'running', updated_at = now()
              WHERE id = $1
-             RETURNING id, goal, bound, state, exploration_id, origin_fact_id, \
+             RETURNING id, goal, state, exploration_id, origin_fact_id, \
                        pinned_planner_profile_id, pinned_worker_profile_id, capacity, \
                        created_at, updated_at",
         )
@@ -1617,7 +1615,6 @@ impl Store {
 struct TaskRow {
     id: Uuid,
     goal: String,
-    bound: i32,
     state: String,
     exploration_id: Uuid,
     origin_fact_id: Uuid,
@@ -1634,7 +1631,6 @@ impl TryFrom<TaskRow> for Task {
         Ok(Self {
             id: r.id,
             goal: r.goal,
-            bound: r.bound,
             state: parse_task_state(&r.state)?,
             exploration_id: r.exploration_id,
             origin_fact_id: r.origin_fact_id,

@@ -588,8 +588,8 @@ impl Engine {
 
     /// Records a visible terminal failure: guarded transition plus one
     /// `task_failed` activity row carrying the reason. Every engine failure
-    /// path (provider error, bound exhaustion, give_up, round cap) goes
-    /// through here, so the dashboard can never show a dead loop as
+    /// path (provider error, give_up, round cap) goes through here, so the
+    /// dashboard can never show a dead loop as
     /// `running`.
     async fn fail_task(
         &self,
@@ -1009,7 +1009,6 @@ impl Engine {
                     .plan(PlanInput {
                         task_id,
                         goal: task.goal.clone(),
-                        bound: task.bound,
                         goals,
                         facts: facts.clone(),
                         open_intents: 0,
@@ -1148,40 +1147,6 @@ impl Engine {
                                 .await?;
                             anyhow::bail!("{reason}");
                         }
-                        // The bound is the task's evidence budget: once the
-                        // confirmed facts reach it, more intents are not
-                        // allowed. A proof of an existing fact is still fine.
-                        //
-                        // A reopened task starts a new evidence epoch: the
-                        // facts that proved the old goals must not exhaust the
-                        // budget for the new goal. Only facts recorded after
-                        // the latest `task_reopened` row count. A task that
-                        // was never reopened has no such row, so every
-                        // confirmed fact counts as before.
-                        let reopened_at = self
-                            .store
-                            .list_activity(task_id, Some("task_reopened"))
-                            .await?
-                            .last()
-                            .map(|activity| activity.created_at);
-                        let confirmed = self
-                            .store
-                            .list_facts(task_id)
-                            .await?
-                            .iter()
-                            .filter(|fact| fact.state == FactState::Confirmed)
-                            .filter(|fact| reopened_at.is_none_or(|at| fact.created_at > at))
-                            .count();
-                        if confirmed >= task.bound.max(1) as usize {
-                            let reason = format!(
-                                "evidence bound exhausted: {confirmed} confirmed facts for bound {}",
-                                task.bound
-                            );
-                            self.fail_task(task_id, &mut task, reason.clone(), "bound")
-                                .await?;
-                            anyhow::bail!("{reason}");
-                        }
-
                         let intent = self
                             .store
                             .add_intent(task_id, task.origin_fact_id, description)
@@ -1503,8 +1468,7 @@ impl Engine {
                     // `team_failed` row, stop this intent, and return to the
                     // planner. The planner can retry with a different plan or
                     // a larger worker budget, or give up. The host guards
-                    // (bound, no-progress, rounds, capacity) still cap the
-                    // loop.
+                    // (no-progress, rounds, capacity) still cap the loop.
                     let worker_details: Vec<serde_json::Value> = result
                         .worker_results
                         .iter()
@@ -2635,7 +2599,7 @@ mod tests {
     #[tokio::test]
     async fn mock_engine_completes_a_task() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("forced mate", 4);
+        let task = store.seed_task("forced mate");
         let engine = Engine::new(store.clone(), Arc::new(MockAgentRuntime));
         let result = engine.run_task(task.id).await.unwrap();
         assert_eq!(result.task.state, TaskState::Done);
@@ -2662,7 +2626,7 @@ mod tests {
     #[tokio::test]
     async fn stop_flag_before_the_first_round_cancels_the_task() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("stop before work", 3);
+        let task = store.seed_task("stop before work");
         let stop = Arc::new(AtomicBool::new(true));
         let engine = Engine::new(store.clone(), Arc::new(MockAgentRuntime));
 
@@ -2694,7 +2658,7 @@ mod tests {
     #[tokio::test]
     async fn stop_during_plan_is_checked_before_the_result_is_applied() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("stop during plan", 3);
+        let task = store.seed_task("stop during plan");
         let stop = Arc::new(AtomicBool::new(false));
         let engine = Engine::new(
             store.clone(),
@@ -2722,7 +2686,7 @@ mod tests {
     #[tokio::test]
     async fn planner_give_up_fails_the_task_with_a_visible_reason() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("impossible task", 3);
+        let task = store.seed_task("impossible task");
         let goal = seed_goal(&store, &task).await;
         let agent = Arc::new(ScriptedAgent::new(
             vec![PlanOutcome::GiveUp {
@@ -2758,39 +2722,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evidence_bound_stops_another_intent_and_marks_the_task_failed() {
+    async fn reopened_task_runs_the_new_goal() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("bound task", 1);
-        let agent = Arc::new(ScriptedAgent::new(
-            vec![
-                single_intent_plan("first intent"),
-                single_intent_plan("second intent"),
-            ],
-            vec![execute_output("the first fact", vec![])],
-        ));
-        let engine = Engine::new(store.clone(), agent);
-        let err = engine
-            .run_task(task.id)
-            .await
-            .expect_err("the bound refuses a second intent");
-        assert!(err.to_string().contains("bound"), "{err}");
-
-        let row = store.get_task(task.id).await.unwrap().unwrap();
-        assert_eq!(row.state, TaskState::Failed);
-        let failed = store
-            .activities(task.id)
-            .into_iter()
-            .find(|a| a.kind == "task_failed")
-            .expect("failure row");
-        assert_eq!(failed.payload["source"], "bound");
-    }
-
-    #[tokio::test]
-    async fn reopened_task_starts_a_new_evidence_epoch() {
-        let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("reopened bound", 1);
-        // The old fact proved the old goal. It must not spend the new goal's
-        // bound after the human reopens the task.
+        let task = store.seed_task("reopened task");
+        // The old fact proved the old goal; the new goal starts from a fresh
+        // intent after the human reopens the task.
         store
             .record_fact(
                 task.id,
@@ -2830,20 +2766,18 @@ mod tests {
         let activities = store.activities(task.id);
         assert!(
             activities.iter().any(|a| a.kind == "intents_added"),
-            "the old fact must not exhaust the new epoch's bound"
+            "the reopened task must add an intent for the new goal"
         );
         assert!(
-            !activities
-                .iter()
-                .any(|a| a.kind == "task_failed" && a.payload["source"] == "bound"),
-            "the bound must not reject the first new intent"
+            !activities.iter().any(|a| a.kind == "task_failed"),
+            "the reopened task must not fail"
         );
     }
 
     #[tokio::test]
     async fn planner_failure_marks_the_task_failed_and_records_it() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("provider failure", 2);
+        let task = store.seed_task("provider failure");
         let agent = Arc::new(ScriptedAgent::with_plans(
             vec![ScriptedPlan::Fail("provider exploded".to_string())],
             vec![],
@@ -2876,7 +2810,7 @@ mod tests {
     #[tokio::test]
     async fn planner_usage_is_recorded() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("record usage", 2);
+        let task = store.seed_task("record usage");
         let engine = Engine::new(store.clone(), Arc::new(RecordingAgent::new()));
         engine.run_task(task.id).await.unwrap();
 
@@ -2919,7 +2853,7 @@ mod tests {
     #[tokio::test]
     async fn worker_usage_is_recorded() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("record usage", 2);
+        let task = store.seed_task("record usage");
         let engine = Engine::new(store.clone(), Arc::new(RecordingAgent::new()));
         engine.run_task(task.id).await.unwrap();
 
@@ -2960,7 +2894,7 @@ mod tests {
     #[tokio::test]
     async fn agent_run_has_tokens_and_status() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("record usage", 2);
+        let task = store.seed_task("record usage");
         let engine = Engine::new(store.clone(), Arc::new(RecordingAgent::new()));
         engine.run_task(task.id).await.unwrap();
 
@@ -2991,7 +2925,7 @@ mod tests {
     #[tokio::test]
     async fn mock_agent_records_no_usage() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("forced mate", 4);
+        let task = store.seed_task("forced mate");
         let engine = Engine::new(store.clone(), Arc::new(MockAgentRuntime));
         engine.run_task(task.id).await.unwrap();
         assert!(
@@ -3003,7 +2937,7 @@ mod tests {
     #[tokio::test]
     async fn claim_is_atomic() {
         let store = MemoryStore::new();
-        let task = store.seed_task("goal", 1);
+        let task = store.seed_task("goal");
         let intent = store
             .add_intent(task.id, task.origin_fact_id, "one step".to_string())
             .await
@@ -3019,7 +2953,7 @@ mod tests {
     #[tokio::test]
     async fn allow_tool_call_records_fact() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("open a game", 4);
+        let task = store.seed_task("open a game");
         let goal = seed_goal(&store, &task).await;
         let backend = Arc::new(FakeBackend::new(json!({"game_id": "g-1"})));
         let engine = guarded_engine(
@@ -3059,7 +2993,7 @@ mod tests {
     #[tokio::test]
     async fn deny_tool_call_continues_intent() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("wipe the disk", 2);
+        let task = store.seed_task("wipe the disk");
         let goal = seed_goal(&store, &task).await;
         let backend = Arc::new(FakeBackend::new(json!({})));
         let engine = guarded_engine(
@@ -3102,7 +3036,7 @@ mod tests {
     #[tokio::test]
     async fn empty_post_hoc_tool_calls_run_nothing_through_the_guard() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("only record the fact", 2);
+        let task = store.seed_task("only record the fact");
         let goal = seed_goal(&store, &task).await;
         let backend = Arc::new(FakeBackend::new(json!({"should": "never run"})));
         let engine = guarded_engine(
@@ -3163,7 +3097,7 @@ mod tests {
     #[tokio::test]
     async fn pending_outcome_from_custom_executor_is_an_error() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("never pause on pending", 3);
+        let task = store.seed_task("never pause on pending");
         let backend = Arc::new(FakeBackend::new(json!({"ok": true})));
         let engine = Engine::new(
             store.clone(),
@@ -3242,7 +3176,7 @@ mod tests {
     #[tokio::test]
     async fn approval_allow_continues_same_run() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("deploy the release", 3);
+        let task = store.seed_task("deploy the release");
         let task_id = task.id;
         let goal = seed_goal(&store, &task).await;
         let backend = Arc::new(FakeBackend::new(json!({"deployed": true})));
@@ -3299,7 +3233,7 @@ mod tests {
     #[tokio::test]
     async fn task_does_not_stay_running_after_allow() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("finish after approval", 3);
+        let task = store.seed_task("finish after approval");
         let task_id = task.id;
         let goal = seed_goal(&store, &task).await;
         let backend = Arc::new(FakeBackend::new(json!({"ok": true})));
@@ -3338,7 +3272,7 @@ mod tests {
     #[tokio::test]
     async fn no_paused_intent_on_ask() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("wait without pausing", 3);
+        let task = store.seed_task("wait without pausing");
         let task_id = task.id;
         let goal = seed_goal(&store, &task).await;
         let backend = Arc::new(FakeBackend::new(json!({"ok": true})));
@@ -3393,7 +3327,7 @@ mod tests {
     #[tokio::test]
     async fn approval_deny_continues_same_run() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("deny and continue", 3);
+        let task = store.seed_task("deny and continue");
         let task_id = task.id;
         let goal = seed_goal(&store, &task).await;
         let backend = Arc::new(FakeBackend::new(json!({"deployed": true})));
@@ -3449,7 +3383,7 @@ mod tests {
     #[tokio::test]
     async fn approval_expiry_continues_same_run() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("deploy without a reviewer", 3);
+        let task = store.seed_task("deploy without a reviewer");
         let task_id = task.id;
         let goal = seed_goal(&store, &task).await;
         let backend = Arc::new(FakeBackend::new(json!({"deployed": true})));
@@ -3497,7 +3431,7 @@ mod tests {
     #[tokio::test]
     async fn approval_sweep_continues_same_run() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("sweep the wait", 3);
+        let task = store.seed_task("sweep the wait");
         let task_id = task.id;
         let goal = seed_goal(&store, &task).await;
         let backend = Arc::new(FakeBackend::new(json!({"ok": true})));
@@ -3554,7 +3488,7 @@ mod tests {
     #[tokio::test]
     async fn decide_approval_only_resolves_the_row() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("decide only", 3);
+        let task = store.seed_task("decide only");
         let backend = Arc::new(FakeBackend::new(json!({"ok": true})));
         let engine = guarded_engine(
             &store,
@@ -3619,7 +3553,7 @@ mod tests {
     #[tokio::test]
     async fn engine_does_not_overwrite_a_terminal_task_state() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("finish once", 2);
+        let task = store.seed_task("finish once");
         store
             .set_task_state_guarded(task.id, TaskState::Failed)
             .await
@@ -3650,8 +3584,8 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let backend = Arc::new(FakeBackend::new(json!({"deployed": true})));
         let policy = verdict_policy("deploy", GuardVerdict::Ask);
-        let task_a = store.seed_task("deploy A", 3);
-        let task_b = store.seed_task("deploy B", 3);
+        let task_a = store.seed_task("deploy A");
+        let task_b = store.seed_task("deploy B");
 
         let mut runs = Vec::new();
         for task in [&task_a, &task_b] {
@@ -3706,7 +3640,7 @@ mod tests {
     #[tokio::test]
     async fn approval_timer_expires_at_deadline_without_sweep() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("deploy without a reviewer", 3);
+        let task = store.seed_task("deploy without a reviewer");
         let task_id = task.id;
         let goal = seed_goal(&store, &task).await;
         let backend = Arc::new(FakeBackend::new(json!({"deployed": true})));
@@ -3750,7 +3684,7 @@ mod tests {
     #[tokio::test]
     async fn finish_paused_intent_is_atomic() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("race the finish", 2);
+        let task = store.seed_task("race the finish");
         let intent = store
             .add_intent(task.id, task.origin_fact_id, "one step".to_string())
             .await
@@ -3819,7 +3753,7 @@ mod tests {
     #[tokio::test]
     async fn orphaned_paused_intent_is_blocked() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("orphaned pause", 2);
+        let task = store.seed_task("orphaned pause");
         let task_id = task.id;
         let intent = store
             .add_intent(task.id, task.origin_fact_id, "one step".to_string())
@@ -3867,7 +3801,7 @@ mod tests {
     #[tokio::test]
     async fn paused_intent_with_pending_approval_is_not_blocked() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("waiting in time", 2);
+        let task = store.seed_task("waiting in time");
         let task_id = task.id;
         let backend = Arc::new(FakeBackend::new(json!({})));
         let engine = guarded_engine(
@@ -3939,7 +3873,7 @@ mod tests {
     #[tokio::test]
     async fn engine_idle_wait_does_not_consume_round_budget() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("wait for work", 2);
+        let task = store.seed_task("wait for work");
         let goal = seed_goal(&store, &task).await;
 
         // Five idle planner ticks, more than the whole round budget, before
@@ -3972,7 +3906,7 @@ mod tests {
     #[tokio::test]
     async fn max_rounds_stops_a_task_at_the_configured_value() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("round cap", 100);
+        let task = store.seed_task("round cap");
         let engine = Engine::new(
             store.clone(),
             Arc::new(ScriptedAgent::new(
@@ -4015,7 +3949,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_round_limit_pauses_before_claiming() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("pause on rounds", 100);
+        let task = store.seed_task("pause on rounds");
         let goal = seed_goal(&store, &task).await;
         GraphStore::set_task_capacity(
             store.as_ref(),
@@ -4070,7 +4004,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_extension_completes_a_paused_task() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("extend after pause", 100);
+        let task = store.seed_task("extend after pause");
         let goal = seed_goal(&store, &task).await;
         GraphStore::set_task_capacity(
             store.as_ref(),
@@ -4126,7 +4060,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_model_call_limit_pauses_a_task() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("pause on model calls", 100);
+        let task = store.seed_task("pause on model calls");
         GraphStore::set_task_capacity(
             store.as_ref(),
             task.id,
@@ -4159,7 +4093,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_wall_limit_pauses_a_task() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("pause on wall time", 100);
+        let task = store.seed_task("pause on wall time");
         GraphStore::set_task_capacity(
             store.as_ref(),
             task.id,
@@ -4188,7 +4122,7 @@ mod tests {
     #[tokio::test]
     async fn no_progress_guard_does_not_stop_a_task_that_confirms_facts() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("steady progress", 100);
+        let task = store.seed_task("steady progress");
         let goal = seed_goal(&store, &task).await;
         let engine = Engine::new(
             store.clone(),
@@ -4231,19 +4165,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl GraphStore for FactlessStore {
-        async fn create_task(&self, goal: String, bound: i32) -> anyhow::Result<Task> {
-            self.inner.create_task(goal, bound).await
+        async fn create_task(&self, goal: String) -> anyhow::Result<Task> {
+            self.inner.create_task(goal).await
         }
 
         async fn create_task_with_pins(
             &self,
             goal: String,
-            bound: i32,
             planner_pin: Option<i64>,
             worker_pin: Option<i64>,
         ) -> anyhow::Result<Task> {
             self.inner
-                .create_task_with_pins(goal, bound, planner_pin, worker_pin)
+                .create_task_with_pins(goal, planner_pin, worker_pin)
                 .await
         }
 
@@ -4533,7 +4466,7 @@ mod tests {
     #[tokio::test]
     async fn no_progress_guard_stops_a_planner_that_adds_intents_without_facts() {
         let inner = Arc::new(MemoryStore::new());
-        let task = inner.seed_task("planner spin", 100);
+        let task = inner.seed_task("planner spin");
         let plans: Vec<ScriptedPlan> = (0..10)
             .map(|i| ScriptedPlan::Outcome(single_intent_plan(&format!("intent {i}"))))
             .collect();
@@ -4583,7 +4516,7 @@ mod tests {
     #[tokio::test]
     async fn engine_does_not_idle_forever() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("planner that never decides", 2);
+        let task = store.seed_task("planner that never decides");
         let engine = Engine::new(store.clone(), Arc::new(IdleAgent))
             .with_heartbeat(Duration::from_millis(10))
             .with_max_idle_ticks(3);
@@ -4612,7 +4545,7 @@ mod tests {
     #[tokio::test]
     async fn worker_tool_calls_cannot_reach_backend_without_executor() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("open a game", 4);
+        let task = store.seed_task("open a game");
         let backend = Arc::new(FakeBackend::new(json!({"game_id": "g-1"})));
         // Deliberately no `with_executor`: there is no guarded choke point.
         let engine = Engine::new(
@@ -4643,7 +4576,7 @@ mod tests {
     #[tokio::test]
     async fn planner_cannot_set_done() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("text cannot finish", 2);
+        let task = store.seed_task("text cannot finish");
         let plans = vec![
             PlanOutcome::NoPlan {
                 reason: "done".to_string(),
@@ -4665,7 +4598,7 @@ mod tests {
     #[tokio::test]
     async fn worker_cannot_set_accepted() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("worker truth is a fact", 2);
+        let task = store.seed_task("worker truth is a fact");
         let goal = seed_goal(&store, &task).await;
         let engine = Engine::new(
             store.clone(),
@@ -4702,7 +4635,7 @@ mod tests {
     #[tokio::test]
     async fn worker_fact_carries_evidence_and_confidence() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("record evidence", 2);
+        let task = store.seed_task("record evidence");
         let engine = Engine::new(
             store.clone(),
             Arc::new(ScriptedAgent::new(
@@ -4746,7 +4679,7 @@ mod tests {
     #[tokio::test]
     async fn worker_fact_detail_is_preserved() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("record detail", 2);
+        let task = store.seed_task("record detail");
         let detail = "the first line\nand the second line";
         let engine = Engine::new(
             store.clone(),
@@ -4784,7 +4717,7 @@ mod tests {
     #[tokio::test]
     async fn prove_goal_requires_confirmed_fact() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("origin cannot prove", 2);
+        let task = store.seed_task("origin cannot prove");
         let goal = seed_goal(&store, &task).await;
         let engine = Engine::new(
             store.clone(),
@@ -4831,7 +4764,7 @@ mod tests {
     #[tokio::test]
     async fn prove_goal_marks_goal_met() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("prove one of two", 2);
+        let task = store.seed_task("prove one of two");
         let first = seed_goal(&store, &task).await;
         let second = store
             .add_goal(task.id, "a second goal".to_string())
@@ -4866,7 +4799,7 @@ mod tests {
     #[tokio::test]
     async fn all_goals_met_sets_task_done() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("prove the only goal", 2);
+        let task = store.seed_task("prove the only goal");
         let goal = seed_goal(&store, &task).await;
         let fact = store
             .record_fact(task.id, "confirmed evidence".to_string(), json!({}))
@@ -4903,8 +4836,8 @@ mod tests {
     #[tokio::test]
     async fn fact_from_another_task_cannot_prove_goal() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("task A", 2);
-        let other = store.seed_task("task B", 2);
+        let task = store.seed_task("task A");
+        let other = store.seed_task("task B");
         let goal = seed_goal(&store, &task).await;
         let foreign_fact = store
             .record_fact(other.id, "another task's evidence".to_string(), json!({}))
@@ -5090,7 +5023,7 @@ mod tests {
     #[tokio::test]
     async fn engine_honors_an_optional_manager_selector() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("team selector", 4);
+        let task = store.seed_task("team selector");
         let goal = seed_goal(&store, &task).await;
         let plan = two_worker_plan("team selector", Topology::ManagerWorker);
         let agent = Arc::new(TeamAgent::new(
@@ -5129,7 +5062,7 @@ mod tests {
     #[tokio::test]
     async fn engine_uses_the_runtime_manager_selection() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("runtime manager", 4);
+        let task = store.seed_task("runtime manager");
         let goal = seed_goal(&store, &task).await;
         // The planner offers alpha and beta but starts the only subtask on
         // beta; the runtime manager selects alpha only.
@@ -5185,7 +5118,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_manager_selection_counts_its_model_calls() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("manager model calls", 4);
+        let task = store.seed_task("manager model calls");
         let agent = Arc::new(SelectingTeamAgent::new(Vec::new(), Vec::new()));
         let model_calls = Arc::new(AtomicUsize::new(0));
         let selector = RuntimeTeamSelector {
@@ -5212,7 +5145,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_model_call_limit_counts_the_manager_selection() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("manager capacity", 100);
+        let task = store.seed_task("manager capacity");
         let goal = seed_goal(&store, &task).await;
         GraphStore::set_task_capacity(
             store.as_ref(),
@@ -5263,7 +5196,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_clamps_manager_worker_parallelism() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("capacity team", 4);
+        let task = store.seed_task("capacity team");
         let goal = seed_goal(&store, &task).await;
         let mut plan = two_worker_plan("capacity team", Topology::ManagerWorker);
         plan.limits.max_parallel = 3;
@@ -5312,7 +5245,7 @@ mod tests {
     #[tokio::test]
     async fn manager_worker_plan_records_exactly_one_fact() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("team task", 4);
+        let task = store.seed_task("team task");
         let goal = seed_goal(&store, &task).await;
         let plan = two_worker_plan("team work", Topology::ManagerWorker);
         let agent = Arc::new(TeamAgent::new(
@@ -5376,7 +5309,7 @@ mod tests {
     #[tokio::test]
     async fn manager_worker_call_usage_is_recorded_as_one_agent_run() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("team usage", 4);
+        let task = store.seed_task("team usage");
         let goal = seed_goal(&store, &task).await;
         let plan = two_worker_plan("team usage", Topology::ManagerWorker);
         let agent = Arc::new(TeamAgent::new(
@@ -5433,7 +5366,7 @@ mod tests {
     #[tokio::test]
     async fn manager_worker_runs_record_distinct_worker_keys() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("team identity", 4);
+        let task = store.seed_task("team identity");
         let goal = seed_goal(&store, &task).await;
         let plan = two_worker_plan("team identity", Topology::ManagerWorker);
         let agent = Arc::new(TeamAgent::new(
@@ -5471,7 +5404,7 @@ mod tests {
     #[tokio::test]
     async fn team_worker_tool_calls_run_once_through_the_guard() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("team tool call", 4);
+        let task = store.seed_task("team tool call");
         let goal = seed_goal(&store, &task).await;
         let plan = two_worker_plan("team tool call", Topology::ManagerWorker);
         let agent = Arc::new(TeamAgent::new(
@@ -5520,7 +5453,7 @@ mod tests {
     #[tokio::test]
     async fn team_worker_denied_tool_call_is_audited_and_never_runs() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("denied team tool", 4);
+        let task = store.seed_task("denied team tool");
         let goal = seed_goal(&store, &task).await;
         let plan = two_worker_plan("denied team tool", Topology::ManagerWorker);
         let agent = Arc::new(TeamAgent::new(
@@ -5578,7 +5511,7 @@ mod tests {
     #[tokio::test]
     async fn team_tool_call_error_fails_the_task_without_the_team_fact() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("failing team tool", 4);
+        let task = store.seed_task("failing team tool");
         let goal = seed_goal(&store, &task).await;
         let plan = two_worker_plan("failing team tool", Topology::ManagerWorker);
         let agent = Arc::new(TeamAgent::new(
@@ -5634,7 +5567,7 @@ mod tests {
     #[tokio::test]
     async fn team_tool_calls_cannot_reach_backend_without_executor() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("unguarded team tool", 4);
+        let task = store.seed_task("unguarded team tool");
         let plan = two_worker_plan("unguarded team tool", Topology::ManagerWorker);
         let agent = Arc::new(TeamAgent::new(
             vec![ScriptedPlan::Outcome(planned_intent(
@@ -5669,7 +5602,7 @@ mod tests {
     #[tokio::test]
     async fn partially_failed_team_records_one_fact_naming_the_failure() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("partial team", 4);
+        let task = store.seed_task("partial team");
         let goal = seed_goal(&store, &task).await;
         let plan = two_worker_plan("partial work", Topology::ManagerWorker);
         let agent = Arc::new(TeamAgent::new(
@@ -5717,7 +5650,7 @@ mod tests {
     #[tokio::test]
     async fn zero_success_team_returns_to_the_planner_and_recovers() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("failed team", 4);
+        let task = store.seed_task("failed team");
         let goal = seed_goal(&store, &task).await;
         let doomed = two_worker_plan("doomed work", Topology::ManagerWorker);
         let retry = IntentPlan {
@@ -5834,7 +5767,7 @@ mod tests {
     #[tokio::test]
     async fn team_workers_receive_exactly_the_planners_turn_budget() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("exact team turns", 4);
+        let task = store.seed_task("exact team turns");
         let goal = seed_goal(&store, &task).await;
         let mut plan = two_worker_plan("exact team turns", Topology::ManagerWorker);
         // Alpha is below the old four-turn floor; beta proves the exact value
@@ -5872,7 +5805,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_plan_fails_the_task_with_a_worker_engine_reason() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("broken plan", 4);
+        let task = store.seed_task("broken plan");
         let plan = IntentPlan {
             intent: "broken work".to_string(),
             topology: Topology::ManagerWorker,
@@ -5916,7 +5849,7 @@ mod tests {
     #[tokio::test]
     async fn swarm_plan_records_one_fact() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("swarm task", 4);
+        let task = store.seed_task("swarm task");
         let goal = seed_goal(&store, &task).await;
         let plan = two_worker_plan("swarm work", Topology::Swarm);
         let agent = Arc::new(TeamAgent::new(
@@ -5986,7 +5919,7 @@ mod tests {
     #[tokio::test]
     async fn swarm_reactions_count_against_capacity_and_become_agent_runs() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("swarm reaction capacity", 4);
+        let task = store.seed_task("swarm reaction capacity");
         let goal = seed_goal(&store, &task).await;
         let mut plan = two_worker_plan("swarm reaction capacity", Topology::Swarm);
         for worker in &mut plan.workers {
@@ -6063,7 +5996,7 @@ mod tests {
     #[tokio::test]
     async fn no_plan_intent_keeps_the_single_worker_path() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("single path", 4);
+        let task = store.seed_task("single path");
         let goal = seed_goal(&store, &task).await;
         let agent = Arc::new(ScriptedAgent::with_plans(
             completion_plans("single work", goal.id),
@@ -6098,7 +6031,7 @@ mod tests {
     #[tokio::test]
     async fn missing_plan_on_resume_falls_back_to_single_worker() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("resume fallback", 4);
+        let task = store.seed_task("resume fallback");
         let goal = seed_goal(&store, &task).await;
         // Simulate a planned intent added by a previous process: its activity
         // marker survives but its plan row is gone, so the new engine's load
@@ -6141,7 +6074,7 @@ mod tests {
     #[tokio::test]
     async fn restarted_engine_loads_the_persisted_plan() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("restart task", 4);
+        let task = store.seed_task("restart task");
         let goal = seed_goal(&store, &task).await;
         let plan = two_worker_plan("restart work", Topology::ManagerWorker);
         let intent = store
@@ -6193,7 +6126,7 @@ mod tests {
     #[tokio::test]
     async fn completed_plan_is_removed_from_the_engine_map() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("cleanup task", 4);
+        let task = store.seed_task("cleanup task");
         let plan = two_worker_plan("cleanup work", Topology::ManagerWorker);
         let agent = Arc::new(TeamAgent::new(
             vec![
@@ -6224,7 +6157,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_fact_fails_the_single_worker_task_cleanly() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("duplicate fact", 4);
+        let task = store.seed_task("duplicate fact");
         let intent = store.seed_intent(task.id, task.origin_fact_id, "the only intent");
         let first = store
             .record_fact_for_intent(
@@ -6272,7 +6205,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_fact_in_a_planned_intent_fails_the_task_cleanly() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("duplicate planned fact", 4);
+        let task = store.seed_task("duplicate planned fact");
         let plan = two_worker_plan("team work", Topology::ManagerWorker);
         let intent = store.seed_intent(task.id, task.origin_fact_id, "team work");
         store.save_intent_plan(intent.id, &plan).await.unwrap();
@@ -6325,7 +6258,7 @@ mod tests {
     #[tokio::test]
     async fn heartbeat_wakes_idle_engine() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("wait then finish", 2);
+        let task = store.seed_task("wait then finish");
         let goal = seed_goal(&store, &task).await;
         let heartbeat = Duration::from_millis(50);
         let engine = Engine::new(

@@ -99,7 +99,7 @@ export function CapacityCard(props: {
             </div>
           </div>
           <Badge variant="outline" className="font-normal">
-            DHI+
+            DHI<sup>+</sup>
           </Badge>
         </div>
       </CardHeader>

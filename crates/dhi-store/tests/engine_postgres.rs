@@ -15,7 +15,7 @@ use uuid::Uuid;
 #[sqlx::test]
 async fn engine_runs_task_against_postgres(pool: PgPool) {
     let store = Arc::new(Store::new(pool));
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
 
     let engine = Engine::new(store.clone(), Arc::new(MockAgentRuntime));
     let result = engine.run_task(task.id).await.unwrap();

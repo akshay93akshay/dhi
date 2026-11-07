@@ -10,7 +10,6 @@ import styles from "./dhi-brand-status.module.css";
 export type BrandActivity =
   | "idle"
   | "focus-goal"
-  | "focus-bound"
   | "focus-planner"
   | "focus-worker"
   | "focus-submit"
@@ -45,8 +44,6 @@ function activityGaze(activity: BrandActivity): Gaze {
   switch (activity) {
     case "focus-goal":
       return { x: 0, y: 4 };
-    case "focus-bound":
-      return { x: 3.5, y: 2 };
     case "focus-planner":
       return { x: -4.5, y: 0 };
     case "focus-worker":
@@ -80,7 +77,7 @@ export function DhiBrandStatus({
   const lastPointerRef = useRef(0);
   const winkTimerRef = useRef<number | null>(null);
   const effectiveActivity: BrandActivity = localWink ? "wink" : activity;
-  const label = `DHI — Dynamic Heuristic Intelligence. ${serviceStatusText(state)}.`;
+  const label = `DHI Plus — Dynamic Heuristic Intelligence Plus. ${serviceStatusText(state)}.`;
 
   // Clear a pending click-wink timer if the logo unmounts mid-gesture.
   useEffect(
@@ -453,8 +450,19 @@ function DhiMark({
           <text className={styles.wordmark} x="410" y="187">
             I
           </text>
+          <text
+            className={styles.wordmark}
+            x="452"
+            y="125"
+            style={{ fontSize: 48, letterSpacing: 0 }}
+          >
+            +
+          </text>
           <text className={styles.tagline} x="350" y="237" textAnchor="middle">
             DYNAMIC HEURISTIC INTELLIGENCE
+            <tspan className={styles.taglinePlus} dy="-6">
+              +
+            </tspan>
           </text>
         </>
       ) : null}

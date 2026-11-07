@@ -325,7 +325,6 @@ impl IntoResponse for ApiError {
 #[derive(Debug, Deserialize)]
 struct CreateTaskRequest {
     goal: String,
-    bound: i32,
     #[serde(alias = "pinned_planner_profile_id")]
     planner_profile_id: Option<i64>,
     #[serde(alias = "pinned_worker_profile_id")]
@@ -483,9 +482,6 @@ async fn create_task(
     if body.goal.trim().is_empty() {
         return Err(ApiError::bad_request("goal must not be empty"));
     }
-    if body.bound < 0 {
-        return Err(ApiError::bad_request("bound must not be negative"));
-    }
     let capacity = body.capacity.map(validate_create_capacity).transpose()?;
     // Pin validation needs the management tables; a pin-less create stays
     // available wherever the core store is wired.
@@ -497,12 +493,7 @@ async fn create_task(
 
     let mut task = state
         .store
-        .create_task_with_pins(
-            body.goal,
-            body.bound,
-            body.planner_profile_id,
-            body.worker_profile_id,
-        )
+        .create_task_with_pins(body.goal, body.planner_profile_id, body.worker_profile_id)
         .await
         .map_err(ApiError::internal)?;
 
@@ -2548,7 +2539,7 @@ mod tests {
     #[tokio::test]
     async fn guarded_tool_sink_mirrors_outcomes_to_activity() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("sink activity", 1);
+        let task = store.seed_task("sink activity");
         let policy = Policy {
             version: "sink-activity-v1".to_string(),
             default: GuardVerdict::Deny,
@@ -2639,7 +2630,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_sweeps_expired_approvals() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("deploy without a reviewer", 3);
+        let task = store.seed_task("deploy without a reviewer");
         let intent = store.seed_intent(task.id, task.origin_fact_id, "ship it");
 
         // Park the intent and open an approval that already ran out.
@@ -2735,8 +2726,8 @@ mod tests {
     #[tokio::test]
     async fn supervisor_skips_terminal_tasks() {
         let store = Arc::new(MemoryStore::new());
-        let live = store.seed_task("live", 2);
-        let done = store.seed_task("already done", 2);
+        let live = store.seed_task("live");
+        let done = store.seed_task("already done");
         GraphStore::set_task_state_guarded(store.as_ref(), done.id, TaskState::Done)
             .await
             .unwrap();
@@ -2752,7 +2743,7 @@ mod tests {
     #[tokio::test]
     async fn supervisor_leaves_decided_approvals_alone() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("decided in time", 3);
+        let task = store.seed_task("decided in time");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
             .unwrap();
@@ -2897,8 +2888,8 @@ mod tests {
     #[tokio::test]
     async fn recover_denies_pending_approvals() {
         let store = Arc::new(MemoryStore::new());
-        let first_task = store.seed_task("wait for review", 3);
-        let second_task = store.seed_task("wait for another review", 3);
+        let first_task = store.seed_task("wait for review");
+        let second_task = store.seed_task("wait for another review");
         let first = seed_pending_approval(&store, &first_task).await;
         let second = seed_pending_approval(&store, &second_task).await;
 
@@ -2938,7 +2929,7 @@ mod tests {
     #[tokio::test]
     async fn recover_completes_denied_tool_calls() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("deny the stale call", 3);
+        let task = store.seed_task("deny the stale call");
         let approval = seed_pending_approval(&store, &task).await;
         let before = GuardStore::get_tool_call(store.as_ref(), approval.tool_call_id)
             .await
@@ -2964,7 +2955,7 @@ mod tests {
     #[tokio::test]
     async fn recover_resets_running_intents() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("abandoned work", 4);
+        let task = store.seed_task("abandoned work");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
             .unwrap();
@@ -3002,8 +2993,8 @@ mod tests {
     #[tokio::test]
     async fn recover_restarts_nonterminal_tasks() {
         let store = Arc::new(MemoryStore::new());
-        let running = store.seed_task("resume running", 2);
-        let created = store.seed_task("resume created", 2);
+        let running = store.seed_task("resume running");
+        let created = store.seed_task("resume created");
         GraphStore::set_task_state_guarded(store.as_ref(), running.id, TaskState::Running)
             .await
             .unwrap();
@@ -3032,7 +3023,7 @@ mod tests {
     #[tokio::test]
     async fn recover_skips_terminal_tasks() {
         let store = Arc::new(MemoryStore::new());
-        let live = store.seed_task("still live", 2);
+        let live = store.seed_task("still live");
         GraphStore::set_task_state_guarded(store.as_ref(), live.id, TaskState::Running)
             .await
             .unwrap();
@@ -3043,7 +3034,7 @@ mod tests {
             ("already timed out", TaskState::Timeout),
             ("already cancelled", TaskState::Cancelled),
         ] {
-            let task = store.seed_task(goal, 2);
+            let task = store.seed_task(goal);
             GraphStore::set_task_state_guarded(store.as_ref(), task.id, state)
                 .await
                 .unwrap();
@@ -3078,7 +3069,7 @@ mod tests {
     #[tokio::test]
     async fn recover_skips_paused_tasks() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("paused on purpose", 2);
+        let task = store.seed_task("paused on purpose");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
             .unwrap();
@@ -3109,7 +3100,7 @@ mod tests {
     #[tokio::test]
     async fn recover_with_registry_registers_restarted_loops() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("resume with a live worker", 2);
+        let task = store.seed_task("resume with a live worker");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
             .unwrap();
@@ -3138,7 +3129,7 @@ mod tests {
     #[tokio::test]
     async fn reconciliation_fails_running_tasks_without_a_worker() {
         let store = Arc::new(MemoryStore::new());
-        let orphan = store.seed_task("running with no loop", 2);
+        let orphan = store.seed_task("running with no loop");
         GraphStore::set_task_state_guarded(store.as_ref(), orphan.id, TaskState::Running)
             .await
             .unwrap();
@@ -3188,7 +3179,7 @@ mod tests {
     #[tokio::test]
     async fn server_failure_helper_marks_a_dead_loop_failed() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("dead without a loop", 2);
+        let task = store.seed_task("dead without a loop");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
             .unwrap();
@@ -3344,22 +3335,12 @@ mod tests {
         (status, json)
     }
 
-    fn post_task(goal: &str, bound: i32) -> Request<Body> {
-        Request::builder()
-            .method("POST")
-            .uri("/api/tasks")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                json!({ "goal": goal, "bound": bound }).to_string(),
-            ))
-            .unwrap()
+    fn post_task(goal: &str) -> Request<Body> {
+        post_json("/api/tasks", json!({ "goal": goal }))
     }
 
-    fn post_task_with_capacity(goal: &str, bound: i32, capacity: Value) -> Request<Body> {
-        post_json(
-            "/api/tasks",
-            json!({ "goal": goal, "bound": bound, "capacity": capacity }),
-        )
+    fn post_task_with_capacity(goal: &str, capacity: Value) -> Request<Body> {
+        post_json("/api/tasks", json!({ "goal": goal, "capacity": capacity }))
     }
 
     fn post_goal(task_id: TaskId, description: &str) -> Request<Body> {
@@ -3389,7 +3370,7 @@ mod tests {
     }
 
     async fn create_one(app: Router, goal: &str) -> (StatusCode, Value) {
-        send(app, post_task(goal, 3)).await
+        send(app, post_task(goal)).await
     }
 
     // -----------------------------------------------------------------------
@@ -3399,7 +3380,7 @@ mod tests {
     /// A task with one goal, one recorded fact, and a little activity. Seeded
     /// directly so no background engine loop moves it while a test runs.
     async fn side_task(store: &MemoryStore) -> Task {
-        let task = store.seed_task("explain the finished task", 3);
+        let task = store.seed_task("explain the finished task");
         GraphStore::add_goal(store, task.id, "one goal".into())
             .await
             .unwrap();
@@ -3444,7 +3425,6 @@ mod tests {
         assert_eq!(snapshot["task"]["id"], json!(task.id));
         assert_eq!(snapshot["task"]["goal"], "explain the finished task");
         assert_eq!(snapshot["task"]["state"], "created");
-        assert_eq!(snapshot["task"]["bound"], 3);
         assert_eq!(snapshot["task"]["pins"]["planner_profile_id"], Value::Null);
         assert_eq!(snapshot["goals"].as_array().unwrap().len(), 1);
         assert_eq!(snapshot["goals"][0]["description"], "one goal");
@@ -3743,7 +3723,6 @@ mod tests {
         let (status, json) = create_one(app, "mate in two").await;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(json["goal"], "mate in two");
-        assert_eq!(json["bound"], 3);
         assert!(json["id"].is_string());
         assert!(json["state"].is_string());
         let id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
@@ -3753,7 +3732,7 @@ mod tests {
     #[tokio::test]
     async fn create_task_rejects_bad_input() {
         let app = router(test_state());
-        let (status, json) = send(app, post_task("  ", 1)).await;
+        let (status, json) = send(app, post_task("  ")).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(json["error"].is_string());
     }
@@ -3765,7 +3744,7 @@ mod tests {
 
         let (status, json) = send(
             app,
-            post_task_with_capacity("pause after one round", 3, json!({ "max_rounds": 1 })),
+            post_task_with_capacity("pause after one round", json!({ "max_rounds": 1 })),
         )
         .await;
 
@@ -3825,7 +3804,7 @@ mod tests {
         ] {
             let (status, json) = send(
                 app.clone(),
-                post_task_with_capacity("invalid capacity", 3, capacity),
+                post_task_with_capacity("invalid capacity", capacity),
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
@@ -3869,7 +3848,7 @@ mod tests {
     #[tokio::test]
     async fn stop_terminal_task_is_409() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("already done", 2);
+        let task = store.seed_task("already done");
         make_terminal(&store, &task, TaskState::Done).await;
         let app = router(test_state_with_store(store));
 
@@ -3885,7 +3864,7 @@ mod tests {
     #[tokio::test]
     async fn stop_orphan_cancels_immediately() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("orphan", 2);
+        let task = store.seed_task("orphan");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
             .unwrap();
@@ -3911,7 +3890,7 @@ mod tests {
     #[tokio::test]
     async fn stop_registered_task_sets_the_flag_without_waiting() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("live loop", 2);
+        let task = store.seed_task("live loop");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
             .unwrap();
@@ -3941,7 +3920,7 @@ mod tests {
     #[tokio::test]
     async fn hard_kill_monitor_aborts_and_marks_cancelled() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("ignores its stop flag", 2);
+        let task = store.seed_task("ignores its stop flag");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
             .unwrap();
@@ -3985,8 +3964,8 @@ mod tests {
     #[tokio::test]
     async fn bulk_stop_reports_stopping_and_blocked_independently() {
         let store = Arc::new(MemoryStore::new());
-        let active = store.seed_task("stop me", 2);
-        let terminal = store.seed_task("already done", 2);
+        let active = store.seed_task("stop me");
+        let terminal = store.seed_task("already done");
         let missing = Uuid::new_v4();
         GraphStore::set_task_state_guarded(store.as_ref(), active.id, TaskState::Running)
             .await
@@ -4045,7 +4024,7 @@ mod tests {
     #[tokio::test]
     async fn delete_active_task_is_409_with_the_frozen_message() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("still running", 2);
+        let task = store.seed_task("still running");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
             .unwrap();
@@ -4061,7 +4040,7 @@ mod tests {
     #[tokio::test]
     async fn delete_refuses_a_terminal_task_while_its_loop_is_registered() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("terminal but registered", 2);
+        let task = store.seed_task("terminal but registered");
         make_terminal(&store, &task, TaskState::Done).await;
         let registry = Arc::new(TaskRunRegistry::new());
         let mut state = test_state_with_store(store.clone());
@@ -4090,7 +4069,7 @@ mod tests {
     #[tokio::test]
     async fn add_goal_reopens_a_done_task_and_respawns_the_engine() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("reopen me", 3);
+        let task = store.seed_task("reopen me");
         make_terminal(&store, &task, TaskState::Done).await;
         let app = router(test_state_with_store(store.clone()));
 
@@ -4139,7 +4118,7 @@ mod tests {
     #[tokio::test]
     async fn add_goal_rejects_a_non_terminal_task_with_its_state() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("still live", 3);
+        let task = store.seed_task("still live");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
             .unwrap();
@@ -4166,7 +4145,7 @@ mod tests {
     #[tokio::test]
     async fn add_goal_validates_the_description() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("validate goals", 3);
+        let task = store.seed_task("validate goals");
         make_terminal(&store, &task, TaskState::Done).await;
         let app = router(test_state_with_store(store.clone()));
 
@@ -4213,8 +4192,8 @@ mod tests {
     #[tokio::test]
     async fn add_goal_mutates_only_the_target_task() {
         let store = Arc::new(MemoryStore::new());
-        let target = store.seed_task("reopen only me", 3);
-        let other = store.seed_task("leave me alone", 3);
+        let target = store.seed_task("reopen only me");
+        let other = store.seed_task("leave me alone");
         make_terminal(&store, &target, TaskState::Failed).await;
         make_terminal(&store, &other, TaskState::Done).await;
         let other_before = store.get_task(other.id).await.unwrap().unwrap();
@@ -4247,7 +4226,7 @@ mod tests {
     #[tokio::test]
     async fn resume_paused_task_is_a_single_winner() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("resume race", 2);
+        let task = store.seed_task("resume race");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Paused)
             .await
             .unwrap();
@@ -4269,7 +4248,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_extension_merges_omitted_fields() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("extend my capacity", 3);
+        let task = store.seed_task("extend my capacity");
         GraphStore::set_task_capacity(
             store.as_ref(),
             task.id,
@@ -4309,7 +4288,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_extension_resumes_a_paused_task() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("resume me", 3);
+        let task = store.seed_task("resume me");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
             .unwrap();
@@ -4339,7 +4318,7 @@ mod tests {
     #[tokio::test]
     async fn capacity_extension_rejects_non_positive_values() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("validate capacity", 3);
+        let task = store.seed_task("validate capacity");
         let app = router(test_state_with_store(store.clone()));
 
         for body in [
@@ -4394,7 +4373,7 @@ mod tests {
             TaskState::Cancelled,
         ] {
             let store = Arc::new(MemoryStore::new());
-            let task = store.seed_task("terminal capacity", 3);
+            let task = store.seed_task("terminal capacity");
             make_terminal(&store, &task, state).await;
             let app = router(test_state_with_store(store.clone()));
 
@@ -4415,7 +4394,7 @@ mod tests {
     #[tokio::test]
     async fn list_tasks_returns_created_task() {
         let store = Arc::new(MemoryStore::new());
-        let created = store.seed_task("seeded", 2);
+        let created = store.seed_task("seeded");
         let app = router(test_state_with_store(store));
         let (status, json) = send(app, get_uri("/api/tasks?limit=100")).await;
         assert_eq!(status, StatusCode::OK);
@@ -4427,7 +4406,7 @@ mod tests {
     #[tokio::test]
     async fn get_task_returns_task() {
         let store = Arc::new(MemoryStore::new());
-        let created = store.seed_task("find the fork", 4);
+        let created = store.seed_task("find the fork");
         let app = router(test_state_with_store(store));
         let (status, json) = send(app, get_uri(&format!("/api/tasks/{}", created.id))).await;
         assert_eq!(status, StatusCode::OK);
@@ -4438,7 +4417,7 @@ mod tests {
     #[tokio::test]
     async fn get_task_work_returns_collections() {
         let store = Arc::new(MemoryStore::new());
-        let created = store.seed_task("clip the king", 3);
+        let created = store.seed_task("clip the king");
         let store_trait: Arc<dyn GraphStore> = store.clone();
         let goal = GraphStore::add_goal(store_trait.as_ref(), created.id, "reach mate".into())
             .await
@@ -4464,7 +4443,7 @@ mod tests {
     #[tokio::test]
     async fn get_task_activity_returns_activity() {
         let store = Arc::new(MemoryStore::new());
-        let created = store.seed_task("watch the back rank", 2);
+        let created = store.seed_task("watch the back rank");
         let store_trait: Arc<dyn GraphStore> = store.clone();
         GraphStore::append_activity(
             store_trait.as_ref(),
@@ -4488,7 +4467,7 @@ mod tests {
     #[tokio::test]
     async fn get_task_swarm_messages_orders_by_id() {
         let store = Arc::new(MemoryStore::new());
-        let created = store.seed_task("split the swarm", 4);
+        let created = store.seed_task("split the swarm");
         let intent = store.seed_intent(created.id, created.origin_fact_id, "run the swarm");
         let store_trait: Arc<dyn GraphStore> = store.clone();
         for index in 0..3 {
@@ -4532,7 +4511,7 @@ mod tests {
     #[tokio::test]
     async fn get_task_swarm_messages_empty_task_returns_empty_list() {
         let store = Arc::new(MemoryStore::new());
-        let created = store.seed_task("no swarm yet", 2);
+        let created = store.seed_task("no swarm yet");
 
         let app = router(test_state_with_store(store));
         let (status, json) = send(
@@ -4547,7 +4526,7 @@ mod tests {
     #[tokio::test]
     async fn get_task_swarm_messages_clamps_limit() {
         let store = Arc::new(MemoryStore::new());
-        let created = store.seed_task("many messages", 2);
+        let created = store.seed_task("many messages");
         let intent = store.seed_intent(created.id, created.origin_fact_id, "run the swarm");
         let store_trait: Arc<dyn GraphStore> = store.clone();
         for index in 0..1_005 {
@@ -4620,8 +4599,8 @@ mod tests {
     #[tokio::test]
     async fn list_pending_approvals_returns_rows() {
         let store = Arc::new(MemoryStore::new());
-        let pending = store.seed_task("wait for review", 3);
-        let decided = store.seed_task("already reviewed", 3);
+        let pending = store.seed_task("wait for review");
+        let decided = store.seed_task("already reviewed");
         let kept = seed_pending_approval(&store, &pending).await;
         let closed = seed_pending_approval(&store, &decided).await;
         GuardStore::decide_approval(store.as_ref(), closed.id, ApprovalDecision::Deny)
@@ -4644,7 +4623,7 @@ mod tests {
     #[tokio::test]
     async fn list_approvals_missing_tool_call_returns_null_detail() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("missing tool call row", 3);
+        let task = store.seed_task("missing tool call row");
         let approval = GuardStore::create_approval(
             store.as_ref(),
             task.id,
@@ -4671,7 +4650,7 @@ mod tests {
     #[tokio::test]
     async fn approval_decision_allow_returns_granted_and_running_task() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("let the tool run", 3);
+        let task = store.seed_task("let the tool run");
         let approval = seed_pending_approval(&store, &task).await;
 
         let app = router(guarded_state(store.clone()));
@@ -4721,7 +4700,7 @@ mod tests {
     #[tokio::test]
     async fn second_decision_returns_409() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("decide once", 3);
+        let task = store.seed_task("decide once");
         let approval = seed_pending_approval(&store, &task).await;
         let app = router(guarded_state(store.clone()));
 
@@ -4776,7 +4755,7 @@ mod tests {
     #[tokio::test]
     async fn approval_decision_not_pending_returns_409() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("already handled", 3);
+        let task = store.seed_task("already handled");
         let approval = seed_pending_approval(&store, &task).await;
         GuardStore::decide_approval(store.as_ref(), approval.id, ApprovalDecision::Deny)
             .await
@@ -4803,7 +4782,7 @@ mod tests {
     #[tokio::test]
     async fn approval_decision_expired_race_returns_409() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("expired before decision", 3);
+        let task = store.seed_task("expired before decision");
         let intent = store.seed_intent(task.id, task.origin_fact_id, "await a decision");
         GraphStore::set_task_state_guarded(store.as_ref(), task.id, TaskState::Running)
             .await
@@ -4872,7 +4851,7 @@ mod tests {
     #[tokio::test]
     async fn task_usage_returns_runs() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("count the calls", 2);
+        let task = store.seed_task("count the calls");
         let mut run = dhi_core::AgentRun {
             id: Uuid::new_v4(),
             run_id: Uuid::new_v4(),
@@ -4947,7 +4926,7 @@ mod tests {
     #[tokio::test]
     async fn stream_returns_event_stream_content_type() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("stream it", 2);
+        let task = store.seed_task("stream it");
         let app = router(test_state_with_store(store));
         let response = app.oneshot(get(&stream_uri(task.id, None))).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -4982,7 +4961,7 @@ mod tests {
     #[tokio::test]
     async fn stream_sends_initial_hello() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("say hello", 2);
+        let task = store.seed_task("say hello");
         let app = router(test_state_with_store(store));
         let response = app.oneshot(get(&stream_uri(task.id, None))).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -5004,7 +4983,7 @@ mod tests {
     #[tokio::test]
     async fn stream_sends_every_new_activity_row_per_poll() {
         let store = Arc::new(MemoryStore::new());
-        let task = store.seed_task("burst of activity", 2);
+        let task = store.seed_task("burst of activity");
         let store_trait: Arc<dyn GraphStore> = store.clone();
         let skipped = GraphStore::append_activity(
             store_trait.as_ref(),

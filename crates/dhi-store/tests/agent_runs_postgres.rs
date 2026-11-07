@@ -25,7 +25,7 @@ fn run_row(task_id: Uuid, run_id: Uuid, call_index: u32) -> AgentRun {
         profile: "open_ai/deepseek-v4.1/max_tokens=4096/stream=true".to_string(),
         prompt: "system\n\nuser".to_string(),
         prompt_hash: "planner@0af7c1e9b2d3".to_string(),
-        variables: serde_json::json!({"goal": "forced mate", "bound": 4}),
+        variables: serde_json::json!({"goal": "forced mate"}),
         response: Some("NO PLAN: nothing to add".to_string()),
         thinking: Some("the origin fact already covers the first goal".to_string()),
         tokens_in: 100,
@@ -46,7 +46,7 @@ fn run_row(task_id: Uuid, run_id: Uuid, call_index: u32) -> AgentRun {
 #[sqlx::test]
 async fn agent_run_round_trips_every_new_column(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
     let run_id = Uuid::new_v4();
     let row = run_row(task.id, run_id, 0);
 
@@ -88,7 +88,7 @@ async fn agent_run_round_trips_every_new_column(pool: PgPool) {
 #[sqlx::test]
 async fn agent_run_round_trips_worker_key(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("team task", 4).await.unwrap();
+    let task = store.create_task("team task").await.unwrap();
     let mut row = run_row(task.id, Uuid::new_v4(), 0);
     row.worker_key = Some("alpha".to_string());
 
@@ -104,7 +104,7 @@ async fn agent_run_round_trips_worker_key(pool: PgPool) {
 #[sqlx::test]
 async fn blank_thinking_is_stored_as_null(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
     let mut row = run_row(task.id, Uuid::new_v4(), 0);
     row.thinking = Some("   ".to_string());
 
@@ -116,7 +116,7 @@ async fn blank_thinking_is_stored_as_null(pool: PgPool) {
 #[sqlx::test]
 async fn agent_run_reopens_as_running_then_finishes(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
     let run_id = Uuid::new_v4();
 
     let mut row = run_row(task.id, run_id, 0);
@@ -149,7 +149,7 @@ async fn agent_run_reopens_as_running_then_finishes(pool: PgPool) {
 #[sqlx::test]
 async fn agent_run_status_check_rejects_unknown_status(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
     let mut row = run_row(task.id, Uuid::new_v4(), 0);
     row.status = "bogus".to_string();
 
@@ -179,7 +179,7 @@ async fn agent_run_status_check_rejects_unknown_status(pool: PgPool) {
 #[sqlx::test]
 async fn checkpoint_pointer_nulls_instead_of_cascading(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
     let run_id = Uuid::new_v4();
     let mut row = run_row(task.id, run_id, 0);
     store.save_agent_run(&row).await.unwrap();
@@ -218,7 +218,7 @@ async fn agent_run_requires_an_existing_task(pool: PgPool) {
 async fn terminal_task_still_has_its_run_rows(pool: PgPool) {
     // The record is written before the task finishes and survives it.
     let store = Store::new(pool);
-    let task = store.create_task("forced mate", 4).await.unwrap();
+    let task = store.create_task("forced mate").await.unwrap();
     store
         .save_agent_run(&run_row(task.id, Uuid::new_v4(), 0))
         .await

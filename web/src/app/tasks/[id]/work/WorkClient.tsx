@@ -452,7 +452,7 @@ function TaskWorkView() {
 
 /**
  * One fact: claim, state badge, and its provenance rendered according to the
- * detected convention (origin `{goal,bound}` vs worker
+ * detected convention (origin `{goal}` vs worker
  * `{intent_id,detail,evidence,confidence}` vs raw JSON).
  */
 function FactLine(props: { fact: Fact; proofOf?: string }) {

@@ -81,6 +81,11 @@
   letter-spacing: 2.1px;
 }
 
+.taglinePlus {
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
 /* Status bar: separate from the logo, pinned in the sidebar footer. */
 .statusBar {
   display: flex;

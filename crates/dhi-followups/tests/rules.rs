@@ -8,7 +8,7 @@ use serde_json::json;
 use uuid::Uuid;
 
 fn task() -> Task {
-    Task::new("block test", 2)
+    Task::new("block test")
 }
 
 #[test]

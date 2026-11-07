@@ -9,19 +9,18 @@ use dhi_core::{AgentRole, AgentRun, Intent, RunId, Task, TaskId};
 use crate::MemoryStore;
 
 /// Seed a task and its single origin fact.
-pub fn seeded_task(goal: impl Into<String>, bound: i32) -> (MemoryStore, Task) {
+pub fn seeded_task(goal: impl Into<String>) -> (MemoryStore, Task) {
     let store = MemoryStore::new();
-    let task = store.seed_task(goal, bound);
+    let task = store.seed_task(goal);
     (store, task)
 }
 
 /// Seed a task plus one open intent that points at the task's origin fact.
 pub fn seeded_intent(
     goal: impl Into<String>,
-    bound: i32,
     description: impl Into<String>,
 ) -> (MemoryStore, Task, Intent) {
-    let (store, task) = seeded_task(goal, bound);
+    let (store, task) = seeded_task(goal);
     let intent = store.seed_intent(task.id, task.origin_fact_id, description);
     (store, task, intent)
 }
@@ -67,7 +66,7 @@ mod tests {
 
     #[test]
     fn seeded_task_has_one_origin_fact() {
-        let (store, task) = seeded_task("forced mate", 4);
+        let (store, task) = seeded_task("forced mate");
 
         let facts = store.facts(task.id);
         assert_eq!(facts.len(), 1);
@@ -77,7 +76,7 @@ mod tests {
 
     #[test]
     fn seeded_intent_is_open_and_points_at_origin() {
-        let (store, task, intent) = seeded_intent("forced mate", 4, "find the mate");
+        let (store, task, intent) = seeded_intent("forced mate", "find the mate");
 
         assert_eq!(intent.task_id, task.id);
         assert_eq!(intent.fact_id, task.origin_fact_id);

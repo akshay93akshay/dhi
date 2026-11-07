@@ -29,7 +29,7 @@ async fn reopen_moves_each_terminal_state_to_running(pool: PgPool) {
     .enumerate()
     {
         let task = store
-            .create_task(&format!("terminal {index}"), 4)
+            .create_task(&format!("terminal {index}"))
             .await
             .unwrap();
         GraphStore::set_task_state_guarded(&store, task.id, TaskState::Running)
@@ -95,7 +95,7 @@ async fn reopen_moves_each_terminal_state_to_running(pool: PgPool) {
 #[sqlx::test]
 async fn reopen_running_task_is_not_terminal_and_writes_nothing(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("still running", 3).await.unwrap();
+    let task = store.create_task("still running").await.unwrap();
     GraphStore::set_task_state_guarded(&store, task.id, TaskState::Running)
         .await
         .unwrap();
@@ -142,7 +142,7 @@ async fn reopen_unknown_task_is_not_found(pool: PgPool) {
 #[sqlx::test]
 async fn reopen_twice_after_done_again(pool: PgPool) {
     let store = Store::new(pool);
-    let task = store.create_task("reopen twice", 4).await.unwrap();
+    let task = store.create_task("reopen twice").await.unwrap();
     GraphStore::set_task_state_guarded(&store, task.id, TaskState::Running)
         .await
         .unwrap();
@@ -212,7 +212,7 @@ async fn memory_store_reopen_matches_the_postgres_contract() {
         TaskState::Timeout,
         TaskState::Cancelled,
     ] {
-        let task = store.seed_task(format!("memory {terminal}"), 2);
+        let task = store.seed_task(format!("memory {terminal}"));
         GraphStore::set_task_state_guarded(&store, task.id, TaskState::Running)
             .await
             .unwrap();
@@ -254,7 +254,7 @@ async fn memory_store_reopen_matches_the_postgres_contract() {
         );
     }
 
-    let running = store.seed_task("memory running", 2);
+    let running = store.seed_task("memory running");
     GraphStore::set_task_state_guarded(&store, running.id, TaskState::Running)
         .await
         .unwrap();

@@ -107,7 +107,6 @@ pub fn build_snapshot(task: &Task, goals: &[Goal], facts: &[Fact], activity: &[A
             "id": task.id,
             "goal": task.goal,
             "state": task.state.as_str(),
-            "bound": task.bound,
             "pins": {
                 "planner_profile_id": task.pinned_planner_profile_id,
                 "worker_profile_id": task.pinned_worker_profile_id,

@@ -15,10 +15,7 @@ async fn live_river_planner_smoke() {
         .expect("ops/prompts must be discoverable");
     let runtime = RigAgentRuntime::from_env(prompts).expect("River configuration must load");
 
-    let task = Task::new(
-        "Find the shortest forced mate from the starting position.",
-        4,
-    );
+    let task = Task::new("Find the shortest forced mate from the starting position.");
     let origin = task.origin_fact();
     let goal = Goal {
         id: uuid::Uuid::new_v4(),
@@ -33,7 +30,6 @@ async fn live_river_planner_smoke() {
         .plan(PlanInput {
             task_id: task.id,
             goal: task.goal.clone(),
-            bound: 4,
             goals: vec![goal],
             facts: vec![origin],
             open_intents: 0,

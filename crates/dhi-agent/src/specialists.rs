@@ -50,7 +50,7 @@ pub const DEFAULT_SPECIALIST_MAX_TURNS: usize = 6;
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Delegation limits, resolved from the environment.
+/// Delegation limits used by every manager run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DelegationLimits {
     /// How many delegations one manager (worker) run may make.
@@ -64,26 +64,6 @@ impl Default for DelegationLimits {
         Self {
             max_delegations: DEFAULT_MAX_DELEGATIONS,
             manager_max_turns: DEFAULT_MANAGER_MAX_TURNS,
-        }
-    }
-}
-
-impl DelegationLimits {
-    /// `DHI_MAX_DELEGATIONS` (default 8) and `DHI_MANAGER_MAX_TURNS`
-    /// (default 12). An invalid value keeps the default and warns.
-    pub fn from_env() -> Self {
-        let parse = |key: &str, default: usize| -> usize {
-            match std::env::var(key) {
-                Ok(raw) => raw.trim().parse().unwrap_or_else(|_| {
-                    warn!("invalid {key}={raw}; using default {default}");
-                    default
-                }),
-                Err(_) => default,
-            }
-        };
-        Self {
-            max_delegations: parse("DHI_MAX_DELEGATIONS", DEFAULT_MAX_DELEGATIONS),
-            manager_max_turns: parse("DHI_MANAGER_MAX_TURNS", DEFAULT_MANAGER_MAX_TURNS),
         }
     }
 }

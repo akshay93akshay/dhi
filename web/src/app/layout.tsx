@@ -9,10 +9,11 @@ import {
 
 export const metadata: Metadata = {
   title: {
-    default: "DHI — Dynamic Heuristic Intelligence",
-    template: "%s · DHI",
+    default: "DHI⁺ — Dynamic Heuristic Intelligence⁺",
+    template: "%s · DHI⁺",
   },
-  description: "Dynamic Heuristic Intelligence — task, tool, and agent control room.",
+  description:
+    "Dynamic Heuristic Intelligence⁺ — task, tool, and agent control room.",
   icons: { icon: "/brand/dhi-mark-512.png" },
 };
 
