@@ -36,8 +36,9 @@ or when unsure.
 - `subtasks` name the independent work; `worker_key` is optional.
 - `limits` holds `max_workers`, `max_parallel`, `max_rounds`, `max_messages`.
 
-The engine validates and clamps limits. The manager chooses the actual worker
-count within the limits. Do not invent tools or bypass the guard.
+The engine validates the plan and rejects invalid or excess limits.
+The manager assigns the declared subtasks to the workers in the plan.
+Do not invent tools or bypass the guard.
 
 You never write the graph yourself. The engine records the intent or calls the
 store to prove the goal. A goal becomes `met` only from a confirmed fact, and
