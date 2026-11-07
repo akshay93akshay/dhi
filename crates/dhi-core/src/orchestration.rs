@@ -134,6 +134,19 @@ impl IntentPlan {
                     key: worker.key.clone(),
                 });
             }
+            // The manager is the runtime selector, not a worker. A plan that
+            // declares a `manager` worker makes the selector choose itself and
+            // adds a fourth result for a three-worker intent. Reject it
+            // instead of silently running a wider team than the goal asked
+            // for.
+            if self.topology == Topology::ManagerWorker
+                && (worker.key.eq_ignore_ascii_case("manager")
+                    || worker.role.eq_ignore_ascii_case("manager"))
+            {
+                return Err(OrchestrationError::ManagerIsNotAWorker {
+                    worker_key: worker.key.clone(),
+                });
+            }
         }
 
         for subtask in &self.subtasks {
@@ -172,6 +185,11 @@ pub enum OrchestrationError {
     },
     #[error("worker key {key:?} is declared more than once")]
     DuplicateWorkerKey { key: String },
+    #[error(
+        "manager_worker worker {worker_key:?} uses the reserved manager role; \
+         the manager is the runtime selector, not a worker"
+    )]
+    ManagerIsNotAWorker { worker_key: String },
     #[error("subtask {subtask_id:?} names unknown worker {worker_key:?}")]
     UnknownWorker {
         subtask_id: String,
@@ -231,6 +249,25 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Topology::ManagerWorker).unwrap(),
             "\"manager_worker\""
+        );
+    }
+
+    #[test]
+    fn manager_worker_rejects_a_manager_worker() {
+        let mut manager = worker("manager");
+        manager.role = "manager".to_owned();
+        let plan = IntentPlan {
+            intent: "ship it".to_owned(),
+            topology: Topology::ManagerWorker,
+            workers: vec![worker("alpha"), manager],
+            subtasks: vec![subtask("s0", Some("alpha"))],
+            limits: CapabilityLimits::default(),
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(OrchestrationError::ManagerIsNotAWorker {
+                worker_key: "manager".to_owned(),
+            })
         );
     }
 

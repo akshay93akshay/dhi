@@ -666,6 +666,62 @@ async fn swarm_findings_flow_and_stop_after_two_quiet_rounds() {
 }
 
 #[tokio::test]
+async fn swarm_reactions_are_audit_only_and_never_enter_the_fact() {
+    let handler: Handler = Arc::new(|worker, subtask, _context| {
+        Box::pin(async move {
+            if subtask.id.contains(":r") {
+                return Ok(WorkerResult::ok(
+                    worker.key.clone(),
+                    subtask.id.clone(),
+                    "off-topic reaction: the sky is green".to_string(),
+                    "reaction evidence".to_string(),
+                ));
+            }
+            Ok(ok_from(&worker, &subtask))
+        })
+    });
+    let executor = Arc::new(FakeExecutor::new(handler));
+    let plan = plan(
+        Topology::Swarm,
+        vec![worker("a", 3), worker("b", 3), worker("c", 3)],
+        vec![
+            subtask("seed-0", None),
+            subtask("seed-1", None),
+            subtask("seed-2", None),
+        ],
+        limits(3, 3, 2, 64),
+    );
+
+    let runner = SwarmRunner::new(executor);
+    let result = runner.run(&plan).await.unwrap();
+
+    assert_eq!(
+        result.worker_results.len(),
+        3,
+        "only the three seed turns are aggregated"
+    );
+    for worker in ["a", "b", "c"] {
+        assert!(
+            result.fact.summary.contains(&format!("- {worker} [seed-")),
+            "seed finding for {worker}: {}",
+            result.fact.summary
+        );
+    }
+    assert!(
+        !result.fact.summary.contains("the sky is green"),
+        "a reaction can never replace a worker's assigned finding: {}",
+        result.fact.summary
+    );
+    assert!(
+        runner.messages().iter().any(|message| matches!(
+            message,
+            SwarmMessage::Finding { summary, .. } if summary.contains("the sky is green")
+        )),
+        "reaction findings remain visible in the swarm audit log"
+    );
+}
+
+#[tokio::test]
 async fn swarm_seed_context_omits_the_broad_intent() {
     let executor = Arc::new(FakeExecutor::new(always_ok_handler()));
     let plan = plan(

@@ -604,9 +604,11 @@ pub fn apply_manager_choice(
 pub fn manager_selection_prompt(plan: &dhi_core::IntentPlan) -> (String, String) {
     let system = format!(
         "You are the DHI manager. Choose only from the allowed_workers in the input; \
-         never invent a worker. Return JSON only, with this schema: \
+         never invent a worker. You are the selector, not a worker: do not add \
+         yourself to the selection. Return JSON only, with this schema: \
          {{\"worker_keys\":[\"...\"],\"assignments\":[{{\"subtask_id\":\"...\",\"worker_key\":\"...\"}}]}}. \
          Select at most {} worker(s) (the plan's max_workers). \
+         When every allowed worker has a subtask, select every allowed worker. \
          Assign every subtask exactly once, to a selected worker.",
         plan.limits.max_workers
     );
@@ -737,6 +739,23 @@ impl RigConfig {
 struct ToolSetup {
     context: Option<ToolContext>,
     registry: Option<ToolServerHandle>,
+}
+
+/// A private copy of one guarded registry for a single completion attempt.
+///
+/// Rig's builder merges its `dynamic_tool` registrations into the handle it is
+/// given. The per-attempt tools (`record_fact`, delegation tools with a fresh
+/// budget) must not mutate the shared registry: two concurrent workers would
+/// otherwise replace each other's tool of the same name, and a fact could be
+/// recorded into the wrong worker's sink. Cloned registrations share the
+/// original handler, so guarded tools still dispatch to the host's one sink.
+fn private_tool_server(shared: &ToolServerHandle) -> ToolServerHandle {
+    let toolset = shared.toolset();
+    let mut server = ToolServer::new();
+    for (_, tool) in toolset.iter() {
+        server = server.registered_tool(tool.clone());
+    }
+    server.run()
 }
 
 pub struct RigAgentRuntime {
@@ -1063,11 +1082,19 @@ impl RigAgentRuntime {
             ),
         }
         .preamble(call.system.clone());
-        // The shared guarded registry: every registration the host makes is
-        // live for this attempt, alongside the per-attempt native tools. A
-        // side question passes `None`, so the answerer has NO tools at all.
+        // The guarded registry: every host registration is live for this
+        // attempt, alongside the per-attempt native tools. A side question
+        // passes `None`, so the answerer has NO tools at all.
+        //
+        // Rig merges the builder's per-attempt tools into the handle passed
+        // here. Passing the shared registry directly would therefore install
+        // each worker's `record_fact` (and delegation budget) into the same
+        // global map, and concurrent workers would overwrite each other. Copy
+        // the guarded registrations into a private registry first; cloned
+        // registrations share their handler, so the guard/audit sink is still
+        // the one host-owned instance.
         if let Some(server) = tool_server {
-            builder = builder.tool_server_handle(server);
+            builder = builder.tool_server_handle(private_tool_server(&server));
         }
         for tool in tools {
             builder = builder.dynamic_tool(tool);
@@ -1426,7 +1453,10 @@ impl PlannerSink {
                                             "type": "string",
                                             "description": "Unique worker key referenced by subtasks."
                                         },
-                                        "role": {"type": "string"},
+                                        "role": {
+                                            "type": "string",
+                                            "description": "The task worker's role. For manager_worker, never use `manager`: the runtime manager is the selector, not a worker."
+                                        },
                                         "prompt": {"type": "string"},
                                         "max_turns": {
                                             "type": "integer",
@@ -3005,6 +3035,31 @@ mod tests {
                 "{other} must not trigger the record_fact retry"
             );
         }
+    }
+
+    #[test]
+    fn private_tool_servers_isolate_per_attempt_registrations() {
+        let shared = ToolServer::new().run();
+        let first = private_tool_server(&shared);
+        let second = private_tool_server(&shared);
+
+        let sink = WorkerSink::default();
+        for tool in sink.tools().expect("worker tools build") {
+            first.add_dynamic_tool(tool);
+        }
+
+        assert!(
+            first.toolset().get("record_fact").is_some(),
+            "the attempt registry owns its record_fact"
+        );
+        assert!(
+            second.toolset().get("record_fact").is_none(),
+            "a concurrent attempt must not see another attempt's record_fact"
+        );
+        assert!(
+            shared.toolset().get("record_fact").is_none(),
+            "per-attempt tools never mutate the shared guarded registry"
+        );
     }
 
     #[tokio::test]

@@ -109,9 +109,12 @@ impl<E> SwarmRunner<E> {
 impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
     /// Validate the plan, seed the swarm, and synthesize one intent result.
     ///
-    /// One worker failure becomes a failed [`WorkerResult`] plus a peer
-    /// challenge; the remaining workers keep contributing. No fact is written
-    /// here.
+    /// Only the seed turn of each worker contributes to the aggregated fact.
+    /// Reaction turns are peer-to-peer audit traffic: they are broadcast and
+    /// persisted, but a worker's reply to a peer's finding can never replace
+    /// or add to its own assigned result. One worker failure becomes a failed
+    /// [`WorkerResult`] and the remaining workers keep contributing. No fact
+    /// is written here.
     pub async fn run(&self, plan: &IntentPlan) -> anyhow::Result<IntentResult> {
         plan.validate()?;
 
@@ -412,6 +415,7 @@ async fn run_worker<E: WorkerExecutor + 'static>(
             &peers,
             1,
             ctx.limits.max_messages,
+            true,
         )
         .await;
         turns += 1;
@@ -477,6 +481,7 @@ async fn run_worker<E: WorkerExecutor + 'static>(
                                         &peers,
                                         round,
                                         ctx.limits.max_messages,
+                                        false,
                                     )
                                     .await;
                                     turns += 1;
@@ -531,6 +536,7 @@ async fn execute<E: WorkerExecutor>(
     peers: &[mpsc::UnboundedSender<SwarmMessage>],
     round: u64,
     max_messages: usize,
+    aggregate: bool,
 ) -> WorkerResult {
     let _permit = permits
         .acquire()
@@ -547,7 +553,15 @@ async fn execute<E: WorkerExecutor>(
             WorkerResult::failed(worker.key.clone(), subtask.id.clone(), error.to_string())
         }
     };
-    record_result(board, messages, peers, &result, round, max_messages);
+    record_result(
+        board,
+        messages,
+        peers,
+        &result,
+        round,
+        max_messages,
+        aggregate,
+    );
     result
 }
 
@@ -558,10 +572,16 @@ fn record_result(
     result: &WorkerResult,
     round: u64,
     max_messages: usize,
+    aggregate: bool,
 ) {
     {
         let mut state = board_lock(board);
-        state.results.push(result.clone());
+        // A reaction is peer traffic, not the worker's assigned result. Only
+        // the seed turn enters the board that the deterministic aggregator
+        // reads, so a peer's topic can never overwrite a worker's finding.
+        if aggregate {
+            state.results.push(result.clone());
+        }
         if result.status == WorkerStatus::Ok {
             state.findings += 1;
             state.last_finding_round = state.last_finding_round.max(round);
@@ -583,21 +603,11 @@ fn record_result(
                 max_messages,
             );
         }
-        WorkerStatus::Failed => {
-            broadcast(
-                board,
-                messages,
-                peers,
-                SwarmMessage::Challenge {
-                    from: result.worker_key.clone(),
-                    text: result
-                        .error
-                        .clone()
-                        .unwrap_or_else(|| "worker failed without an error".to_owned()),
-                },
-                max_messages,
-            );
-        }
+        // A failed turn is visible in the aggregated evidence, but its error
+        // text is not a finding: broadcasting it as a peer challenge asked
+        // unrelated workers to answer "the worker must call record_fact" and
+        // pulled them off their own subtasks.
+        WorkerStatus::Failed => {}
         // A skipped result is recorded but nothing is announced: the worker
         // declined this turn and remains available for later peer messages.
         WorkerStatus::Skipped => {}

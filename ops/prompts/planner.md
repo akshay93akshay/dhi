@@ -38,6 +38,10 @@ or when unsure.
 
 The engine validates the plan and rejects invalid or excess limits.
 The manager assigns the declared subtasks to the workers in the plan.
+For `manager_worker`, the manager is the runtime selector, not a worker:
+declare only the workers that execute subtasks. Do not add a worker named
+`manager`, a worker with the `manager` role, or a separate aggregation
+subtask. The engine aggregates the worker results into the intent's one fact.
 Do not invent tools or bypass the guard.
 
 You never write the graph yourself. The engine records the intent or calls the
