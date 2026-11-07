@@ -23,7 +23,9 @@ use dhi_core::{
     IntentPlan, IntentState, Task, TaskState, ToolCallOutcome, ToolCallRequest, Topology,
 };
 use dhi_guard::ToolExecutor;
-use dhi_orchestrator::{IntentResult, ManagerRunner, SwarmMessage, SwarmRunner, WorkerStatus};
+use dhi_orchestrator::{
+    IntentResult, ManagerRunner, SwarmMessage, SwarmRunner, TeamSelector, WorkerStatus,
+};
 use tokio::sync::Notify;
 use tracing::warn;
 use uuid::Uuid;
@@ -214,6 +216,9 @@ pub struct Engine {
     max_idle_ticks: usize,
     /// Consecutive spent rounds allowed without a new confirmed fact.
     max_no_progress_rounds: usize,
+    /// Optional manager choice. `None` keeps `ManagerRunner::new` and the
+    /// planner's plan unchanged, so the default path is untouched.
+    manager_selector: Option<Arc<dyn TeamSelector>>,
     /// In-memory cache of DHI+ plans keyed by the intent the planner created.
     ///
     /// Every planned intent also has a durable `intent_plans` row. The cache is
@@ -242,6 +247,7 @@ impl Engine {
             max_rounds: 16,
             max_idle_ticks: DEFAULT_MAX_IDLE_TICKS,
             max_no_progress_rounds: DEFAULT_MAX_NO_PROGRESS_ROUNDS,
+            manager_selector: None,
             plans: Mutex::new(HashMap::new()),
         }
     }
@@ -289,7 +295,14 @@ impl Engine {
             worker_profile_id: task.pinned_worker_profile_id,
         });
         match plan.topology {
-            Topology::ManagerWorker => ManagerRunner::new(executor).run(plan).await,
+            Topology::ManagerWorker => match self.manager_selector.as_ref() {
+                Some(selector) => {
+                    ManagerRunner::with_selector(executor, Arc::clone(selector))
+                        .run(plan)
+                        .await
+                }
+                None => ManagerRunner::new(executor).run(plan).await,
+            },
             Topology::Swarm => {
                 let runner = SwarmRunner::new(executor);
                 let result = runner.run(plan).await;
@@ -375,6 +388,20 @@ impl Engine {
     ) -> Self {
         self.executor = Some(executor);
         self.guard_store = Some(guard_store);
+        self
+    }
+
+    /// Lets a manager selector choose the actual workers and subtasks of
+    /// every manager/worker plan. The planner's plan still validates first and
+    /// the selected plan is re-validated against the planner's limits.
+    ///
+    /// This is a local selection seam; it adds no model API. A manager plan
+    /// without a selector keeps the default `ManagerRunner::new` path.
+    pub fn with_manager_selector<S>(mut self, selector: S) -> Self
+    where
+        S: TeamSelector + 'static,
+    {
+        self.manager_selector = Some(Arc::new(selector));
         self
     }
 
@@ -1467,7 +1494,7 @@ mod tests {
     };
     use dhi_guard::Policy;
     use dhi_guard::executor::{GuardedExecutor, ToolBackend, ToolExecutor};
-    use dhi_orchestrator::{CapabilityLimits, Subtask, WorkerSpec};
+    use dhi_orchestrator::{CapabilityLimits, Subtask, TeamSelector, WorkerSpec};
     use dhi_testkit::MemoryStore;
     use serde_json::json;
     use std::sync::Mutex;
@@ -4161,6 +4188,56 @@ mod tests {
     }
 
     // ---------- DHI+ plan execution ----------
+
+    struct AlphaOnlySelector;
+
+    #[async_trait::async_trait]
+    impl TeamSelector for AlphaOnlySelector {
+        async fn select(&self, plan: &IntentPlan) -> anyhow::Result<IntentPlan> {
+            let mut selected = plan.clone();
+            selected.workers.retain(|worker| worker.key == "alpha");
+            for subtask in &mut selected.subtasks {
+                subtask.worker_key = Some("alpha".to_owned());
+            }
+            Ok(selected)
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_honors_an_optional_manager_selector() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("team selector", 4);
+        let goal = seed_goal(&store, &task).await;
+        let plan = two_worker_plan("team selector", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("team selector", plan, goal.id),
+            vec![
+                ("subtask one", TeamWorker::Success("finding one")),
+                ("subtask two", TeamWorker::Success("finding two")),
+            ],
+        ));
+        let engine =
+            Engine::new(store.clone(), agent.clone()).with_manager_selector(AlphaOnlySelector);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        let calls = agent.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls.iter().all(|call| call
+                .context
+                .iter()
+                .any(|line| line == "worker role: alpha (researcher)")),
+            "both subtasks ran through the selected worker"
+        );
+        let team_run = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "team_run")
+            .expect("team_run activity");
+        assert_eq!(team_run.payload["worker_keys"], json!(["alpha", "alpha"]));
+    }
 
     #[tokio::test]
     async fn manager_worker_plan_records_exactly_one_fact() {

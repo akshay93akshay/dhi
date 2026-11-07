@@ -4,31 +4,49 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::aggregate::sorted_results;
 use crate::{
-    Aggregator, DeterministicAggregator, IntentPlan, IntentResult, Subtask, WorkerExecutor,
-    WorkerResult, WorkerSpec,
+    Aggregator, DeterministicAggregator, IntentPlan, IntentResult, Subtask, TeamSelector, Topology,
+    WorkerExecutor, WorkerResult, WorkerSpec,
 };
+
+/// Keeps the planner's plan unchanged: the default runner behavior.
+#[derive(Debug, Default, Clone, Copy)]
+struct KeepPlannerSelection;
+
+#[async_trait]
+impl TeamSelector for KeepPlannerSelection {
+    async fn select(&self, plan: &IntentPlan) -> anyhow::Result<IntentPlan> {
+        Ok(plan.clone())
+    }
+}
 
 /// Executes a manager/worker [`IntentPlan`].
 ///
 /// The assignment is fixed before any worker runs: a subtask with a
 /// `worker_key` goes to that worker, otherwise it is assigned round-robin by
 /// subtask index. The executor is the only place a guard or audit hook belongs.
+///
+/// A [`TeamSelector`] may choose the actual workers and subtasks first. The
+/// default keeps the planner's plan unchanged; use [`Self::with_selector`] to
+/// honor a manager choice.
 pub struct ManagerRunner<E> {
     executor: Arc<E>,
     aggregator: Arc<dyn Aggregator>,
+    selector: Arc<dyn TeamSelector>,
 }
 
 impl<E> ManagerRunner<E> {
-    /// A runner with the deterministic aggregator.
+    /// A runner with the deterministic aggregator and the planner's plan.
     pub fn new(executor: Arc<E>) -> Self {
         Self {
             executor,
             aggregator: Arc::new(DeterministicAggregator),
+            selector: Arc::new(KeepPlannerSelection),
         }
     }
 
@@ -37,6 +55,24 @@ impl<E> ManagerRunner<E> {
         Self {
             executor,
             aggregator,
+            selector: Arc::new(KeepPlannerSelection),
+        }
+    }
+
+    /// A runner that lets `selector` choose the actual workers and subtasks.
+    ///
+    /// The selector runs after the planner's plan validates and before any
+    /// assignment or worker call. Its output is re-validated against the
+    /// planner's limits; an invalid selection fails the run without calling
+    /// the executor.
+    pub fn with_selector<S>(executor: Arc<E>, selector: S) -> Self
+    where
+        S: TeamSelector + 'static,
+    {
+        Self {
+            executor,
+            aggregator: Arc::new(DeterministicAggregator),
+            selector: Arc::new(selector),
         }
     }
 }
@@ -48,6 +84,13 @@ impl<E: WorkerExecutor + 'static> ManagerRunner<E> {
     /// or discards the other results. No fact is written here.
     pub async fn run(&self, plan: &IntentPlan) -> anyhow::Result<IntentResult> {
         plan.validate()?;
+
+        let mut selected = self.selector.select(plan).await?;
+        // Limits belong to the planner. A selector may choose workers and
+        // subtasks, but it cannot widen the budget the manager executes under.
+        selected.limits = plan.limits;
+        validate_selection(&selected)?;
+        let plan = &selected;
 
         let assignments = assignments(plan);
         let context = vec![format!("intent: {}", plan.intent)];
@@ -122,6 +165,23 @@ impl<E: WorkerExecutor + 'static> ManagerRunner<E> {
             worker_results: results,
         })
     }
+}
+
+/// Reject a manager selection the runner cannot execute safely.
+///
+/// The planner's limits were restored before this check, so
+/// [`IntentPlan::validate`] enforces the planner's `max_workers`, not a limit
+/// the selector supplied. The topology check is explicit because the generic
+/// plan validator would also accept `single` and `swarm` plans.
+fn validate_selection(plan: &IntentPlan) -> anyhow::Result<()> {
+    if plan.topology != Topology::ManagerWorker {
+        anyhow::bail!(
+            "manager selector must keep the manager_worker topology, got {}",
+            plan.topology
+        );
+    }
+    plan.validate()?;
+    Ok(())
 }
 
 /// Fixed assignment: explicit keys first, otherwise round-robin by subtask

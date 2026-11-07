@@ -15,6 +15,12 @@
 //! [`dhi_agent::FactDraft`] and never write a fact. The caller persists the
 //! draft.
 //!
+//! A manager plan may pass through a [`TeamSelector`] before assignment. The
+//! planner declares the allowed worker pool and limits; the selector chooses
+//! the actual workers and subtasks inside them. [`ManagerRunner::new`] keeps
+//! the planner's plan unchanged, [`ManagerRunner::with_selector`] opts into a
+//! choice, and [`BoundedSelector`] is the deterministic testable selector.
+//!
 //! Aggregation goes through the small [`Aggregator`] trait. The default
 //! [`DeterministicAggregator`] orders results by worker and subtask key, not
 //! completion order; an LLM aggregator can replace it with
@@ -22,17 +28,20 @@
 //!
 //! Plan validation is typed by [`OrchestrationError`] and covers topology
 //! worker counts, non-empty subtasks, unique worker keys, known assigned
-//! workers, and non-zero limits.
+//! workers, and non-zero limits. The runner re-validates the selected plan
+//! against the planner's limits before any worker runs.
 
 mod aggregate;
 mod executor;
 mod manager;
+mod selector;
 mod swarm;
 mod types;
 
 pub use aggregate::{Aggregation, Aggregator, DeterministicAggregator};
 pub use executor::WorkerExecutor;
 pub use manager::ManagerRunner;
+pub use selector::{BoundedSelector, ManagerPrompt, TeamSelector};
 pub use swarm::{SwarmMessage, SwarmRunner, SwarmStats};
 pub use types::{
     CapabilityLimits, IntentPlan, IntentResult, OrchestrationError, Subtask, Topology,

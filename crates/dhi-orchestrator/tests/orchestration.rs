@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use dhi_orchestrator::{
-    Aggregator, CapabilityLimits, DeterministicAggregator, IntentPlan, ManagerRunner,
-    OrchestrationError, Subtask, SwarmMessage, SwarmRunner, Topology, WorkerExecutor, WorkerResult,
-    WorkerSpec, WorkerStatus,
+    Aggregator, BoundedSelector, CapabilityLimits, DeterministicAggregator, IntentPlan,
+    ManagerPrompt, ManagerRunner, OrchestrationError, Subtask, SwarmMessage, SwarmRunner,
+    TeamSelector, Topology, WorkerExecutor, WorkerResult, WorkerSpec, WorkerStatus,
 };
 use tokio::sync::{Barrier, watch};
 
@@ -287,6 +287,300 @@ async fn manager_assigns_unkeyed_subtasks_round_robin() {
         .collect::<Vec<_>>();
     called.sort();
     assert_eq!(called, assigned);
+}
+
+#[tokio::test]
+async fn bounded_selector_reduces_the_worker_pool() {
+    let plan = plan(
+        Topology::ManagerWorker,
+        vec![worker("a", 2), worker("b", 2), worker("c", 2)],
+        vec![subtask("s0", Some("a")), subtask("s1", Some("b"))],
+        limits(4, 3, 4, 16),
+    );
+
+    let selected = BoundedSelector::new().select(&plan).await.unwrap();
+
+    assert_eq!(
+        selected
+            .workers
+            .iter()
+            .map(|worker| worker.key.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(selected.subtasks, plan.subtasks);
+    assert_eq!(selected.topology, Topology::ManagerWorker);
+    assert_eq!(selected.limits, plan.limits, "limits stay the planner's");
+}
+
+#[tokio::test]
+async fn bounded_selector_caps_the_worker_pool_at_max_workers() {
+    let plan = plan(
+        Topology::ManagerWorker,
+        vec![
+            worker("a", 2),
+            worker("b", 2),
+            worker("c", 2),
+            worker("d", 2),
+        ],
+        vec![
+            subtask("s0", None),
+            subtask("s1", None),
+            subtask("s2", None),
+            subtask("s3", None),
+            subtask("s4", None),
+        ],
+        limits(2, 4, 4, 32),
+    );
+
+    let selected = BoundedSelector::new().select(&plan).await.unwrap();
+
+    assert_eq!(selected.workers.len(), 2);
+    assert_eq!(
+        selected
+            .workers
+            .iter()
+            .map(|worker| worker.key.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    assert_eq!(
+        selected
+            .subtasks
+            .iter()
+            .map(|subtask| subtask.worker_key.as_deref().unwrap())
+            .collect::<Vec<_>>(),
+        ["a", "b", "a", "b", "a"]
+    );
+}
+
+#[tokio::test]
+async fn bounded_selector_preserves_subtask_order() {
+    let plan = plan(
+        Topology::ManagerWorker,
+        vec![worker("a", 2), worker("b", 2), worker("c", 2)],
+        vec![
+            subtask("first", Some("c")),
+            subtask("second", None),
+            subtask("third", Some("a")),
+        ],
+        limits(2, 3, 4, 16),
+    );
+
+    let selected = BoundedSelector::new().select(&plan).await.unwrap();
+
+    assert_eq!(
+        selected
+            .subtasks
+            .iter()
+            .map(|subtask| subtask.id.as_str())
+            .collect::<Vec<_>>(),
+        ["first", "second", "third"]
+    );
+    for subtask in &selected.subtasks {
+        assert!(
+            selected
+                .workers
+                .iter()
+                .any(|worker| Some(worker.key.as_str()) == subtask.worker_key.as_deref()),
+            "subtask {} names an unselected worker",
+            subtask.id
+        );
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BadSelection {
+    ExtraWorker,
+    NoSubtasks,
+    DuplicateWorker,
+    UnknownWorker,
+    WrongTopology,
+}
+
+struct BadSelector(BadSelection);
+
+#[async_trait]
+impl TeamSelector for BadSelector {
+    async fn select(&self, plan: &IntentPlan) -> anyhow::Result<IntentPlan> {
+        let mut selected = plan.clone();
+        match self.0 {
+            BadSelection::ExtraWorker => selected.workers.push(worker("extra", 1)),
+            BadSelection::NoSubtasks => selected.subtasks.clear(),
+            BadSelection::DuplicateWorker => {
+                let duplicate = selected.workers[0].clone();
+                selected.workers.push(duplicate);
+            }
+            BadSelection::UnknownWorker => {
+                selected.subtasks[0].worker_key = Some("ghost".to_owned());
+            }
+            BadSelection::WrongTopology => selected.topology = Topology::Swarm,
+        }
+        Ok(selected)
+    }
+}
+
+#[tokio::test]
+async fn manager_rejects_invalid_selector_output_before_running() {
+    let plan = plan(
+        Topology::ManagerWorker,
+        vec![worker("a", 2), worker("b", 2)],
+        vec![subtask("s0", Some("a")), subtask("s1", Some("b"))],
+        limits(2, 2, 4, 16),
+    );
+
+    for mode in [
+        BadSelection::ExtraWorker,
+        BadSelection::NoSubtasks,
+        BadSelection::DuplicateWorker,
+        BadSelection::UnknownWorker,
+        BadSelection::WrongTopology,
+    ] {
+        let executor = Arc::new(FakeExecutor::new(always_ok_handler()));
+        let error = ManagerRunner::with_selector(Arc::clone(&executor), BadSelector(mode))
+            .run(&plan)
+            .await
+            .unwrap_err();
+        assert!(
+            !error.to_string().is_empty(),
+            "{mode:?} must produce a visible reason"
+        );
+        assert!(
+            executor.calls().is_empty(),
+            "{mode:?} was rejected before any worker ran"
+        );
+    }
+}
+
+struct OnlyAlpha;
+
+#[async_trait]
+impl TeamSelector for OnlyAlpha {
+    async fn select(&self, plan: &IntentPlan) -> anyhow::Result<IntentPlan> {
+        let mut selected = plan.clone();
+        selected.workers.retain(|worker| worker.key == "alpha");
+        for subtask in &mut selected.subtasks {
+            subtask.worker_key = Some("alpha".to_owned());
+        }
+        Ok(selected)
+    }
+}
+
+#[tokio::test]
+async fn manager_runs_the_selection_before_assigning_work() {
+    let executor = Arc::new(FakeExecutor::new(always_ok_handler()));
+    let plan = plan(
+        Topology::ManagerWorker,
+        vec![worker("alpha", 2), worker("beta", 2)],
+        vec![subtask("s0", Some("alpha")), subtask("s1", Some("beta"))],
+        limits(2, 2, 4, 16),
+    );
+
+    let result = ManagerRunner::with_selector(Arc::clone(&executor), OnlyAlpha)
+        .run(&plan)
+        .await
+        .unwrap();
+
+    assert_eq!(result.worker_results.len(), 2);
+    assert!(
+        result
+            .worker_results
+            .iter()
+            .all(|result| result.worker_key == "alpha")
+    );
+    let calls = executor.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls.iter().all(|call| call.worker_key == "alpha"),
+        "the manager never ran the dropped worker"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call.subtask_id.as_str())
+            .collect::<Vec<_>>(),
+        ["s0", "s1"]
+    );
+}
+
+#[tokio::test]
+async fn manager_accepts_a_shared_selector_object() {
+    let selector: Arc<dyn TeamSelector> = Arc::new(BoundedSelector::new());
+    let executor = Arc::new(FakeExecutor::new(always_ok_handler()));
+    let plan = plan(
+        Topology::ManagerWorker,
+        vec![worker("a", 2), worker("b", 2), worker("c", 2)],
+        vec![subtask("s0", Some("a")), subtask("s1", Some("b"))],
+        limits(3, 3, 4, 16),
+    );
+
+    let result = ManagerRunner::with_selector(executor, Arc::clone(&selector))
+        .run(&plan)
+        .await
+        .unwrap();
+
+    assert_eq!(result.worker_results.len(), 2);
+    assert!(
+        result
+            .worker_results
+            .iter()
+            .all(|result| result.worker_key == "a" || result.worker_key == "b")
+    );
+}
+
+#[tokio::test]
+async fn manager_honors_bounded_selector_end_to_end() {
+    let executor = Arc::new(FakeExecutor::new(always_ok_handler()));
+    let plan = plan(
+        Topology::ManagerWorker,
+        vec![
+            worker("a", 2),
+            worker("b", 2),
+            worker("c", 2),
+            worker("d", 2),
+        ],
+        vec![subtask("s0", Some("a")), subtask("s1", Some("b"))],
+        limits(4, 4, 4, 32),
+    );
+
+    let result = ManagerRunner::with_selector(Arc::clone(&executor), BoundedSelector::new())
+        .run(&plan)
+        .await
+        .unwrap();
+
+    assert_eq!(result.worker_results.len(), 2);
+    let calls = executor.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.worker_key == "a" || call.worker_key == "b"),
+        "the reduced pool is the only pool that runs"
+    );
+    let mut subtasks = calls
+        .iter()
+        .map(|call| call.subtask_id.as_str())
+        .collect::<Vec<_>>();
+    subtasks.sort();
+    assert_eq!(subtasks, ["s0", "s1"]);
+}
+
+#[test]
+fn manager_prompt_exposes_the_selector_input() {
+    let plan = plan(
+        Topology::ManagerWorker,
+        vec![worker("a", 2), worker("b", 2)],
+        vec![subtask("s0", Some("a"))],
+        limits(4, 2, 4, 16),
+    );
+
+    let prompt = ManagerPrompt::new(&plan);
+
+    assert_eq!(prompt.intent, plan.intent);
+    assert_eq!(prompt.allowed_workers, plan.workers);
+    assert_eq!(prompt.subtasks, plan.subtasks);
+    assert_eq!(prompt.limits, plan.limits);
+    assert_eq!(prompt.remaining_capacity, 2);
 }
 
 #[tokio::test]
