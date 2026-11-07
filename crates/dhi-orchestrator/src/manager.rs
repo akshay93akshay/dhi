@@ -93,7 +93,10 @@ impl<E: WorkerExecutor + 'static> ManagerRunner<E> {
         let plan = &selected;
 
         let assignments = assignments(plan);
-        let context = vec![format!("intent: {}", plan.intent)];
+        // The assigned subtask is the worker's primary instruction through the
+        // executor. The broad plan intent names every worker's topic and must
+        // not leak into a worker turn.
+        let context: Vec<String> = Vec::new();
         let permits = Arc::new(Semaphore::new(plan.limits.max_parallel));
         let mut tasks = JoinSet::new();
         let mut identities = HashMap::with_capacity(assignments.len());

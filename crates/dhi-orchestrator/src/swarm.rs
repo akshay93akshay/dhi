@@ -18,7 +18,7 @@ use crate::{
     WorkerStatus,
 };
 
-/// Largest retained context entries, including the intent line.
+/// Largest retained context entries.
 const MAX_CONTEXT_ENTRIES: usize = 32;
 
 /// A message peers exchange inside a swarm.
@@ -160,7 +160,6 @@ impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
             let worker_messages = Arc::clone(&messages);
             let worker_rounds = round_rx.clone();
             let worker_stop = stop_rx.clone();
-            let intent = plan.intent.clone();
             let limits = plan.limits;
             let identity = (worker.key.clone(), seed.id.clone());
 
@@ -173,7 +172,6 @@ impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
                     rounds: worker_rounds,
                     stop: worker_stop,
                     reports: worker_reports,
-                    intent,
                     limits,
                 },
                 worker,
@@ -378,7 +376,6 @@ struct WorkerContext<E> {
     rounds: watch::Receiver<u64>,
     stop: watch::Receiver<bool>,
     reports: mpsc::UnboundedSender<WorkerReport>,
-    intent: String,
     limits: CapabilityLimits,
 }
 
@@ -389,7 +386,7 @@ async fn run_worker<E: WorkerExecutor + 'static>(
     mut inbox: mpsc::UnboundedReceiver<SwarmMessage>,
     peers: Vec<mpsc::UnboundedSender<SwarmMessage>>,
 ) {
-    let mut context = vec![format!("intent: {}", ctx.intent)];
+    let mut context: Vec<String> = Vec::new();
     let mut turns = 0usize;
     let mut last_round = 1u64;
     let mut done = false;

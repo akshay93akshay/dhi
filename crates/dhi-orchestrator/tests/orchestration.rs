@@ -183,6 +183,37 @@ async fn manager_runs_three_workers_with_bounded_parallelism() {
 }
 
 #[tokio::test]
+async fn manager_worker_context_is_empty() {
+    let executor = Arc::new(FakeExecutor::new(always_ok_handler()));
+    let plan = plan(
+        Topology::ManagerWorker,
+        vec![worker("alpha", 2), worker("beta", 2)],
+        vec![subtask("s0", Some("alpha")), subtask("s1", Some("beta"))],
+        limits(2, 2, 4, 16),
+    );
+
+    ManagerRunner::new(Arc::clone(&executor))
+        .run(&plan)
+        .await
+        .unwrap();
+
+    let calls = executor.calls();
+    assert_eq!(calls.len(), 2);
+    for call in calls {
+        assert!(
+            call.context.is_empty(),
+            "manager worker {} received runner context {:?}",
+            call.worker_key,
+            call.context
+        );
+        assert!(
+            !call.context.iter().any(|line| line.contains(&plan.intent)),
+            "the broad plan intent must not reach a manager worker"
+        );
+    }
+}
+
+#[tokio::test]
 async fn manager_keeps_other_results_when_one_worker_fails() {
     let handler: Handler = Arc::new(|worker, subtask, _context| {
         Box::pin(async move {
@@ -632,6 +663,41 @@ async fn swarm_findings_flow_and_stop_after_two_quiet_rounds() {
     assert!(result.fact.summary.contains("- a [seed-0]"));
     assert!(result.fact.summary.contains("- b [seed-1]"));
     assert!(result.fact.summary.contains("- c [seed-2]"));
+}
+
+#[tokio::test]
+async fn swarm_seed_context_omits_the_broad_intent() {
+    let executor = Arc::new(FakeExecutor::new(always_ok_handler()));
+    let plan = plan(
+        Topology::Swarm,
+        vec![worker("a", 1), worker("b", 1), worker("c", 1)],
+        vec![
+            subtask("seed-0", None),
+            subtask("seed-1", None),
+            subtask("seed-2", None),
+        ],
+        limits(3, 3, 4, 32),
+    );
+
+    SwarmRunner::new(Arc::clone(&executor))
+        .run(&plan)
+        .await
+        .unwrap();
+
+    let calls = executor.calls();
+    assert_eq!(calls.len(), 3);
+    for call in calls {
+        assert!(
+            call.context.is_empty(),
+            "swarm worker {} received runner context {:?}",
+            call.worker_key,
+            call.context
+        );
+        assert!(
+            !call.context.iter().any(|line| line.contains(&plan.intent)),
+            "the broad plan intent must not reach a swarm seed"
+        );
+    }
 }
 
 #[tokio::test]

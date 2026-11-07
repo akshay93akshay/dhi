@@ -17,8 +17,9 @@ pub(crate) struct RuntimeWorkerExecutor {
     pub agent: Arc<dyn AgentRuntime>,
     pub task_id: Uuid,
     pub intent_id: Uuid,
-    /// Confirmed facts at claim time. The runner adds its own per-turn context
-    /// (intent line, peer messages) on top.
+    /// Confirmed facts at claim time. Swarm runners add per-turn context
+    /// (peer messages, own results) on top; the assigned subtask travels in
+    /// the worker intent instead.
     pub context: Vec<String>,
     pub worker_profile_id: Option<i64>,
 }
