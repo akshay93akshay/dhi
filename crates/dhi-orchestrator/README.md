@@ -9,7 +9,8 @@ The orchestration foundation for DHI+ intents. This crate turns one
   and capability limits that make up an `IntentPlan`.
 - **Runner**: this crate. `ManagerRunner` executes a manager/worker plan;
   `SwarmRunner` executes a peer-to-peer swarm plan. Both validate the plan
-  first and return every worker result, even when one worker fails.
+  first and return every seed result, even when one worker fails. The swarm
+  also returns reaction turns separately in `audit_results`.
 - **WorkerExecutor**: the execution seam. A runner calls only this trait.
   Guard checks, auditing, tool routing, and model calls belong in the
   implementation, not in the runners.

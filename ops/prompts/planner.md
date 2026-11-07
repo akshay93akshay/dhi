@@ -42,6 +42,9 @@ For `manager_worker`, the manager is the runtime selector, not a worker:
 declare only the workers that execute subtasks. Do not add a worker named
 `manager`, a worker with the `manager` role, or a separate aggregation
 subtask. The engine aggregates the worker results into the intent's one fact.
+For `swarm`, declare one subtask per worker; the runner seeds one turn per
+worker and peers react afterwards. Give each worker at least four `max_turns`
+so it can use a tool, call `record_fact`, and answer.
 Do not invent tools or bypass the guard.
 
 You never write the graph yourself. The engine records the intent or calls the

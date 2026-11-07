@@ -73,9 +73,9 @@ pub struct PlanInput {
 pub enum PlanOutcome {
     AddIntent {
         description: String,
-        /// Optional DHI+ execution plan. `None` keeps the current
-        /// single-worker behavior. The engine records it but does not execute
-        /// it yet.
+        /// Optional DHI+ execution plan. `None` keeps the single-worker
+        /// behavior. The engine validates it, persists it, and executes it
+        /// through the manager/worker or swarm runner.
         #[serde(default)]
         plan: Option<dhi_core::IntentPlan>,
     },
