@@ -1225,6 +1225,36 @@ impl Engine {
                         .await;
                 }
 
+                // DHI+ workers never execute post-hoc tool calls themselves.
+                // Every request from every worker passes the same guard as the
+                // single-worker path: an `Ask` blocks inside the call, a
+                // denial is audited and does not run, and the aggregate still
+                // records its fact. An executor error fails the task before
+                // the team fact exists.
+                for worker in &result.worker_results {
+                    if worker.tool_calls.is_empty() {
+                        continue;
+                    }
+                    if let Err(err) = self
+                        .run_tool_calls_for_worker(
+                            task_id,
+                            claimed.id,
+                            Some(worker.worker_key.as_str()),
+                            &worker.tool_calls,
+                        )
+                        .await
+                    {
+                        let reason = format!("worker/engine: {err}");
+                        self.store
+                            .finish_intent(claimed.id, IntentState::Stopped)
+                            .await?;
+                        self.forget_plan(claimed.id);
+                        self.fail_task(task_id, &mut task, reason.clone(), "worker")
+                            .await?;
+                        anyhow::bail!("{reason}");
+                    }
+                }
+
                 let successes = result
                     .worker_results
                     .iter()
@@ -1480,6 +1510,23 @@ impl Engine {
         intent_id: Uuid,
         requests: &[ToolCallRequest],
     ) -> anyhow::Result<()> {
+        self.run_tool_calls_for_worker(task_id, intent_id, None, requests)
+            .await
+    }
+
+    /// The one guarded path for tool calls, with the DHI+ subworker stamped
+    /// on the engine's activity rows when there is one.
+    ///
+    /// The guard itself is intent-scoped: `ToolExecutor::execute` only takes
+    /// a task and an intent, so the worker key enriches the audit context and
+    /// never changes the verdict or the backend call.
+    async fn run_tool_calls_for_worker(
+        &self,
+        task_id: Uuid,
+        intent_id: Uuid,
+        worker_key: Option<&str>,
+        requests: &[ToolCallRequest],
+    ) -> anyhow::Result<()> {
         let executor = self.executor.as_ref().ok_or_else(|| {
             anyhow::anyhow!("intent {intent_id} requested tool calls but no executor is configured")
         })?;
@@ -1491,33 +1538,43 @@ impl Engine {
                 .await?
             {
                 ToolCallOutcome::Allowed { output } => {
-                    self.log_activity(
-                        task_id,
-                        "tool_allowed",
-                        format!("tool {tool} executed"),
-                        serde_json::json!({
-                            "intent_id": intent_id,
-                            "tool": tool,
-                            "output": output,
-                        }),
-                    )
-                    .await?;
+                    let message = match worker_key {
+                        Some(worker_key) => {
+                            format!("worker {worker_key} tool {tool} executed")
+                        }
+                        None => format!("tool {tool} executed"),
+                    };
+                    let mut payload = serde_json::json!({
+                        "intent_id": intent_id,
+                        "tool": tool,
+                        "output": output,
+                    });
+                    if let Some(worker_key) = worker_key {
+                        payload["worker_key"] = serde_json::json!(worker_key);
+                    }
+                    self.log_activity(task_id, "tool_allowed", message, payload)
+                        .await?;
                 }
                 ToolCallOutcome::Denied { reason } => {
                     // The worker continues in the same task loop. The denial
                     // is recorded, but the intent is not blocked and the task
                     // does not stop.
-                    self.log_activity(
-                        task_id,
-                        "tool_denied",
-                        format!("tool {tool} denied: {reason}"),
-                        serde_json::json!({
-                            "intent_id": intent_id,
-                            "tool": tool,
-                            "reason": reason,
-                        }),
-                    )
-                    .await?;
+                    let message = match worker_key {
+                        Some(worker_key) => {
+                            format!("worker {worker_key} tool {tool} denied: {reason}")
+                        }
+                        None => format!("tool {tool} denied: {reason}"),
+                    };
+                    let mut payload = serde_json::json!({
+                        "intent_id": intent_id,
+                        "tool": tool,
+                        "reason": reason,
+                    });
+                    if let Some(worker_key) = worker_key {
+                        payload["worker_key"] = serde_json::json!(worker_key);
+                    }
+                    self.log_activity(task_id, "tool_denied", message, payload)
+                        .await?;
                 }
                 ToolCallOutcome::Pending { approval_id } => {
                     return Err(anyhow::anyhow!(
@@ -1669,6 +1726,8 @@ mod tests {
         Success(&'static str),
         /// Success that also reports one completion call, like a real runtime.
         Recorded(&'static str),
+        /// Success that returns post-hoc tool calls for the engine to guard.
+        Calls(&'static str, Vec<ToolCallRequest>),
         Failure(&'static str),
     }
 
@@ -1735,6 +1794,9 @@ mod tests {
                         response: summary.to_string(),
                         thinking: Some("team worker reasoning".to_string()),
                     })
+                }
+                TeamWorker::Calls(summary, tool_calls) => {
+                    Ok(unrecorded(execute_output(summary, tool_calls)))
                 }
                 TeamWorker::Failure(error) => Err(anyhow::anyhow!(error)),
             }
@@ -1827,6 +1889,21 @@ mod tests {
         ) -> anyhow::Result<serde_json::Value> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(json!({"tool": tool, "input": input, "result": self.output}))
+        }
+    }
+
+    /// A backend that fails after the guard allowed the call, so the engine
+    /// sees the executor's error path.
+    struct FailingBackend;
+
+    #[async_trait::async_trait]
+    impl ToolBackend for FailingBackend {
+        async fn execute(
+            &self,
+            _tool: &str,
+            _input: &serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            anyhow::bail!("backend exploded")
         }
     }
 
@@ -4580,6 +4657,204 @@ mod tests {
             workers.iter().all(|run| run.intent_id == Some(intent_id)),
             "every subworker row names the team intent"
         );
+    }
+
+    #[tokio::test]
+    async fn team_worker_tool_calls_run_once_through_the_guard() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("team tool call", 4);
+        let goal = seed_goal(&store, &task).await;
+        let plan = two_worker_plan("team tool call", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("team tool call", plan, goal.id),
+            vec![
+                (
+                    "subtask one",
+                    TeamWorker::Calls(
+                        "the tool ran",
+                        vec![request("createGame", json!({"color": "white"}))],
+                    ),
+                ),
+                ("subtask two", TeamWorker::Success("plain finding")),
+            ],
+        ));
+        let backend = Arc::new(FakeBackend::new(json!({"game_id": "g-1"})));
+        let engine = guarded_engine(
+            &store,
+            agent,
+            verdict_policy("createGame", GuardVerdict::Allow),
+            backend.clone(),
+        );
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(backend.calls(), 1, "the allowed call ran exactly once");
+        let calls = store.tool_calls(task.id);
+        assert_eq!(calls.len(), 1);
+        let intent_id = store.intents(task.id)[0].id;
+        assert_eq!(calls[0].intent_id, intent_id);
+        assert_eq!(calls[0].tool_name, "createGame");
+        assert_eq!(calls[0].status, "ok");
+
+        let allowed = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "tool_allowed")
+            .expect("tool_allowed activity");
+        assert_eq!(allowed.payload["worker_key"], "alpha");
+        assert_eq!(allowed.payload["intent_id"], intent_id.to_string());
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 2, "origin fact plus one team fact");
+    }
+
+    #[tokio::test]
+    async fn team_worker_denied_tool_call_is_audited_and_never_runs() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("denied team tool", 4);
+        let goal = seed_goal(&store, &task).await;
+        let plan = two_worker_plan("denied team tool", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("denied team tool", plan, goal.id),
+            vec![
+                (
+                    "subtask one",
+                    TeamWorker::Calls(
+                        "the denial was handled",
+                        vec![request("rmrf", json!({"path": "/"}))],
+                    ),
+                ),
+                ("subtask two", TeamWorker::Success("plain finding")),
+            ],
+        ));
+        let backend = Arc::new(FakeBackend::new(json!({"should": "never run"})));
+        let engine = guarded_engine(
+            &store,
+            agent,
+            verdict_policy("rmrf", GuardVerdict::Deny),
+            backend.clone(),
+        );
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(
+            backend.calls(),
+            0,
+            "a denied call never reaches the backend"
+        );
+        let calls = store.tool_calls(task.id);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].status, "denied");
+        assert_eq!(calls[0].intent_id, store.intents(task.id)[0].id);
+
+        let denied = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "tool_denied")
+            .expect("tool_denied activity");
+        assert_eq!(denied.payload["tool"], "rmrf");
+        assert_eq!(denied.payload["worker_key"], "alpha");
+        assert_eq!(denied.payload["intent_id"], calls[0].intent_id.to_string());
+
+        let facts = store.facts(task.id);
+        assert_eq!(
+            facts.len(),
+            2,
+            "the denial is audited but the team fact is still recorded"
+        );
+        assert_eq!(store.intents(task.id)[0].state, IntentState::Done);
+    }
+
+    #[tokio::test]
+    async fn team_tool_call_error_fails_the_task_without_the_team_fact() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("failing team tool", 4);
+        let goal = seed_goal(&store, &task).await;
+        let plan = two_worker_plan("failing team tool", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("failing team tool", plan, goal.id),
+            vec![
+                (
+                    "subtask one",
+                    TeamWorker::Calls("must not land", vec![request("deploy", json!({}))]),
+                ),
+                ("subtask two", TeamWorker::Success("plain finding")),
+            ],
+        ));
+        let engine = guarded_engine(
+            &store,
+            agent,
+            verdict_policy("deploy", GuardVerdict::Allow),
+            Arc::new(FailingBackend),
+        );
+
+        let err = engine
+            .run_task(task.id)
+            .await
+            .expect_err("an executor error fails the task");
+
+        assert!(err.to_string().contains("backend exploded"), "{err}");
+        assert_eq!(
+            store.get_task(task.id).await.unwrap().unwrap().state,
+            TaskState::Failed
+        );
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 1, "only the origin fact exists");
+        assert_eq!(facts[0].id, task.origin_fact_id);
+        let intents = store.intents(task.id);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].state, IntentState::Stopped);
+        let calls = store.tool_calls(task.id);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].status, "error");
+        let failed = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "task_failed")
+            .expect("task_failed activity");
+        assert_eq!(failed.payload["source"], "worker");
+        assert!(
+            failed.payload["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("backend exploded")
+        );
+    }
+
+    #[tokio::test]
+    async fn team_tool_calls_cannot_reach_backend_without_executor() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("unguarded team tool", 4);
+        let plan = two_worker_plan("unguarded team tool", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            vec![ScriptedPlan::Outcome(planned_intent(
+                "unguarded team tool",
+                plan,
+            ))],
+            vec![
+                (
+                    "subtask one",
+                    TeamWorker::Calls("must not land", vec![request("deploy", json!({}))]),
+                ),
+                ("subtask two", TeamWorker::Success("plain finding")),
+            ],
+        ));
+        let backend = Arc::new(FakeBackend::new(json!({"should": "never run"})));
+        let engine = Engine::new(store.clone(), agent);
+
+        let err = engine.run_task(task.id).await.unwrap_err();
+
+        assert!(err.to_string().contains("no executor"), "{err}");
+        assert_eq!(backend.calls(), 0);
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 1, "only the origin fact exists");
+        assert_eq!(facts[0].id, task.origin_fact_id);
+        assert_eq!(
+            store.get_task(task.id).await.unwrap().unwrap().state,
+            TaskState::Failed
+        );
+        assert_eq!(store.intents(task.id)[0].state, IntentState::Stopped);
     }
 
     #[tokio::test]

@@ -38,7 +38,7 @@ impl std::fmt::Display for WorkerStatus {
 }
 
 /// One worker's outcome for one subtask.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerResult {
     pub worker_key: String,
     pub subtask_id: String,
@@ -58,6 +58,34 @@ pub struct WorkerResult {
     /// The provider's final reasoning text, when it returned any.
     #[serde(default)]
     pub thinking: Option<String>,
+    /// Post-hoc tool calls the worker's runtime returned for the engine to
+    /// route through the guard. The worker never executes them itself.
+    #[serde(default)]
+    pub tool_calls: Vec<dhi_core::ToolCallRequest>,
+}
+
+// `dhi_core::ToolCallRequest` does not derive `PartialEq`, so the tool-call
+// list is compared field by field here. Every other field keeps the derived
+// structural equality a plain `#[derive(PartialEq)]` would give.
+impl PartialEq for WorkerResult {
+    fn eq(&self, other: &Self) -> bool {
+        self.worker_key == other.worker_key
+            && self.subtask_id == other.subtask_id
+            && self.status == other.status
+            && self.summary == other.summary
+            && self.evidence == other.evidence
+            && self.error == other.error
+            && self.call_meta == other.call_meta
+            && self.prompt == other.prompt
+            && self.response == other.response
+            && self.thinking == other.thinking
+            && self.tool_calls.len() == other.tool_calls.len()
+            && self
+                .tool_calls
+                .iter()
+                .zip(&other.tool_calls)
+                .all(|(left, right)| left.tool == right.tool && left.input == right.input)
+    }
 }
 
 impl WorkerResult {
@@ -79,6 +107,7 @@ impl WorkerResult {
             prompt: String::new(),
             response: String::new(),
             thinking: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -99,6 +128,7 @@ impl WorkerResult {
             prompt: String::new(),
             response: String::new(),
             thinking: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -119,6 +149,7 @@ impl WorkerResult {
             prompt: String::new(),
             response: String::new(),
             thinking: None,
+            tool_calls: Vec::new(),
         }
     }
 

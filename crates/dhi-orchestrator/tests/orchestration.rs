@@ -1035,6 +1035,10 @@ fn worker_result_round_trip_preserves_audit_fields() {
     result.prompt = "rendered worker prompt".to_owned();
     result.response = "worker response text".to_owned();
     result.thinking = Some("worker reasoning".to_owned());
+    result.tool_calls = vec![dhi_core::ToolCallRequest {
+        tool: "audit-tool".to_owned(),
+        input: serde_json::json!({"path": "/audit"}),
+    }];
 
     let encoded = serde_json::to_string(&result).unwrap();
     let decoded: WorkerResult = serde_json::from_str(&encoded).unwrap();
@@ -1046,4 +1050,6 @@ fn worker_result_round_trip_preserves_audit_fields() {
     assert_eq!(decoded.prompt, "rendered worker prompt");
     assert_eq!(decoded.response, "worker response text");
     assert_eq!(decoded.thinking.as_deref(), Some("worker reasoning"));
+    assert_eq!(decoded.tool_calls.len(), 1);
+    assert_eq!(decoded.tool_calls[0].tool, "audit-tool");
 }

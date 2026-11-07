@@ -75,6 +75,9 @@ impl WorkerExecutor for RuntimeWorkerExecutor {
                 result.prompt = prompt;
                 result.response = response;
                 result.thinking = thinking;
+                // Post-hoc tool calls travel with the result; the engine's
+                // guard is the only thing that may execute them.
+                result.tool_calls = output.tool_calls;
                 Ok(result)
             }
             // One failing worker never aborts the team: the runners turn this
