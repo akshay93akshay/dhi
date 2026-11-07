@@ -59,6 +59,11 @@ pub struct PlanInput {
     /// Facts of the task, with their full ids and states.
     pub facts: Vec<dhi_core::Fact>,
     pub open_intents: usize,
+    /// Recent DHI+ team failures, oldest first. The planner uses them to
+    /// decide whether to retry with a different plan or a larger worker
+    /// budget, or to give up. Empty for a normal first turn.
+    #[serde(default)]
+    pub failures: Vec<String>,
     /// The task's pinned planner profile, resolved by the engine from the
     /// task row. `None` follows the planner's default chain.
     #[serde(default)]
@@ -979,6 +984,7 @@ impl RigAgentRuntime {
             goals: goal_lines(&input.goals),
             facts: fact_lines(&input.facts),
             open_intents: input.open_intents,
+            failures: failure_lines(&input.failures),
         };
         let (system, user) = self.prompts.render_planner(&vars)?;
         Ok(self.rendered(Role::Planner, system, user))
@@ -1355,6 +1361,16 @@ fn fact_lines(facts: &[dhi_core::Fact]) -> String {
         .join("\n")
 }
 
+/// One line per recent team failure. `none` keeps the prompt explicit when
+/// the planner has not seen a failure yet.
+fn failure_lines(failures: &[String]) -> String {
+    if failures.is_empty() {
+        "none".to_string()
+    } else {
+        bullet_list(failures)
+    }
+}
+
 /// Minimal templates for [`RigAgentRuntime::new`], which resolves no file. A
 /// bad constant is a bug in this crate, not configuration.
 fn fallback_prompts() -> PromptSet {
@@ -1465,7 +1481,7 @@ impl PlannerSink {
                                         "max_turns": {
                                             "type": "integer",
                                             "minimum": 1,
-                                            "description": "Model turns for this worker. Use at least 4 so a tool-using worker can still call record_fact and answer."
+                                            "description": "Model turns for this worker. Choose enough for its tool calls, record_fact, and answer; the engine passes it through exactly."
                                         }
                                     },
                                     "required": ["key", "role", "prompt", "max_turns"],
@@ -1696,28 +1712,9 @@ fn parse_plan_arg(
 /// [`AgentRuntime::execute`].
 const MISSING_RECORD_FACT: &str = "the worker must call record_fact";
 
-/// Smallest model-turn budget a DHI+ team worker receives.
-///
-/// `record_fact` plus the final sentence already costs two turns; a worker
-/// that uses one tool needs at least four. The planner may raise this budget
-/// but cannot make a worker too small to report its own result.
-const MIN_TEAM_WORKER_TURNS: usize = 4;
-
 /// The system-turn reminder appended for the one retry after a worker
 /// answered without calling `record_fact`.
 const RECORD_FACT_RETRY_INSTRUCTION: &str = "CRITICAL: Your previous attempt did not call record_fact. You MUST call record_fact now with the complete result. Do not answer with prose.";
-
-/// The model-turn budget one worker execution receives.
-///
-/// A planner-supplied DHI+ budget gets [`MIN_TEAM_WORKER_TURNS`] as a floor.
-/// The legacy single-worker path has no planner budget, so it keeps the
-/// runtime's role/manager budget unchanged.
-fn worker_turn_budget(input: &ExecuteInput, fallback: usize) -> usize {
-    match input.max_turns {
-        Some(planned) => planned.max(MIN_TEAM_WORKER_TURNS),
-        None => fallback,
-    }
-}
 
 /// Builds the one retry call: the original render with the CRITICAL reminder
 /// appended to its system turn and a distinct `+retry` prompt hash, so the
@@ -1921,10 +1918,9 @@ impl AgentRuntime for RigAgentRuntime {
             context: Some(tool_context),
             registry: Some(worker_registry),
         };
-        // The planner's per-worker budget wins for a DHI+ team turn, with a
-        // small floor so a tool-using worker can always reach record_fact;
-        // the legacy single-worker path keeps the runtime's budget.
-        let max_turns = worker_turn_budget(&input, self.manager_max_turns());
+        // The planner's per-worker budget is authoritative for a DHI+ team
+        // turn. The legacy single-worker path keeps the runtime's budget.
+        let max_turns = input.max_turns.unwrap_or_else(|| self.manager_max_turns());
         let attempt_tools = || {
             let sink = WorkerSink::default();
             let mut tools = sink.tools()?;
@@ -2180,6 +2176,7 @@ mod tests {
             goals: vec![goal],
             facts: vec![origin],
             open_intents: 1,
+            failures: vec![],
             planner_profile_id: None,
         }
     }
@@ -2207,6 +2204,16 @@ mod tests {
         assert!(call.user.contains(&goal_id), "{}", call.user);
         assert!(call.user.contains(&fact_id), "{}", call.user);
         assert!(call.user.contains("Open intents: 1"), "{}", call.user);
+        assert!(
+            call.user.contains("Recent failed intents"),
+            "the planner prompt shows the failure section: {}",
+            call.user
+        );
+        assert!(
+            call.user.lines().any(|line| line.trim() == "none"),
+            "an empty failure list renders as none: {}",
+            call.user
+        );
         assert!(call.system.contains("add_intent"), "{}", call.system);
         assert!(call.system.contains("prove_goal"), "{}", call.system);
         assert!(call.system.contains("NO PLAN:"), "{}", call.system);
@@ -2217,6 +2224,26 @@ mod tests {
         assert_eq!(
             call.prompt_hash,
             runtime.prompts().planner.version(Role::Planner)
+        );
+    }
+
+    #[test]
+    fn planner_render_bullets_recent_team_failures() {
+        let runtime = runtime_with("river-planner", "river-worker");
+        let mut input = plan_input();
+        input.failures =
+            vec!["DHI+ manager_worker team produced no successful worker result".to_string()];
+        let call = runtime.render_plan(&input).expect("renders");
+        assert!(
+            call.user
+                .contains("- DHI+ manager_worker team produced no successful worker result"),
+            "{}",
+            call.user
+        );
+        assert!(
+            !call.user.lines().any(|line| line.trim() == "none"),
+            "{}",
+            call.user
         );
     }
 
@@ -3023,23 +3050,6 @@ mod tests {
             .finish()
             .expect_err("prose without a record_fact call is not a fact");
         assert!(err.to_string().contains("record_fact"), "{err}");
-    }
-
-    #[test]
-    fn worker_turn_budget_floors_planner_values() {
-        let mut input = execute_input();
-        input.max_turns = Some(1);
-        assert_eq!(worker_turn_budget(&input, 40), MIN_TEAM_WORKER_TURNS);
-
-        input.max_turns = Some(8);
-        assert_eq!(worker_turn_budget(&input, 40), 8);
-
-        input.max_turns = None;
-        assert_eq!(
-            worker_turn_budget(&input, 40),
-            40,
-            "the legacy single-worker path keeps its runtime budget"
-        );
     }
 
     #[test]

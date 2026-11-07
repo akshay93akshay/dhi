@@ -43,8 +43,9 @@ declare only the workers that execute subtasks. Do not add a worker named
 `manager`, a worker with the `manager` role, or a separate aggregation
 subtask. The engine aggregates the worker results into the intent's one fact.
 For `swarm`, declare one subtask per worker; the runner seeds one turn per
-worker and peers react afterwards. Give each worker at least four `max_turns`
-so it can use a tool, call `record_fact`, and answer.
+worker and peers react afterwards. Give each worker enough `max_turns` for its
+tool calls, `record_fact`, and answer; the engine passes the budget through
+exactly.
 Do not invent tools or bypass the guard.
 
 You never write the graph yourself. The engine records the intent or calls the
@@ -65,6 +66,14 @@ Open goals follow. Each line carries the full goal id and its state:
 {{goals}}
 
 Open intents: {{open_intents}}
+
+Recent failed intents, oldest first:
+
+{{failures}}
+
+If a failed plan blocked the goal, decide whether to retry with a different
+plan or larger worker `max_turns`, change the approach, or give up. Do not
+repeat the same failing plan without a reason.
 
 Facts follow, oldest first. Each line carries the full fact id and its state.
 `origin` is the task's own premise; `confirmed` is evidence the worker recorded.

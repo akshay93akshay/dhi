@@ -976,6 +976,18 @@ impl Engine {
                     .into_iter()
                     .filter(|goal| goal.state == GoalState::Open)
                     .collect();
+                // A team failure returns to the planner as a visible recent
+                // failure. Keep the newest lines so the prompt stays bounded.
+                let mut failures: Vec<String> = self
+                    .store
+                    .list_activity(task_id, Some("team_failed"))
+                    .await?
+                    .into_iter()
+                    .map(|activity| activity.message)
+                    .collect();
+                if failures.len() > 8 {
+                    failures = failures.split_off(failures.len() - 8);
+                }
                 // Before an expensive step: a planner call is a model call.
                 if let Some(reason) =
                     Self::capacity_pause_reason(wall_limit, model_call_limit, started, model_calls)
@@ -1001,6 +1013,7 @@ impl Engine {
                         goals,
                         facts: facts.clone(),
                         open_intents: 0,
+                        failures,
                         planner_profile_id: task.pinned_planner_profile_id,
                     })
                     .await
@@ -1485,11 +1498,70 @@ impl Engine {
                     .count();
 
                 if successes == 0 {
+                    // A worker failure is evidence for the planner, not an
+                    // automatic task failure. Record a rejected result and a
+                    // `team_failed` row, stop this intent, and return to the
+                    // planner. The planner can retry with a different plan or
+                    // a larger worker budget, or give up. The host guards
+                    // (bound, no-progress, rounds, capacity) still cap the
+                    // loop.
+                    let worker_details: Vec<serde_json::Value> = result
+                        .worker_results
+                        .iter()
+                        .map(|worker| {
+                            let role = team_plan
+                                .workers
+                                .iter()
+                                .find(|spec| spec.key == worker.worker_key)
+                                .map(|spec| spec.role.clone())
+                                .unwrap_or_default();
+                            let subtask = team_plan
+                                .subtasks
+                                .iter()
+                                .find(|subtask| subtask.id == worker.subtask_id)
+                                .map(|subtask| subtask.description.clone())
+                                .unwrap_or_else(|| worker.subtask_id.clone());
+                            serde_json::json!({
+                                "key": worker.worker_key,
+                                "role": role,
+                                "status": worker.status.to_string(),
+                                "subtask": subtask,
+                                "error": worker.error,
+                            })
+                        })
+                        .collect();
+                    let detail = result
+                        .worker_results
+                        .iter()
+                        .map(|worker| {
+                            let error = worker
+                                .error
+                                .as_deref()
+                                .unwrap_or("worker failed without an error");
+                            format!("{} [{}]: {error}", worker.worker_key, worker.subtask_id)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
                     let reason = format!(
-                        "DHI+ {} team produced no successful worker result \
-                         ({failures} failed, {skipped} skipped)",
+                        "DHI+ {} team produced no successful worker result ({detail})",
                         plan.topology
                     );
+                    self.store
+                        .record_result(
+                            task_id,
+                            claimed.id,
+                            reason.clone(),
+                            dhi_core::ResultStatus::Rejected,
+                            serde_json::json!({
+                                "topology": plan.topology.as_str(),
+                                "workers": result.worker_results.len(),
+                                "success": successes,
+                                "failed": failures,
+                                "skipped": skipped,
+                                "worker_details": worker_details.clone(),
+                            }),
+                        )
+                        .await?;
                     self.store
                         .finish_intent(claimed.id, IntentState::Stopped)
                         .await?;
@@ -1505,12 +1577,12 @@ impl Engine {
                             "success": successes,
                             "failed": failures,
                             "skipped": skipped,
+                            "worker_details": worker_details,
                         }),
                     )
                     .await?;
-                    self.fail_task(task_id, &mut task, reason.clone(), "worker")
-                        .await?;
-                    anyhow::bail!("{reason}");
+                    self.wake();
+                    continue;
                 }
 
                 self.log_activity(
@@ -1899,6 +1971,7 @@ mod tests {
     struct ScriptedAgent {
         plans: Mutex<Vec<ScriptedPlan>>,
         executes: Mutex<Vec<dhi_agent::ExecuteOutput>>,
+        plan_inputs: Mutex<Vec<PlanInput>>,
     }
 
     impl ScriptedAgent {
@@ -1921,7 +1994,12 @@ mod tests {
             Self {
                 plans: Mutex::new(plans),
                 executes: Mutex::new(executes),
+                plan_inputs: Mutex::new(Vec::new()),
             }
+        }
+
+        fn plan_inputs(&self) -> Vec<PlanInput> {
+            self.plan_inputs.lock().unwrap().clone()
         }
     }
 
@@ -1931,6 +2009,7 @@ mod tests {
             &self,
             input: PlanInput,
         ) -> anyhow::Result<dhi_agent::AgentCall<PlanOutcome>> {
+            self.plan_inputs.lock().unwrap().push(input.clone());
             let output = match self.plans.lock().unwrap().pop() {
                 Some(ScriptedPlan::Outcome(plan)) => plan,
                 Some(ScriptedPlan::ProveFirstConfirmed { goal_id }) => {
@@ -2011,6 +2090,10 @@ mod tests {
 
         fn calls(&self) -> Vec<ExecuteInput> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn plan_inputs(&self) -> Vec<PlanInput> {
+            self.planner.plan_inputs()
         }
     }
 
@@ -5632,52 +5715,158 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_workers_failed_records_no_fact_and_fails_the_task() {
+    async fn zero_success_team_returns_to_the_planner_and_recovers() {
         let store = Arc::new(MemoryStore::new());
         let task = store.seed_task("failed team", 4);
-        let plan = two_worker_plan("doomed work", Topology::ManagerWorker);
+        let goal = seed_goal(&store, &task).await;
+        let doomed = two_worker_plan("doomed work", Topology::ManagerWorker);
+        let retry = IntentPlan {
+            intent: "recovered work".to_string(),
+            topology: Topology::ManagerWorker,
+            workers: vec![team_worker("gamma", "researcher")],
+            subtasks: vec![team_subtask("s3", "recovered subtask", "gamma")],
+            limits: CapabilityLimits::default(),
+        };
         let agent = Arc::new(TeamAgent::new(
-            vec![ScriptedPlan::Outcome(planned_intent("doomed work", plan))],
+            vec![
+                ScriptedPlan::Outcome(planned_intent("doomed work", doomed)),
+                ScriptedPlan::Outcome(planned_intent("recovered work", retry)),
+                ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+            ],
             vec![
                 ("subtask one", TeamWorker::Failure("alpha exploded")),
                 ("subtask two", TeamWorker::Failure("beta exploded")),
+                (
+                    "recovered subtask",
+                    TeamWorker::Success("the retry found it"),
+                ),
             ],
         ));
-        let engine = Engine::new(store.clone(), agent);
+        let engine = Engine::new(store.clone(), agent.clone());
 
-        let err = engine
-            .run_task(task.id)
-            .await
-            .expect_err("a team with no finding fails the task");
-        assert!(
-            err.to_string().contains("no successful worker result"),
-            "{err}"
-        );
+        let result = engine.run_task(task.id).await.unwrap();
 
         assert_eq!(
-            store.get_task(task.id).await.unwrap().unwrap().state,
-            TaskState::Failed
+            result.task.state,
+            TaskState::Done,
+            "a failed team returns to the planner; it does not fail the task"
         );
-        let facts = store.facts(task.id);
-        assert_eq!(facts.len(), 1, "only the origin fact exists");
-        assert_eq!(facts[0].id, task.origin_fact_id);
         let intents = store.intents(task.id);
-        assert_eq!(intents.len(), 1);
-        assert_eq!(intents[0].state, IntentState::Stopped);
-        assert!(engine.plans.lock().unwrap().is_empty());
+        assert_eq!(intents.len(), 2, "the planner added a second intent");
+        let failed_intent = intents
+            .iter()
+            .find(|intent| intent.description == "doomed work")
+            .expect("the failed intent");
+        let retried_intent = intents
+            .iter()
+            .find(|intent| intent.description == "recovered work")
+            .expect("the retried intent");
+        assert_eq!(failed_intent.state, IntentState::Stopped);
+        assert_eq!(retried_intent.state, IntentState::Done);
 
         let activities = store.activities(task.id);
         assert!(
-            activities
+            !activities
                 .iter()
-                .any(|activity| activity.kind == "team_failed"),
-            "a team failure leaves an activity row"
+                .any(|activity| activity.kind == "task_failed"),
+            "no host guard fired, so the task must not fail"
         );
-        let failed = activities
+        let team_failed = activities
             .iter()
-            .find(|activity| activity.kind == "task_failed")
-            .expect("task_failed activity");
-        assert_eq!(failed.payload["source"], "worker");
+            .find(|activity| activity.kind == "team_failed")
+            .expect("team_failed activity");
+        assert_eq!(
+            team_failed.payload["intent_id"],
+            failed_intent.id.to_string()
+        );
+        assert_eq!(team_failed.payload["success"], 0);
+        let details = team_failed.payload["worker_details"]
+            .as_array()
+            .expect("worker details");
+        assert_eq!(details.len(), 2);
+        assert!(
+            details
+                .iter()
+                .any(|worker| worker["error"] == "alpha exploded"),
+            "{details:?}"
+        );
+
+        let results = store.list_results(task.id, 10).await.unwrap();
+        assert_eq!(results.len(), 1, "one rejected result for the failed team");
+        assert_eq!(results[0].intent_id, failed_intent.id);
+        assert_eq!(results[0].acceptance, ResultStatus::Rejected);
+        assert!(
+            results[0].claim.contains("no successful worker result"),
+            "{}",
+            results[0].claim
+        );
+
+        let planner_inputs = agent.plan_inputs();
+        assert_eq!(
+            planner_inputs.len(),
+            3,
+            "the planner decides after the failure and after the recovery"
+        );
+        assert!(
+            planner_inputs[0].failures.is_empty(),
+            "the first plan has no prior failure"
+        );
+        assert!(
+            planner_inputs[1].failures.iter().any(|failure| {
+                failure.contains("no successful worker result")
+                    && failure.contains("alpha exploded")
+                    && failure.contains("beta exploded")
+            }),
+            "{:?}",
+            planner_inputs[1].failures
+        );
+
+        let facts = store.facts(task.id);
+        assert_eq!(facts.len(), 2, "origin fact plus the recovered team fact");
+        assert!(
+            facts
+                .iter()
+                .any(|fact| fact.claim.contains("the retry found it")),
+            "{facts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn team_workers_receive_exactly_the_planners_turn_budget() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("exact team turns", 4);
+        let goal = seed_goal(&store, &task).await;
+        let mut plan = two_worker_plan("exact team turns", Topology::ManagerWorker);
+        // Alpha is below the old four-turn floor; beta proves the exact value
+        // is not clamped to some other ceiling either.
+        plan.workers[0].max_turns = 2;
+        plan.workers[1].max_turns = 9;
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("exact team turns", plan, goal.id),
+            vec![
+                ("subtask one", TeamWorker::Success("finding one")),
+                ("subtask two", TeamWorker::Success("finding two")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone());
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        let calls = agent.calls();
+        assert_eq!(calls.len(), 2);
+        for call in &calls {
+            let expected = match assigned_subtask(&call.intent) {
+                "subtask one" => 2,
+                "subtask two" => 9,
+                other => panic!("unexpected worker subtask: {other}"),
+            };
+            assert_eq!(
+                call.max_turns,
+                Some(expected),
+                "the planner's budget reaches the worker unchanged"
+            );
+        }
     }
 
     #[tokio::test]

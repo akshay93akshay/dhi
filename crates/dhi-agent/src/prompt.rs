@@ -30,13 +30,15 @@ Worker: you never create intents. Write one fact draft through `record_fact`; do
 Use only the output mechanism this role is given. Never answer in JSON text.\n";
 
 /// The only variables this crate defines: `goal`, `bound`, `goals`, `facts`,
-/// `open_intents`, `intent`, `context`. Nothing else is renderable.
+/// `open_intents`, `failures`, `intent`, `context`. Nothing else is
+/// renderable.
 pub const DECLARED_VARIABLES: &[&str] = &[
     "goal",
     "bound",
     "goals",
     "facts",
     "open_intents",
+    "failures",
     "intent",
     "context",
 ];
@@ -50,6 +52,7 @@ pub struct PlannerVars {
     pub goals: String,
     pub facts: String,
     pub open_intents: usize,
+    pub failures: String,
 }
 
 /// Variables of one worker render. The intent text goes in the system prompt.
@@ -68,16 +71,18 @@ impl PlannerVars {
             "goals": self.goals,
             "facts": self.facts,
             "open_intents": self.open_intents,
+            "failures": self.failures,
         })
     }
 
-    fn pairs(&self) -> [(&'static str, String); 5] {
+    fn pairs(&self) -> [(&'static str, String); 6] {
         [
             ("goal", self.goal.clone()),
             ("bound", self.bound.to_string()),
             ("goals", self.goals.clone()),
             ("facts", self.facts.clone()),
             ("open_intents", self.open_intents.to_string()),
+            ("failures", self.failures.clone()),
         ]
     }
 }
@@ -122,7 +127,7 @@ pub struct PromptSet {
 
 impl PromptSet {
     /// Reads both role templates from `dir` and validates them. Every
-    /// `{{…}}` must be one of the six declared variables.
+    /// `{{…}}` must be one of the declared variables.
     pub fn load(dir: &Path) -> Result<Self, PromptError> {
         let planner =
             PromptTemplate::load_file(dir.join(Role::Planner.prompt_file()), Role::Planner)?;
@@ -339,6 +344,7 @@ mod tests {
                     - [confirmed] 89abcd00-0000-0000-0000-000000000003 found a rook lift"
                 .to_string(),
             open_intents: 2,
+            failures: "- DHI+ swarm team produced no successful worker result".to_string(),
         }
     }
 
@@ -423,6 +429,10 @@ mod tests {
             "facts carry full ids: {user}"
         );
         assert!(user.contains("Open intents: 2"));
+        assert!(
+            user.contains("no successful worker result"),
+            "recent failures reach the planner: {user}"
+        );
         assert!(
             !system.contains("89abcd00") && !system.contains("found a rook lift"),
             "system prompt must not carry fact claims: {system}"

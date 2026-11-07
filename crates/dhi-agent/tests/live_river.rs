@@ -37,6 +37,7 @@ async fn live_river_planner_smoke() {
             goals: vec![goal],
             facts: vec![origin],
             open_intents: 0,
+            failures: vec![],
             planner_profile_id: None,
         })
         .await

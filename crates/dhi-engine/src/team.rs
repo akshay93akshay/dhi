@@ -72,7 +72,7 @@ impl WorkerExecutor for RuntimeWorkerExecutor {
                 intent: team_intent(worker, subtask),
                 context,
                 worker_profile_id: self.worker_profile_id,
-                max_turns: Some(worker.max_turns.max(1)),
+                max_turns: Some(worker.max_turns),
             })
             .await;
 
