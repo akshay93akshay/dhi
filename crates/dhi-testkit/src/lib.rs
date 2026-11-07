@@ -12,8 +12,8 @@ use dhi_core::{
     FactId, FactState, Goal, GoalState, GraphStore, GuardDecision, GuardDecisionId, GuardStore,
     GuardVerdict, Intent, IntentId, IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome,
     ResultRecord, ResultStatus, RunId, SideQuestionRequest, SideQuestionSession,
-    SideQuestionSessionStatus, SideQuestionStatus, SideQuestionThread, Task, TaskId, TaskState,
-    ToolCall, ToolCallId,
+    SideQuestionSessionStatus, SideQuestionStatus, SideQuestionThread, SwarmMessageRecord, Task,
+    TaskId, TaskState, ToolCall, ToolCallId,
 };
 use uuid::Uuid;
 
@@ -38,7 +38,10 @@ struct Inner {
     agent_runs: HashMap<RunId, AgentRun>,
     side_sessions: HashMap<Uuid, SideQuestionSession>,
     side_requests: Vec<SideQuestionRequest>,
+    /// Typed messages broadcast by swarm runs, append-only.
+    swarm_messages: Vec<SwarmMessageRecord>,
     next_activity: i64,
+    next_swarm_message: i64,
 }
 
 #[derive(Clone, Default)]
@@ -127,6 +130,20 @@ impl MemoryStore {
             .filter(|a| a.task_id == task_id)
             .cloned()
             .collect()
+    }
+
+    /// Every persisted swarm message of `task_id`, oldest first by id. The
+    /// engine test reads the swarm audit log from here.
+    pub fn swarm_messages(&self, task_id: TaskId) -> Vec<SwarmMessageRecord> {
+        let inner = self.inner.lock().unwrap();
+        let mut messages: Vec<SwarmMessageRecord> = inner
+            .swarm_messages
+            .iter()
+            .filter(|message| message.task_id == task_id)
+            .cloned()
+            .collect();
+        messages.sort_by_key(|message| message.id);
+        messages
     }
 
     /// Every recorded `agent_runs` row of `task_id`, oldest first. Tests read
@@ -460,6 +477,44 @@ impl GraphStore for MemoryStore {
             .intent_plans
             .get(&intent_id)
             .cloned())
+    }
+
+    async fn append_swarm_message(
+        &self,
+        task_id: TaskId,
+        intent_id: IntentId,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let mut inner = self.inner.lock().unwrap();
+        // Mirror the PostgreSQL foreign keys: both rows must exist.
+        if !inner.tasks.contains_key(&task_id) {
+            anyhow::bail!("swarm message references missing task {task_id}");
+        }
+        if !inner.intents.contains_key(&intent_id) {
+            anyhow::bail!("swarm message references missing intent {intent_id}");
+        }
+        inner.next_swarm_message += 1;
+        let record = SwarmMessageRecord {
+            id: inner.next_swarm_message,
+            task_id,
+            intent_id,
+            kind: kind.to_string(),
+            payload,
+            created_at: Utc::now(),
+        };
+        inner.swarm_messages.push(record);
+        Ok(())
+    }
+
+    async fn list_swarm_messages(
+        &self,
+        task_id: TaskId,
+        limit: i64,
+    ) -> anyhow::Result<Vec<SwarmMessageRecord>> {
+        let mut messages = self.swarm_messages(task_id);
+        messages.truncate(limit.max(0) as usize);
+        Ok(messages)
     }
 
     async fn claim_intent(

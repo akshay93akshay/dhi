@@ -62,6 +62,8 @@ pub struct SwarmRunner<E> {
     executor: Arc<E>,
     aggregator: Arc<dyn Aggregator>,
     last_stats: Mutex<Option<SwarmStats>>,
+    /// Every logical broadcast of the most recent run, in broadcast order.
+    messages: Arc<Mutex<Vec<SwarmMessage>>>,
 }
 
 impl<E> SwarmRunner<E> {
@@ -71,6 +73,7 @@ impl<E> SwarmRunner<E> {
             executor,
             aggregator: Arc::new(DeterministicAggregator),
             last_stats: Mutex::new(None),
+            messages: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -80,6 +83,7 @@ impl<E> SwarmRunner<E> {
             executor,
             aggregator,
             last_stats: Mutex::new(None),
+            messages: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -89,6 +93,16 @@ impl<E> SwarmRunner<E> {
             .last_stats
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Typed messages broadcast during the most recent run, in broadcast
+    /// order. The runtime control [`SwarmMessage::Shutdown`] is never recorded
+    /// because workers stop without broadcasting it.
+    pub fn messages(&self) -> Vec<SwarmMessage> {
+        self.messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 }
 
@@ -100,6 +114,12 @@ impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
     /// here.
     pub async fn run(&self, plan: &IntentPlan) -> anyhow::Result<IntentResult> {
         plan.validate()?;
+
+        self.messages
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let messages = Arc::clone(&self.messages);
 
         let worker_count = plan.workers.len();
         let mut senders = Vec::with_capacity(worker_count);
@@ -137,6 +157,7 @@ impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
             let executor = Arc::clone(&self.executor);
             let worker_permits = Arc::clone(&permits);
             let worker_board = Arc::clone(&board);
+            let worker_messages = Arc::clone(&messages);
             let worker_rounds = round_rx.clone();
             let worker_stop = stop_rx.clone();
             let intent = plan.intent.clone();
@@ -148,6 +169,7 @@ impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
                     executor,
                     permits: worker_permits,
                     board: worker_board,
+                    messages: worker_messages,
                     rounds: worker_rounds,
                     stop: worker_stop,
                     reports: worker_reports,
@@ -352,6 +374,7 @@ struct WorkerContext<E> {
     executor: Arc<E>,
     permits: Arc<Semaphore>,
     board: Arc<Mutex<BoardState>>,
+    messages: Arc<Mutex<Vec<SwarmMessage>>>,
     rounds: watch::Receiver<u64>,
     stop: watch::Receiver<bool>,
     reports: mpsc::UnboundedSender<WorkerReport>,
@@ -372,7 +395,13 @@ async fn run_worker<E: WorkerExecutor + 'static>(
     let mut done = false;
 
     if worker.max_turns == 0 {
-        mark_done(&worker.key, &ctx.board, &peers, ctx.limits.max_messages);
+        mark_done(
+            &worker.key,
+            &ctx.board,
+            &ctx.messages,
+            &peers,
+            ctx.limits.max_messages,
+        );
         done = true;
     } else {
         let result = execute(
@@ -382,6 +411,7 @@ async fn run_worker<E: WorkerExecutor + 'static>(
             &context,
             &ctx.permits,
             &ctx.board,
+            &ctx.messages,
             &peers,
             1,
             ctx.limits.max_messages,
@@ -390,7 +420,13 @@ async fn run_worker<E: WorkerExecutor + 'static>(
         turns += 1;
         push_result_context(&mut context, &result);
         if turns >= worker.max_turns {
-            mark_done(&worker.key, &ctx.board, &peers, ctx.limits.max_messages);
+            mark_done(
+                &worker.key,
+                &ctx.board,
+                &ctx.messages,
+                &peers,
+                ctx.limits.max_messages,
+            );
             done = true;
         }
     }
@@ -440,6 +476,7 @@ async fn run_worker<E: WorkerExecutor + 'static>(
                                         &context,
                                         &ctx.permits,
                                         &ctx.board,
+                                        &ctx.messages,
                                         &peers,
                                         round,
                                         ctx.limits.max_messages,
@@ -451,6 +488,7 @@ async fn run_worker<E: WorkerExecutor + 'static>(
                                         mark_done(
                                             &worker.key,
                                             &ctx.board,
+                                            &ctx.messages,
                                             &peers,
                                             ctx.limits.max_messages,
                                         );
@@ -460,6 +498,7 @@ async fn run_worker<E: WorkerExecutor + 'static>(
                                     mark_done(
                                         &worker.key,
                                         &ctx.board,
+                                        &ctx.messages,
                                         &peers,
                                         ctx.limits.max_messages,
                                     );
@@ -491,6 +530,7 @@ async fn execute<E: WorkerExecutor>(
     context: &[String],
     permits: &Semaphore,
     board: &Mutex<BoardState>,
+    messages: &Mutex<Vec<SwarmMessage>>,
     peers: &[mpsc::UnboundedSender<SwarmMessage>],
     round: u64,
     max_messages: usize,
@@ -510,12 +550,13 @@ async fn execute<E: WorkerExecutor>(
             WorkerResult::failed(worker.key.clone(), subtask.id.clone(), error.to_string())
         }
     };
-    record_result(board, peers, &result, round, max_messages);
+    record_result(board, messages, peers, &result, round, max_messages);
     result
 }
 
 fn record_result(
     board: &Mutex<BoardState>,
+    messages: &Mutex<Vec<SwarmMessage>>,
     peers: &[mpsc::UnboundedSender<SwarmMessage>],
     result: &WorkerResult,
     round: u64,
@@ -534,6 +575,7 @@ fn record_result(
         WorkerStatus::Ok => {
             broadcast(
                 board,
+                messages,
                 peers,
                 SwarmMessage::Finding {
                     from: result.worker_key.clone(),
@@ -547,6 +589,7 @@ fn record_result(
         WorkerStatus::Failed => {
             broadcast(
                 board,
+                messages,
                 peers,
                 SwarmMessage::Challenge {
                     from: result.worker_key.clone(),
@@ -567,6 +610,7 @@ fn record_result(
 fn mark_done(
     worker_key: &str,
     board: &Mutex<BoardState>,
+    messages: &Mutex<Vec<SwarmMessage>>,
     peers: &[mpsc::UnboundedSender<SwarmMessage>],
     max_messages: usize,
 ) {
@@ -578,6 +622,7 @@ fn mark_done(
     }
     broadcast(
         board,
+        messages,
         peers,
         SwarmMessage::Done {
             from: worker_key.to_owned(),
@@ -587,9 +632,11 @@ fn mark_done(
 }
 
 /// Count and deliver one logical message. The board owns the budget, so a
-/// broadcast can never push the swarm past `max_messages`.
+/// broadcast can never push the swarm past `max_messages`. Every delivered
+/// message is also appended to the run log in broadcast order.
 fn broadcast(
     board: &Mutex<BoardState>,
+    messages: &Mutex<Vec<SwarmMessage>>,
     peers: &[mpsc::UnboundedSender<SwarmMessage>],
     message: SwarmMessage,
     max_messages: usize,
@@ -601,6 +648,10 @@ fn broadcast(
         }
         state.messages += 1;
     }
+    messages
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(message.clone());
     for peer in peers {
         let _ = peer.send(message.clone());
     }

@@ -204,18 +204,18 @@ async fn duplicate_exploration_is_rejected(pool: PgPool) {
 
 /// Migrations from an empty database create the full schema, idempotently.
 /// The schema includes tool control (`tool_catalog`, `tool_visibility`,
-/// `skill_usage`), web-provider settings (`web_provider_settings`), and
-/// persisted DHI+ plans (`intent_plans`).
+/// `skill_usage`), web-provider settings (`web_provider_settings`), persisted
+/// DHI+ plans (`intent_plans`), and swarm audit messages (`swarm_messages`).
 #[sqlx::test(migrations = false)]
-async fn migration_creates_24_tables_and_is_idempotent_from_clean_database(pool: PgPool) {
+async fn migration_creates_25_tables_and_is_idempotent_from_clean_database(pool: PgPool) {
     assert_eq!(base_table_count(&pool).await, 0);
 
     let store = Store::new(pool);
     store.migrate().await.expect("first migrate succeeds");
-    assert_eq!(base_table_count(store.pool()).await, 24);
+    assert_eq!(base_table_count(store.pool()).await, 25);
 
     store.migrate().await.expect("second migrate succeeds");
-    assert_eq!(base_table_count(store.pool()).await, 24);
+    assert_eq!(base_table_count(store.pool()).await, 25);
 }
 
 /// A DHI+ plan round-trips through JSONB, an upsert replaces it, and an
@@ -260,6 +260,67 @@ async fn intent_plan_round_trips_upserts_and_unknown_returns_none(pool: PgPool) 
         .await
         .unwrap();
     assert_eq!(rows, 1, "the upsert keeps exactly one row per intent");
+}
+
+/// Swarm messages append per task and list oldest first by id; `limit`
+/// truncates the newest rows, not the oldest.
+#[sqlx::test]
+async fn swarm_messages_append_and_list_ordered_by_id(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store.create_task("swarm audit", 4).await.unwrap();
+    let intent = store
+        .add_intent(task.id, task.origin_fact_id, "swarm work")
+        .await
+        .unwrap();
+
+    assert!(
+        store
+            .list_swarm_messages(task.id, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a task without a swarm run has no messages"
+    );
+
+    let appended = [
+        (
+            "finding",
+            serde_json::json!({"type": "finding", "from": "alpha", "summary": "one"}),
+        ),
+        (
+            "challenge",
+            serde_json::json!({"type": "challenge", "from": "beta", "text": "dispute"}),
+        ),
+        ("done", serde_json::json!({"type": "done", "from": "alpha"})),
+    ];
+    for (kind, payload) in appended {
+        store
+            .append_swarm_message(task.id, intent.id, kind, payload)
+            .await
+            .unwrap();
+    }
+
+    let messages = store.list_swarm_messages(task.id, 10).await.unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["finding", "challenge", "done"]
+    );
+    assert!(
+        messages.windows(2).all(|pair| pair[0].id < pair[1].id),
+        "messages are ordered by insertion id"
+    );
+    assert_eq!(messages[0].task_id, task.id);
+    assert_eq!(messages[0].intent_id, intent.id);
+    assert_eq!(messages[0].payload["summary"], "one");
+
+    let first_two = store.list_swarm_messages(task.id, 2).await.unwrap();
+    assert_eq!(first_two.len(), 2);
+    assert_eq!(first_two[0].id, messages[0].id);
+    assert_eq!(first_two[1].id, messages[1].id);
 }
 
 /// A fact may name an intent only once.

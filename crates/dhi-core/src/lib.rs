@@ -472,6 +472,21 @@ pub struct Activity {
     pub created_at: DateTime<Utc>,
 }
 
+/// One typed message broadcast during a DHI+ swarm run.
+///
+/// The payload is the serialized `SwarmMessage` and `kind` is its typed name
+/// (`finding`, `question`, `challenge`, `done`). Rows are append-only audit
+/// data; they live until their task is deleted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmMessageRecord {
+    pub id: i64,
+    pub task_id: TaskId,
+    pub intent_id: IntentId,
+    pub kind: String,
+    pub payload: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: ToolCallId,

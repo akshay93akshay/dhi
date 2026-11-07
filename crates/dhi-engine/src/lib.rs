@@ -23,7 +23,7 @@ use dhi_core::{
     IntentPlan, IntentState, Task, TaskState, ToolCallOutcome, ToolCallRequest, Topology,
 };
 use dhi_guard::ToolExecutor;
-use dhi_orchestrator::{IntentResult, ManagerRunner, SwarmRunner, WorkerStatus};
+use dhi_orchestrator::{IntentResult, ManagerRunner, SwarmMessage, SwarmRunner, WorkerStatus};
 use tokio::sync::Notify;
 use tracing::warn;
 use uuid::Uuid;
@@ -182,6 +182,20 @@ fn team_provenance(intent_id: Uuid, plan: &IntentPlan, result: &IntentResult) ->
     })
 }
 
+/// The persisted `kind` of one typed swarm message.
+///
+/// `Shutdown` is runtime control and has no persisted kind; a swarm run never
+/// logs it, but the defensive `None` keeps the mapping total.
+fn swarm_message_kind(message: &SwarmMessage) -> Option<&'static str> {
+    match message {
+        SwarmMessage::Finding { .. } => Some("finding"),
+        SwarmMessage::Question { .. } => Some("question"),
+        SwarmMessage::Challenge { .. } => Some("challenge"),
+        SwarmMessage::Done { .. } => Some("done"),
+        SwarmMessage::Shutdown => None,
+    }
+}
+
 pub struct Engine {
     store: Arc<dyn GraphStore>,
     agent: Arc<dyn AgentRuntime>,
@@ -273,8 +287,58 @@ impl Engine {
         });
         match plan.topology {
             Topology::ManagerWorker => ManagerRunner::new(executor).run(plan).await,
-            Topology::Swarm => SwarmRunner::new(executor).run(plan).await,
+            Topology::Swarm => {
+                let runner = SwarmRunner::new(executor);
+                let result = runner.run(plan).await;
+                self.persist_swarm_messages(task_id, intent.id, runner.messages())
+                    .await;
+                result
+            }
             Topology::Single => unreachable!("single plans use the worker path"),
+        }
+    }
+
+    /// Persists the typed broadcast log of one swarm run.
+    ///
+    /// `Shutdown` is runtime control, never a logical broadcast, so it is
+    /// skipped. A failed save is logged and swallowed: swarm audit data must
+    /// never fail the intent that produced it.
+    async fn persist_swarm_messages(
+        &self,
+        task_id: Uuid,
+        intent_id: Uuid,
+        messages: Vec<SwarmMessage>,
+    ) {
+        for message in messages {
+            let Some(kind) = swarm_message_kind(&message) else {
+                continue;
+            };
+            let payload = match serde_json::to_value(&message) {
+                Ok(payload) => payload,
+                Err(err) => {
+                    tracing::warn!(
+                        task_id = %task_id,
+                        intent_id = %intent_id,
+                        kind,
+                        error = %err,
+                        "failed to serialize swarm message"
+                    );
+                    continue;
+                }
+            };
+            if let Err(err) = self
+                .store
+                .append_swarm_message(task_id, intent_id, kind, payload)
+                .await
+            {
+                tracing::warn!(
+                    task_id = %task_id,
+                    intent_id = %intent_id,
+                    kind,
+                    error = %err,
+                    "failed to persist swarm message"
+                );
+            }
         }
     }
 
@@ -1387,7 +1451,8 @@ mod tests {
     use dhi_core::{
         Activity, AgentRole, Approval, ApprovalStatus, FactId, FactState, Goal, GoalId, GoalState,
         GuardVerdict, Intent, IntentId, NewSideQuestionRequest, ReopenOutcome, ResultRecord,
-        ResultStatus, SideQuestionRequest, SideQuestionSession, SideQuestionThread, TaskId,
+        ResultStatus, SideQuestionRequest, SideQuestionSession, SideQuestionThread,
+        SwarmMessageRecord, TaskId,
     };
     use dhi_guard::Policy;
     use dhi_guard::executor::{GuardedExecutor, ToolBackend, ToolExecutor};
@@ -3441,6 +3506,26 @@ mod tests {
             self.inner.get_intent_plan(intent_id).await
         }
 
+        async fn append_swarm_message(
+            &self,
+            task_id: TaskId,
+            intent_id: IntentId,
+            kind: &str,
+            payload: serde_json::Value,
+        ) -> anyhow::Result<()> {
+            self.inner
+                .append_swarm_message(task_id, intent_id, kind, payload)
+                .await
+        }
+
+        async fn list_swarm_messages(
+            &self,
+            task_id: TaskId,
+            limit: i64,
+        ) -> anyhow::Result<Vec<SwarmMessageRecord>> {
+            self.inner.list_swarm_messages(task_id, limit).await
+        }
+
         async fn claim_intent(
             &self,
             intent_id: IntentId,
@@ -4096,6 +4181,10 @@ mod tests {
             "the team fact is bound to its one intent"
         );
         assert_eq!(intents[0].state, IntentState::Done);
+        assert!(
+            store.swarm_messages(task.id).is_empty(),
+            "manager/worker plans persist no swarm messages"
+        );
         assert_eq!(team_fact.provenance["intent_id"], intents[0].id.to_string());
         assert!(
             store
@@ -4348,7 +4437,38 @@ mod tests {
             .expect("team_run activity");
         assert_eq!(team_run.payload["topology"], "swarm");
         assert_eq!(team_run.payload["success"], 2);
-        assert_eq!(store.intents(task.id)[0].state, IntentState::Done);
+        let intents = store.intents(task.id);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].state, IntentState::Done);
+
+        let messages = store.swarm_messages(task.id);
+        assert!(
+            !messages.is_empty(),
+            "a swarm run persists its typed broadcast log"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.intent_id == intents[0].id),
+            "every swarm message belongs to the plan's intent"
+        );
+        assert!(
+            messages.iter().any(|message| message.kind == "finding"),
+            "seed findings are persisted"
+        );
+        assert!(
+            messages.iter().all(|message| matches!(
+                message.kind.as_str(),
+                "finding" | "question" | "challenge" | "done"
+            )),
+            "only typed logical messages are persisted"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.payload["type"].is_string()),
+            "the payload is the serialized typed message"
+        );
     }
 
     #[tokio::test]

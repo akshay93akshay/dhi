@@ -7,8 +7,8 @@ use dhi_core::{
     Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, Fact, FactId, Goal, GoalId,
     GraphStore, GuardDecision, GuardDecisionId, GuardStore, GuardVerdict, Intent, IntentId,
     IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus,
-    SideQuestionRequest, SideQuestionSession, SideQuestionThread, Task, TaskId, TaskState,
-    ToolCall, ToolCallId,
+    SideQuestionRequest, SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task, TaskId,
+    TaskState, ToolCall, ToolCallId,
 };
 use uuid::Uuid;
 
@@ -91,6 +91,24 @@ impl GraphStore for Store {
 
     async fn get_intent_plan(&self, intent_id: IntentId) -> anyhow::Result<Option<IntentPlan>> {
         Ok(Store::get_intent_plan(self, intent_id).await?)
+    }
+
+    async fn append_swarm_message(
+        &self,
+        task_id: TaskId,
+        intent_id: IntentId,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        Ok(Store::append_swarm_message(self, task_id, intent_id, kind, payload).await?)
+    }
+
+    async fn list_swarm_messages(
+        &self,
+        task_id: TaskId,
+        limit: i64,
+    ) -> anyhow::Result<Vec<SwarmMessageRecord>> {
+        Ok(Store::list_swarm_messages(self, task_id, limit).await?)
     }
 
     async fn claim_intent(

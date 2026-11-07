@@ -1,6 +1,6 @@
 //! PostgreSQL store for DHI.
 //!
-//! This crate owns the 24-table schema and the SQL used by the engine and API.
+//! This crate owns the 25-table schema and the SQL used by the engine and API.
 //! Every invariant that can be enforced by a constraint is enforced here.
 
 use chrono::{DateTime, Utc};
@@ -9,7 +9,8 @@ use dhi_core::{
     CheckpointId, CoreError, Fact, FactState, Goal, GoalState, GuardDecision, GuardVerdict, Intent,
     IntentId, IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord,
     ResultStatus, RunId, SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus,
-    SideQuestionStatus, SideQuestionThread, Task, TaskId, TaskState, ToolCall, ToolCallId,
+    SideQuestionStatus, SideQuestionThread, SwarmMessageRecord, Task, TaskId, TaskState, ToolCall,
+    ToolCallId,
 };
 use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
@@ -582,6 +583,51 @@ impl Store {
                 .map_err(|err| StoreError::InvalidValue(format!("intent plan: {err}")))
         })
         .transpose()
+    }
+
+    /// Appends one typed message broadcast during a swarm run.
+    ///
+    /// The two foreign keys reject a missing task or intent, and both cascade
+    /// on delete: swarm messages live exactly as long as their task.
+    pub async fn append_swarm_message(
+        &self,
+        task_id: Uuid,
+        intent_id: Uuid,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO swarm_messages (task_id, intent_id, kind, payload)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(task_id)
+        .bind(intent_id)
+        .bind(kind)
+        .bind(payload)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Every swarm message of `task_id`, ordered by insertion id, at most
+    /// `limit` rows.
+    pub async fn list_swarm_messages(
+        &self,
+        task_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<SwarmMessageRecord>, StoreError> {
+        let rows = sqlx::query_as::<_, SwarmMessageRow>(
+            "SELECT id, task_id, intent_id, kind, payload, created_at
+             FROM swarm_messages
+             WHERE task_id = $1
+             ORDER BY id
+             LIMIT $2",
+        )
+        .bind(task_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(SwarmMessageRecord::from).collect())
     }
 
     /// Atomic claim. Only one worker can move an intent from open to running.
@@ -1682,6 +1728,29 @@ impl From<ActivityRow> for Activity {
             task_id: r.task_id,
             kind: r.kind,
             message: r.message,
+            payload: r.payload,
+            created_at: r.created_at,
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct SwarmMessageRow {
+    id: i64,
+    task_id: Uuid,
+    intent_id: Uuid,
+    kind: String,
+    payload: serde_json::Value,
+    created_at: DateTime<Utc>,
+}
+
+impl From<SwarmMessageRow> for SwarmMessageRecord {
+    fn from(r: SwarmMessageRow) -> Self {
+        Self {
+            id: r.id,
+            task_id: r.task_id,
+            intent_id: r.intent_id,
+            kind: r.kind,
             payload: r.payload,
             created_at: r.created_at,
         }

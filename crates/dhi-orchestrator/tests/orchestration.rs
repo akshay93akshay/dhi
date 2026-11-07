@@ -341,6 +341,63 @@ async fn swarm_findings_flow_and_stop_after_two_quiet_rounds() {
 }
 
 #[tokio::test]
+async fn swarm_records_typed_messages_only_after_a_run() {
+    let executor = Arc::new(FakeExecutor::new(always_ok_handler()));
+    let plan = plan(
+        Topology::Swarm,
+        vec![worker("a", 1), worker("b", 1)],
+        vec![subtask("seed-0", None), subtask("seed-1", None)],
+        limits(2, 2, 3, 64),
+    );
+
+    let runner = SwarmRunner::new(executor);
+    assert!(
+        runner.messages().is_empty(),
+        "the log is empty before a run"
+    );
+
+    runner.run(&plan).await.unwrap();
+    let messages = runner.messages();
+
+    assert!(
+        !messages
+            .iter()
+            .any(|message| matches!(message, SwarmMessage::Shutdown)),
+        "runtime control is never logged"
+    );
+    let findings: Vec<&SwarmMessage> = messages
+        .iter()
+        .filter(|message| matches!(message, SwarmMessage::Finding { .. }))
+        .collect();
+    assert_eq!(findings.len(), 2, "each seed worker broadcasts one finding");
+    let finding = findings
+        .iter()
+        .find_map(|message| match message {
+            SwarmMessage::Finding {
+                from,
+                subtask_id,
+                summary,
+                evidence,
+            } if from == "a" => Some((subtask_id, summary, evidence)),
+            _ => None,
+        })
+        .expect("worker a's typed finding");
+    assert_eq!(finding.0, "seed-0");
+    assert_eq!(finding.1, "summary from a");
+    assert_eq!(finding.2, "evidence from a");
+
+    let mut done: Vec<&str> = messages
+        .iter()
+        .filter_map(|message| match message {
+            SwarmMessage::Done { from } => Some(from.as_str()),
+            _ => None,
+        })
+        .collect();
+    done.sort();
+    assert_eq!(done, vec!["a", "b"], "each finished worker broadcasts done");
+}
+
+#[tokio::test]
 async fn swarm_stops_at_max_rounds() {
     let executor = Arc::new(FakeExecutor::new(always_ok_handler()));
     let plan = plan(

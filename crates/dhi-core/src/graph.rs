@@ -7,7 +7,8 @@ use crate::{
     Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, Fact, FactId, Goal, GoalId,
     GuardDecision, GuardDecisionId, GuardVerdict, Intent, IntentId, IntentPlan, IntentState,
     NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus, SideQuestionRequest,
-    SideQuestionSession, SideQuestionThread, Task, TaskId, TaskState, ToolCall, ToolCallId,
+    SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task, TaskId, TaskState, ToolCall,
+    ToolCallId,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -97,6 +98,25 @@ pub trait GraphStore: Send + Sync {
     /// The DHI+ plan attached to `intent_id`, or `None` when the intent was
     /// added without one or no plan row exists.
     async fn get_intent_plan(&self, intent_id: IntentId) -> anyhow::Result<Option<IntentPlan>>;
+
+    /// Appends one typed message broadcast while a swarm executed `intent_id`.
+    ///
+    /// The payload is the serialized message and `kind` its typed name. Rows
+    /// are append-only audit data and are removed with their task.
+    async fn append_swarm_message(
+        &self,
+        task_id: TaskId,
+        intent_id: IntentId,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()>;
+
+    /// Every swarm message of `task_id`, ordered by id, at most `limit` rows.
+    async fn list_swarm_messages(
+        &self,
+        task_id: TaskId,
+        limit: i64,
+    ) -> anyhow::Result<Vec<SwarmMessageRecord>>;
 
     async fn claim_intent(
         &self,
