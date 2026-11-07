@@ -1306,11 +1306,11 @@ impl Store {
         parse_agent_run_status(&run.status)?;
         sqlx::query(
             "INSERT INTO agent_runs
-             (id, run_id, call_index, task_id, intent_id, role, model, profile, prompt, prompt_hash,
-              variables, response, thinking, tokens_in, tokens_out, cache_read_tokens,
+             (id, run_id, call_index, task_id, intent_id, worker_key, role, model, profile, prompt,
+              prompt_hash, variables, response, thinking, tokens_in, tokens_out, cache_read_tokens,
               cache_write_tokens, reasoning_tokens, cost, status, error, latency_ms, checkpoint_id,
               created_at, updated_at)
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
              ON CONFLICT (id) DO UPDATE SET
                run_id = EXCLUDED.run_id,
                call_index = EXCLUDED.call_index,
@@ -1336,6 +1336,7 @@ impl Store {
         .bind(i32::try_from(run.call_index).unwrap_or(i32::MAX))
         .bind(run.task_id)
         .bind(run.intent_id)
+        .bind(&run.worker_key)
         .bind(run.role.as_str())
         .bind(&run.model)
         .bind(&run.profile)
@@ -1368,8 +1369,8 @@ impl Store {
 
     pub async fn get_agent_run(&self, id: Uuid) -> Result<Option<AgentRun>, StoreError> {
         let row = sqlx::query_as::<_, AgentRunRow>(
-            "SELECT id, run_id, call_index, task_id, intent_id, role, model, profile, prompt,
-                    prompt_hash, variables, response, thinking, tokens_in, tokens_out,
+            "SELECT id, run_id, call_index, task_id, intent_id, worker_key, role, model, profile,
+                    prompt, prompt_hash, variables, response, thinking, tokens_in, tokens_out,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens, cost, status, error,
                     latency_ms, checkpoint_id, created_at, updated_at
              FROM agent_runs WHERE id = $1",
@@ -1383,8 +1384,8 @@ impl Store {
     /// Every completion-call row of one task, oldest first.
     pub async fn list_agent_runs(&self, task_id: Uuid) -> Result<Vec<AgentRun>, StoreError> {
         let rows = sqlx::query_as::<_, AgentRunRow>(
-            "SELECT id, run_id, call_index, task_id, intent_id, role, model, profile, prompt,
-                    prompt_hash, variables, response, thinking, tokens_in, tokens_out,
+            "SELECT id, run_id, call_index, task_id, intent_id, worker_key, role, model, profile,
+                    prompt, prompt_hash, variables, response, thinking, tokens_in, tokens_out,
                     cache_read_tokens, cache_write_tokens, reasoning_tokens, cost, status, error,
                     latency_ms, checkpoint_id, created_at, updated_at
              FROM agent_runs WHERE task_id = $1 ORDER BY created_at, call_index",
@@ -1821,6 +1822,7 @@ struct AgentRunRow {
     call_index: i32,
     task_id: TaskId,
     intent_id: Option<IntentId>,
+    worker_key: Option<String>,
     role: String,
     model: String,
     profile: String,
@@ -1854,6 +1856,7 @@ impl TryFrom<AgentRunRow> for AgentRun {
             })?,
             task_id: r.task_id,
             intent_id: r.intent_id,
+            worker_key: r.worker_key,
             role: parse_agent_role(&r.role)?,
             model: r.model,
             profile: r.profile,

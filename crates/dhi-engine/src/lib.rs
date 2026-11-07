@@ -79,10 +79,12 @@ fn is_duplicate_intent_fact(err: &anyhow::Error) -> bool {
 /// The row id is the record's `run_id` and the run it belongs to is the same
 /// value, so `call_index` is 0. There is no checkpoint. `variables` is empty
 /// because the engine keeps no rendered variables; the rendered prompt is
-/// stored in full instead.
+/// stored in full instead. `worker_key` names the DHI+ subworker that made the
+/// call; the planner and the single-worker path pass their own value.
 fn agent_run<T>(
     task_id: Uuid,
     intent_id: Option<Uuid>,
+    worker_key: Option<&str>,
     record: &AgentCallRecord,
     call: &AgentCall<T>,
 ) -> AgentRun {
@@ -93,6 +95,7 @@ fn agent_run<T>(
         call_index: record.call_index,
         task_id,
         intent_id,
+        worker_key: worker_key.map(str::to_owned),
         role: dhi_agent::record_role(record.role),
         model: record.model.clone(),
         profile: record.profile.clone(),
@@ -410,17 +413,20 @@ impl Engine {
     /// Records one `agent_runs` row per completion call the runtime made.
     ///
     /// The planner has no intent (`None`); the worker's row names the intent
-    /// it was claimed for. `prompt` and `response` are the texts the runtime
+    /// it was claimed for. `worker_key` is `None` for planner calls, the
+    /// subworker key for a DHI+ team call, and `worker-1` for the normal
+    /// single-worker path. `prompt` and `response` are the texts the runtime
     /// returned. A failed save is logged and swallowed: usage accounting is
     /// never a reason to fail a plan or lose a worker's fact.
     async fn record_agent_calls<T>(
         &self,
         task_id: Uuid,
         intent_id: Option<Uuid>,
+        worker_key: Option<&str>,
         call: &AgentCall<T>,
     ) {
         for record in &call.meta.calls {
-            let run = agent_run(task_id, intent_id, record, call);
+            let run = agent_run(task_id, intent_id, worker_key, record, call);
             if let Err(err) = self.store.save_agent_run(&run).await {
                 warn!(
                     run_id = %record.run_id,
@@ -777,7 +783,7 @@ impl Engine {
                 };
                 // Usage is recorded before the output is read; a failed save
                 // warns and the plan still applies.
-                self.record_agent_calls(task_id, None, &plan).await;
+                self.record_agent_calls(task_id, None, None, &plan).await;
                 let plan = plan.output;
 
                 if stop_requested(stop.as_ref()) {
@@ -1111,8 +1117,13 @@ impl Engine {
                         response: worker.response.clone(),
                         thinking: worker.thinking.clone(),
                     };
-                    self.record_agent_calls(task_id, Some(claimed.id), &call)
-                        .await;
+                    self.record_agent_calls(
+                        task_id,
+                        Some(claimed.id),
+                        Some(worker.worker_key.as_str()),
+                        &call,
+                    )
+                    .await;
                 }
 
                 if stop_requested(stop.as_ref()) {
@@ -1280,7 +1291,7 @@ impl Engine {
             };
             // The row names the intent the worker was claimed for. A failed
             // save warns and the worker's fact is still written.
-            self.record_agent_calls(task_id, Some(claimed.id), &executed)
+            self.record_agent_calls(task_id, Some(claimed.id), Some("worker-1"), &executed)
                 .await;
             let output = executed.output;
 
@@ -2273,6 +2284,10 @@ mod tests {
                 row.intent_id.is_none(),
                 "the planner is not attached to an intent"
             );
+            assert!(
+                row.worker_key.is_none(),
+                "a planner call has no subworker identity"
+            );
             assert_eq!(row.call_index, 0);
             assert_eq!(row.id, row.run_id);
         }
@@ -2306,11 +2321,16 @@ mod tests {
             row.response
         );
 
-        let intent_id = row.intent_id.expect("the worker row names its intent");
+        let id = row.intent_id.expect("the worker row names its intent");
         let intents = store.intents(task.id);
         assert!(
-            intents.iter().any(|i| i.id == intent_id),
+            intents.iter().any(|i| i.id == id),
             "the row's intent exists on the task"
+        );
+        assert_eq!(
+            row.worker_key.as_deref(),
+            Some("worker-1"),
+            "a normal single-worker call records its worker identity"
         );
     }
 
@@ -4243,6 +4263,7 @@ mod tests {
         assert_eq!(row.prompt, "team prompt for subtask one");
         assert_eq!(row.response.as_deref(), Some("recorded team finding"));
         assert_eq!(row.thinking.as_deref(), Some("team worker reasoning"));
+        assert_eq!(row.worker_key.as_deref(), Some("alpha"));
         let intent_id = row.intent_id.expect("the team worker row names its intent");
         assert_eq!(
             store.intents(task.id)[0].id,
@@ -4259,6 +4280,44 @@ mod tests {
             team_run.payload["worker_keys"],
             json!(["alpha", "beta"]),
             "the activity names the workers that ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_worker_runs_record_distinct_worker_keys() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("team identity", 4);
+        let goal = seed_goal(&store, &task).await;
+        let plan = two_worker_plan("team identity", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("team identity", plan, goal.id),
+            vec![
+                ("subtask one", TeamWorker::Recorded("finding one")),
+                ("subtask two", TeamWorker::Recorded("finding two")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        let intent_id = store.intents(task.id)[0].id;
+        let runs = store.agent_runs(task.id);
+        let workers: Vec<_> = runs
+            .iter()
+            .filter(|run| run.role == AgentRole::Worker)
+            .collect();
+        assert_eq!(workers.len(), 2, "one row per recorded subworker call");
+
+        let mut keys: Vec<_> = workers
+            .iter()
+            .map(|run| run.worker_key.as_deref().expect("a worker key"))
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["alpha", "beta"]);
+        assert!(
+            workers.iter().all(|run| run.intent_id == Some(intent_id)),
+            "every subworker row names the team intent"
         );
     }
 

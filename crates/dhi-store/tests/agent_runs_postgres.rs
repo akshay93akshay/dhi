@@ -19,6 +19,7 @@ fn run_row(task_id: Uuid, run_id: Uuid, call_index: u32) -> AgentRun {
         call_index,
         task_id,
         intent_id: None,
+        worker_key: None,
         role: AgentRole::Planner,
         model: "deepseek-v4.1".to_string(),
         profile: "open_ai/deepseek-v4.1/max_tokens=4096/stream=true".to_string(),
@@ -61,6 +62,7 @@ async fn agent_run_round_trips_every_new_column(pool: PgPool) {
     assert_eq!(loaded.call_index, 0);
     assert_eq!(loaded.task_id, task.id);
     assert_eq!(loaded.intent_id, None);
+    assert_eq!(loaded.worker_key, None);
     assert_eq!(loaded.role, AgentRole::Planner);
     assert_eq!(loaded.model, "deepseek-v4.1");
     assert_eq!(loaded.profile, row.profile);
@@ -81,6 +83,22 @@ async fn agent_run_round_trips_every_new_column(pool: PgPool) {
 
     // The API key never reaches the row: the profile is a fingerprint only.
     assert!(!loaded.profile.contains("rv_"));
+}
+
+#[sqlx::test]
+async fn agent_run_round_trips_worker_key(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store.create_task("team task", 4).await.unwrap();
+    let mut row = run_row(task.id, Uuid::new_v4(), 0);
+    row.worker_key = Some("alpha".to_string());
+
+    store.save_agent_run(&row).await.unwrap();
+    let loaded = store.get_agent_run(row.id).await.unwrap().unwrap();
+    assert_eq!(loaded.worker_key.as_deref(), Some("alpha"));
+
+    let listed = store.list_agent_runs(task.id).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].worker_key.as_deref(), Some("alpha"));
 }
 
 #[sqlx::test]

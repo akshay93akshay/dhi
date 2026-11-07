@@ -548,6 +548,10 @@ pub struct AgentRun {
     pub call_index: u32,
     pub task_id: TaskId,
     pub intent_id: Option<IntentId>,
+    /// DHI+ subworker identity that made this call; `None` for planner and
+    /// single-worker calls.
+    #[serde(default)]
+    pub worker_key: Option<String>,
     pub role: AgentRole,
     pub model: String,
     /// `<provider>/<model>/max_tokens=<n>/stream=<bool>`, no secret.

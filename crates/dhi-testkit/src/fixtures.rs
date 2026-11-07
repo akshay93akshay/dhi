@@ -36,6 +36,7 @@ pub fn agent_run(task_id: TaskId, run_id: RunId, call_index: u32) -> AgentRun {
         call_index,
         task_id,
         intent_id: None,
+        worker_key: None,
         role: AgentRole::Planner,
         model: "deepseek-v4.1".to_string(),
         profile: "test/profile".to_string(),
