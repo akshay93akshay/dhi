@@ -319,6 +319,9 @@ impl IntoResponse for ApiError {
 /// `planner_profile_id`/`worker_profile_id` (historical) or
 /// `pinned_planner_profile_id`/`pinned_worker_profile_id` (the column names
 /// the response echoes).
+///
+/// An optional `capacity` ledger is written before the engine's first run,
+/// so that run already sees the limits instead of racing a later extension.
 #[derive(Debug, Deserialize)]
 struct CreateTaskRequest {
     goal: String,
@@ -327,6 +330,7 @@ struct CreateTaskRequest {
     planner_profile_id: Option<i64>,
     #[serde(alias = "pinned_worker_profile_id")]
     worker_profile_id: Option<i64>,
+    capacity: Option<TaskCapacity>,
 }
 
 /// `POST /api/tasks/{id}/goals` input.
@@ -467,19 +471,22 @@ async fn require_task(store: &dyn GraphStore, id: TaskId) -> Result<Task, ApiErr
 
 /// Creates a task, then runs it in the background.
 ///
-/// The response is the task as created (`created`). A failed run is logged
-/// and never fails the HTTP response: the task row keeps whatever state the
-/// run reached.
+/// The response is the task as created (`created`), including any capacity
+/// supplied in the request. A failed run is logged and never fails the HTTP
+/// response: the task row keeps whatever state the run reached.
 async fn create_task(
     State(state): State<AppState>,
-    Json(body): Json<CreateTaskRequest>,
+    payload: Result<Json<CreateTaskRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Task>), ApiError> {
+    let Json(body) = payload.map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
+
     if body.goal.trim().is_empty() {
         return Err(ApiError::bad_request("goal must not be empty"));
     }
     if body.bound < 0 {
         return Err(ApiError::bad_request("bound must not be negative"));
     }
+    let capacity = body.capacity.map(validate_create_capacity).transpose()?;
     // Pin validation needs the management tables; a pin-less create stays
     // available wherever the core store is wired.
     if body.planner_profile_id.is_some() || body.worker_profile_id.is_some() {
@@ -488,7 +495,7 @@ async fn create_task(
         validate_pin(mgmt, body.worker_profile_id, "worker_profile_id").await?;
     }
 
-    let task = state
+    let mut task = state
         .store
         .create_task_with_pins(
             body.goal,
@@ -499,9 +506,40 @@ async fn create_task(
         .await
         .map_err(ApiError::internal)?;
 
+    // The ledger must be durable before the engine snapshots it at run start.
+    if let Some(capacity) = capacity {
+        task = state
+            .store
+            .set_task_capacity(task.id, capacity)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+
     spawn_task_loop(&state.store, &state.task_runs, &state.engine, task.id);
 
     Ok((StatusCode::CREATED, Json(task)))
+}
+
+/// Refuses a create-time capacity with any zero field. Negative values never
+/// reach this point: the core type's unsigned fields reject them during JSON
+/// deserialization, which the extractor maps to `400` as well.
+fn validate_create_capacity(capacity: TaskCapacity) -> Result<TaskCapacity, ApiError> {
+    for (name, is_zero) in [
+        ("max_rounds", capacity.max_rounds == Some(0)),
+        ("max_model_calls", capacity.max_model_calls == Some(0)),
+        ("max_wall_secs", capacity.max_wall_secs == Some(0)),
+        (
+            "max_parallel_workers",
+            capacity.max_parallel_workers == Some(0),
+        ),
+    ] {
+        if is_zero {
+            return Err(ApiError::bad_request(format!(
+                "{name} must be a positive integer"
+            )));
+        }
+    }
+    Ok(capacity)
 }
 
 /// Records an unrecoverable background run error as a visible terminal
@@ -3307,6 +3345,13 @@ mod tests {
             .unwrap()
     }
 
+    fn post_task_with_capacity(goal: &str, bound: i32, capacity: Value) -> Request<Body> {
+        post_json(
+            "/api/tasks",
+            json!({ "goal": goal, "bound": bound, "capacity": capacity }),
+        )
+    }
+
     fn post_goal(task_id: TaskId, description: &str) -> Request<Body> {
         post_json(
             &format!("/api/tasks/{task_id}/goals"),
@@ -3701,6 +3746,86 @@ mod tests {
         let (status, json) = send(app, post_task("  ", 1)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(json["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn create_task_with_capacity_applies_it_before_the_first_run() {
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store.clone()));
+
+        let (status, json) = send(
+            app,
+            post_task_with_capacity("pause after one round", 3, json!({ "max_rounds": 1 })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert_eq!(json["capacity"]["max_rounds"], 1, "{json}");
+        assert!(
+            json["capacity"]["max_model_calls"].is_null(),
+            "omitted limits stay unset: {json}"
+        );
+        let id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
+
+        // One round is enough for the mock planner to add its first intent;
+        // the engine must see the create-time limit and pause before claiming.
+        wait_for_task_state(&store, id, TaskState::Paused).await;
+        let stored = store.get_task(id).await.unwrap().unwrap();
+        assert_eq!(stored.capacity.max_rounds, Some(1));
+        let exhausted = store
+            .activities(id)
+            .into_iter()
+            .find(|row| row.kind == "capacity_exhausted")
+            .expect("the first run must observe the create-time capacity");
+        assert_eq!(exhausted.payload["reason"], "rounds");
+        assert_eq!(exhausted.payload["max_rounds"], 1);
+    }
+
+    #[tokio::test]
+    async fn create_task_without_capacity_keeps_the_default_ledger() {
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store.clone()));
+
+        let (status, json) = create_one(app, "no capacity needed").await;
+
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert_eq!(json["capacity"], json!({}), "{json}");
+        let id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
+        wait_for_task_state(&store, id, TaskState::Done).await;
+        assert_eq!(
+            store.get_task(id).await.unwrap().unwrap().capacity,
+            TaskCapacity::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_non_positive_capacity() {
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store.clone()));
+
+        for capacity in [
+            json!({ "max_rounds": 0 }),
+            json!({ "max_model_calls": 0 }),
+            json!({ "max_wall_secs": 0 }),
+            json!({ "max_parallel_workers": 0 }),
+            json!({ "max_rounds": -1 }),
+            json!({ "max_model_calls": -1 }),
+            json!({ "max_wall_secs": -1 }),
+            json!({ "max_parallel_workers": -1 }),
+        ] {
+            let (status, json) = send(
+                app.clone(),
+                post_task_with_capacity("invalid capacity", 3, capacity),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert!(json["error"].is_string(), "{json}");
+        }
+
+        assert!(
+            store.list_tasks(100).await.unwrap().is_empty(),
+            "a refused create must not insert a task"
+        );
     }
 
     // -----------------------------------------------------------------------
