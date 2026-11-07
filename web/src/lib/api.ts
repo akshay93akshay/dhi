@@ -35,8 +35,11 @@ import type {
   SideQuestionSessionsResponse,
   StopTaskResponse,
   StopTasksResponse,
+  SwarmMessageRecord,
+  SwarmMessagesResponse,
   Task,
   TaskActivityResponse,
+  TaskCapacityPatch,
   TaskListResponse,
   TaskUsageResponse,
   TaskWork,
@@ -224,11 +227,39 @@ export function getTaskWork(id: string): Promise<TaskWork> {
   return request<TaskWork>(`/tasks/${id}/work`);
 }
 
+/**
+ * Extends or lowers one task's capacity ledger. Omitted fields keep their
+ * stored value. A paused task resumes; `409` means the task is terminal and
+ * its ledger can no longer be changed.
+ */
+export function updateTaskCapacity(
+  taskId: string,
+  patch: TaskCapacityPatch,
+): Promise<Task> {
+  return request<Task>(`/tasks/${taskId}/capacity`, {
+    method: "POST",
+    body: JSON.stringify({ ...patch }),
+  });
+}
+
 /** Unwraps the `{ activity: [...] }` envelope. */
 export function getTaskActivity(id: string): Promise<Activity[]> {
   return request<TaskActivityResponse>(`/tasks/${id}/activity`).then(
     (response) => response.activity,
   );
+}
+
+/**
+ * Unwraps the `{ messages: [...] }` envelope. The server defaults `limit`
+ * to 200 and clamps it to `1..=1000`.
+ */
+export function getSwarmMessages(
+  taskId: string,
+  limit = 200,
+): Promise<SwarmMessageRecord[]> {
+  return request<SwarmMessagesResponse>(
+    `/tasks/${taskId}/swarm-messages?limit=${limit}`,
+  ).then((response) => response.messages);
 }
 
 /** Unwraps the `{ runs: [...] }` envelope. */

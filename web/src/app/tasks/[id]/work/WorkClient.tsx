@@ -22,6 +22,7 @@ import {
 } from "@/lib/ui";
 import { formatLocalTimestamp } from "@/lib/localTime";
 import { crumbTrailSegments } from "@/lib/nav";
+import { hasSwarmTopology } from "@/lib/workTeam";
 import { Crumbs } from "@/app/_components/Crumbs";
 import { LiveActivityFeed } from "@/app/_components/ActivityLog";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -37,6 +38,8 @@ import {
 import { PageHeader } from "@/components/ui/page-header";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StateBadge } from "@/components/ui/state-badge";
+import { CapacityCard } from "./CapacityCard";
+import { SwarmMessagesCard } from "./SwarmMessagesCard";
 
 /** Poll cadence for the work view; suspended while the SSE stream is live. */
 const POLL_INTERVAL_MS = 5000;
@@ -239,6 +242,9 @@ function TaskWorkView() {
       proofByFactId.set(goal.proof_fact_id, goal.description);
     }
   }
+  // The work API exposes no task-level topology; the team fact records the
+  // topology each DHI+ plan ran with, so a swarm task auto-loads its log.
+  const autoLoadSwarm = hasSwarmTopology(work.facts);
 
   return (
     <main className="space-y-5">
@@ -291,6 +297,15 @@ function TaskWorkView() {
               </Link>
             </Button>
           </>
+        }
+      />
+
+      <CapacityCard
+        task={work.task}
+        onTaskUpdated={(updated) =>
+          setWork((current) =>
+            current === null ? current : { ...current, task: updated },
+          )
         }
       />
 
@@ -370,6 +385,12 @@ function TaskWorkView() {
       <LiveActivityFeed
         taskId={work.task.id}
         onSignal={(signal) => signalBridgeRef.current?.(signal)}
+      />
+
+      <SwarmMessagesCard
+        autoLoad={autoLoadSwarm}
+        key={work.task.id}
+        taskId={work.task.id}
       />
 
       <SectionCard

@@ -136,6 +136,29 @@ export type Health = {
   version: string;
 };
 
+/**
+ * Per-task capacity ledger. Each field is independently nullable: `null`
+ * means that dimension keeps the engine default. The server only stores
+ * positive values (`POST /api/tasks/{id}/capacity` rejects `<= 0`).
+ */
+export type TaskCapacity = {
+  max_rounds: number | null;
+  max_model_calls: number | null;
+  max_wall_secs: number | null;
+  max_parallel_workers: number | null;
+};
+
+/**
+ * `POST /api/tasks/{id}/capacity` body. Omitted fields keep the stored
+ * value; there is no way to clear a limit back to `null` through the API.
+ */
+export type TaskCapacityPatch = Partial<{
+  max_rounds: number;
+  max_model_calls: number;
+  max_wall_secs: number;
+  max_parallel_workers: number;
+}>;
+
 export type Task = {
   id: string;
   goal: string;
@@ -147,6 +170,11 @@ export type Task = {
   pinned_planner_profile_id: number | null;
   /** `llm_profiles.id` this task's worker role is pinned to, or `null`. */
   pinned_worker_profile_id: number | null;
+  /**
+   * Capacity limits. Older servers omit the field entirely; every limit is
+   * then treated as the engine default.
+   */
+  capacity?: TaskCapacity;
   created_at: string;
   updated_at: string;
 };
@@ -217,6 +245,21 @@ export type Activity = {
    * `{ "approval_id": ..., "tool_call_id": ..., "reason": ... }` on
    * `approval_denied`; workers/steps attach their own extras.
    */
+  payload: JsonObject;
+  created_at: string;
+};
+
+/**
+ * One typed broadcast persisted by a DHI+ swarm run. `kind` is one of
+ * `finding`, `question`, `challenge`, `done`; `payload` is the serialized
+ * `SwarmMessage` (`{ type, from, ... }`). Rows are append-only audit data,
+ * ordered by ascending `id`.
+ */
+export type SwarmMessageRecord = {
+  id: number;
+  task_id: string;
+  intent_id: string;
+  kind: string;
   payload: JsonObject;
   created_at: string;
 };
@@ -733,6 +776,11 @@ export type TaskWork = {
 /** `GET /api/tasks/{id}/activity` — rows ordered by `id` ascending. */
 export type TaskActivityResponse = {
   activity: Activity[];
+};
+
+/** `GET /api/tasks/{id}/swarm-messages` — rows ordered by `id` ascending. */
+export type SwarmMessagesResponse = {
+  messages: SwarmMessageRecord[];
 };
 
 /** `GET /api/tasks/{id}/usage` — completion calls ordered by `(created_at, call_index)`. */

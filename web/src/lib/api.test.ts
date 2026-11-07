@@ -15,6 +15,7 @@ import {
   getHealth,
   getPoolStatus,
   getSettings,
+  getSwarmMessages,
   getTask,
   getTaskActivity,
   getTaskUsage,
@@ -36,6 +37,7 @@ import {
   toggleRule,
   updateRule,
   updateSettings,
+  updateTaskCapacity,
 } from "./api.ts";
 import {
   TASK_STREAM_RESUME_DELAY_MS,
@@ -86,6 +88,12 @@ const sampleTask: Task = {
   origin_fact_id: "00000000-0000-4000-8000-000000000003",
   pinned_planner_profile_id: null,
   pinned_worker_profile_id: null,
+  capacity: {
+    max_rounds: 80,
+    max_model_calls: null,
+    max_wall_secs: null,
+    max_parallel_workers: 4,
+  },
   created_at: "2026-10-30T00:00:00Z",
   updated_at: "2026-10-30T00:00:00Z",
 };
@@ -378,6 +386,80 @@ test("getTaskWork returns the { task, goals, intents, facts, results } shape", a
   assert.deepEqual(work.results, [result]);
   // The handler serves no `digests` collection.
   assert.equal("digests" in work, false);
+});
+
+test("updateTaskCapacity POSTs the patch and returns the updated task", async () => {
+  const updated: Task = {
+    ...sampleTask,
+    capacity: {
+      max_rounds: 100,
+      max_model_calls: 120,
+      max_wall_secs: null,
+      max_parallel_workers: 4,
+    },
+  };
+  const recorder = stubFetch((_url, init) => {
+    assert.equal(init?.method, "POST");
+    assert.equal(
+      init?.body,
+      JSON.stringify({ max_rounds: 100, max_model_calls: 120 }),
+    );
+    return jsonResponse(updated);
+  });
+
+  const task = await updateTaskCapacity(sampleTask.id, {
+    max_rounds: 100,
+    max_model_calls: 120,
+  });
+
+  assert.equal(recorder.urls[0], `/api/tasks/${sampleTask.id}/capacity`);
+  assert.deepEqual(task, updated);
+});
+
+test("updateTaskCapacity exposes the terminal-task 409 as a conflict", async () => {
+  stubFetch(() =>
+    jsonResponse(
+      {
+        error: `task ${sampleTask.id} is done; its capacity cannot be extended`,
+      },
+      409,
+    ),
+  );
+
+  const error = await updateTaskCapacity(sampleTask.id, { max_rounds: 90 }).then(
+    () => {
+      throw new Error("updateTaskCapacity must reject a 409");
+    },
+    (thrown: unknown) => thrown,
+  );
+
+  assert.ok(error instanceof ApiError);
+  assert.equal(error.status, 409);
+  assert.equal(error.isConflict(), true);
+  assert.match(error.message, /capacity cannot be extended/);
+});
+
+test("getSwarmMessages unwraps { messages } and forwards the limit", async () => {
+  const record = {
+    id: 7,
+    task_id: sampleTask.id,
+    intent_id: "11111111-2222-4333-8444-555555555555",
+    kind: "finding",
+    payload: { type: "finding", from: "worker-a", summary: "found it" },
+    created_at: "2026-11-07T10:00:00Z",
+  };
+  const recorder = stubFetch(() => jsonResponse({ messages: [record] }));
+
+  const defaulted = await getSwarmMessages(sampleTask.id);
+  const explicit = await getSwarmMessages(sampleTask.id, 50);
+
+  assert.deepEqual(recorder.urls, [
+    `/api/tasks/${sampleTask.id}/swarm-messages?limit=200`,
+    `/api/tasks/${sampleTask.id}/swarm-messages?limit=50`,
+  ]);
+  assert.equal(recorder.calls[0]?.init?.method, undefined);
+  assert.deepEqual(defaulted, [record]);
+  assert.deepEqual(explicit, [record]);
 });
 
 test("getTaskActivity unwraps the { activity } envelope", async () => {
