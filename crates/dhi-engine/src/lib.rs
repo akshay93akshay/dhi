@@ -65,6 +65,20 @@ fn confirmed_fact_count(facts: &[Fact]) -> usize {
         .count()
 }
 
+/// Fact context for one DHI+ subworker.
+///
+/// The origin fact is the task's full goal text and names every worker and
+/// topic, so a subworker that reads it can drift onto a peer's topic. Only
+/// confirmed facts are shared context; the assigned subtask belongs in the
+/// worker's intent, not here.
+fn team_fact_context(facts: &[Fact]) -> Vec<String> {
+    facts
+        .iter()
+        .filter(|fact| fact.state == FactState::Confirmed)
+        .map(|fact| fact.claim.clone())
+        .collect()
+}
+
 /// True when a store rejected a second fact for one intent.
 ///
 /// Both stores surface `CoreError::FactAlreadyRecordedForIntent`; the
@@ -371,7 +385,7 @@ impl Engine {
             agent: Arc::clone(&self.agent),
             task_id,
             intent_id: intent.id,
-            context: facts.iter().map(|fact| fact.claim.clone()).collect(),
+            context: team_fact_context(facts),
             worker_profile_id: task.pinned_worker_profile_id,
         });
         let manager_model_calls = Arc::new(AtomicUsize::new(0));
@@ -1798,6 +1812,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::team::team_intent;
     use dhi_agent::{AgentCallRecord, MockAgentRuntime, PlanOutcome, Role};
     use dhi_core::{
         Activity, AgentRole, Approval, ApprovalStatus, FactId, FactState, Goal, GoalId, GoalState,
@@ -1949,6 +1964,15 @@ mod tests {
         }
     }
 
+    /// The subtask description a team intent names, so worker scripts can stay
+    /// keyed by description.
+    fn assigned_subtask(intent: &str) -> &str {
+        intent
+            .lines()
+            .find_map(|line| line.strip_prefix("Assigned subtask: "))
+            .unwrap_or(intent)
+    }
+
     #[async_trait::async_trait]
     impl AgentRuntime for TeamAgent {
         async fn plan(
@@ -1963,13 +1987,14 @@ mod tests {
             input: ExecuteInput,
         ) -> anyhow::Result<dhi_agent::AgentCall<dhi_agent::ExecuteOutput>> {
             self.calls.lock().unwrap().push(input.clone());
+            let subtask = assigned_subtask(&input.intent);
             let script = self
                 .workers
                 .lock()
                 .unwrap()
-                .get(&input.intent)
+                .get(subtask)
                 .cloned()
-                .ok_or_else(|| anyhow::anyhow!("unexpected team subtask: {}", input.intent))?;
+                .ok_or_else(|| anyhow::anyhow!("unexpected team subtask: {subtask}"))?;
             match script {
                 TeamWorker::Success(summary) => Ok(unrecorded(execute_output(summary, vec![]))),
                 TeamWorker::Recorded(summary) => {
@@ -1980,7 +2005,7 @@ mod tests {
                             usage: record.usage,
                             calls: vec![record],
                         },
-                        prompt: format!("team prompt for {}", input.intent),
+                        prompt: format!("team prompt for {subtask}"),
                         response: summary.to_string(),
                         thinking: Some("team worker reasoning".to_string()),
                     })
@@ -2365,6 +2390,54 @@ mod tests {
         Engine::new(store.clone(), agent)
             .with_executor(Arc::new(executor), store.clone())
             .with_heartbeat(Duration::from_millis(20))
+    }
+
+    fn fact(claim: &str, state: FactState) -> Fact {
+        Fact {
+            id: Uuid::new_v4(),
+            task_id: Uuid::new_v4(),
+            claim: claim.to_string(),
+            state,
+            provenance: json!({}),
+            origin_of: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn team_fact_context_drops_origin_and_keeps_confirmed_facts() {
+        let facts = vec![
+            fact(
+                "origin goal naming every worker and topic",
+                FactState::Origin,
+            ),
+            fact("alpha confirmed its finding", FactState::Confirmed),
+            fact("a dismissed finding", FactState::Dismissed),
+            fact("beta confirmed its finding", FactState::Confirmed),
+        ];
+
+        assert_eq!(
+            team_fact_context(&facts),
+            vec![
+                "alpha confirmed its finding".to_string(),
+                "beta confirmed its finding".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn team_intent_names_the_assigned_subtask_and_worker_prompt() {
+        let worker = team_worker("alpha", "researcher");
+        let subtask = team_subtask("s1", "check the northern route", "alpha");
+
+        let intent = team_intent(&worker, &subtask);
+
+        assert_eq!(
+            intent,
+            "Assigned subtask: check the northern route\n\n\
+             Worker role: researcher\n\
+             Worker instruction: act as researcher"
+        );
     }
 
     // ---------- existing behavior ----------
@@ -4846,10 +4919,9 @@ mod tests {
         let calls = agent.calls();
         assert_eq!(calls.len(), 2);
         assert!(
-            calls.iter().all(|call| call
-                .context
+            calls
                 .iter()
-                .any(|line| line == "worker role: alpha (researcher)")),
+                .all(|call| call.intent.contains("Worker role: researcher")),
             "both subtasks ran through the selected worker"
         );
         let team_run = store
@@ -4886,10 +4958,7 @@ mod tests {
         let calls = agent.calls();
         assert_eq!(calls.len(), 1, "only the selected worker runs");
         assert!(
-            calls[0]
-                .context
-                .iter()
-                .any(|line| line == "worker role: alpha (researcher)"),
+            calls[0].intent.contains("Worker role: researcher"),
             "the selected worker executed the subtask"
         );
 

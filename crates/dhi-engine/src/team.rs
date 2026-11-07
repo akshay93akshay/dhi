@@ -17,10 +17,39 @@ pub(crate) struct RuntimeWorkerExecutor {
     pub agent: Arc<dyn AgentRuntime>,
     pub task_id: Uuid,
     pub intent_id: Uuid,
-    /// The fact context at claim time. The runner adds its own per-turn
-    /// context (intent line, peer messages) on top.
+    /// Confirmed facts at claim time. The runner adds its own per-turn context
+    /// (intent line, peer messages) on top.
     pub context: Vec<String>,
     pub worker_profile_id: Option<i64>,
+}
+
+/// The primary intent for one worker turn.
+///
+/// The assigned subtask leads, followed by the worker's own role and
+/// instruction. Empty parts are omitted so a minimal worker never renders a
+/// blank heading, and the task's origin goal is deliberately absent.
+pub(crate) fn team_intent(worker: &WorkerSpec, subtask: &Subtask) -> String {
+    let mut sections = Vec::new();
+
+    let description = subtask.description.trim();
+    if !description.is_empty() {
+        sections.push(format!("Assigned subtask: {description}"));
+    }
+
+    let mut worker_lines = Vec::new();
+    let role = worker.role.trim();
+    if !role.is_empty() {
+        worker_lines.push(format!("Worker role: {role}"));
+    }
+    let prompt = worker.prompt.trim();
+    if !prompt.is_empty() {
+        worker_lines.push(format!("Worker instruction: {prompt}"));
+    }
+    if !worker_lines.is_empty() {
+        sections.push(worker_lines.join("\n"));
+    }
+
+    sections.join("\n\n")
 }
 
 #[async_trait]
@@ -33,20 +62,13 @@ impl WorkerExecutor for RuntimeWorkerExecutor {
     ) -> anyhow::Result<WorkerResult> {
         let mut context = self.context.clone();
         context.extend(runner_context.iter().cloned());
-        // The role and prompt shape the worker's turn just as the manager's
-        // assignment does; without them every worker would see the same bare
-        // intent text.
-        context.push(format!("worker role: {} ({})", worker.key, worker.role));
-        if !worker.prompt.trim().is_empty() {
-            context.push(format!("worker instructions: {}", worker.prompt.trim()));
-        }
 
         let executed = self
             .agent
             .execute(ExecuteInput {
                 task_id: self.task_id,
                 intent_id: self.intent_id,
-                intent: subtask.description.clone(),
+                intent: team_intent(worker, subtask),
                 context,
                 worker_profile_id: self.worker_profile_id,
             })
