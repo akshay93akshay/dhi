@@ -9,6 +9,7 @@
 //! [`PromptSet`](prompt::PromptSet), plus the per-run usage record
 //! ([`AgentCallMeta`]).
 
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -155,10 +156,62 @@ pub struct ExecuteOutput {
     pub tool_calls: Vec<dhi_core::ToolCallRequest>,
 }
 
+/// One manager selection request: the task intent plus the planner's allowed
+/// worker pool, subtasks, and limits.
+///
+/// The manager may choose a subset of the allowed workers and assign every
+/// subtask, but it cannot invent a worker or widen the planner's limits.
+#[derive(Debug, Clone)]
+pub struct TeamSelectionInput {
+    pub task_id: Uuid,
+    pub intent_id: Uuid,
+    pub intent: String,
+    pub plan: dhi_core::IntentPlan,
+    /// The task's pinned worker profile. `None` follows the worker's default
+    /// chain.
+    pub worker_profile_id: Option<i64>,
+}
+
+/// The manager's selection answer, as the model returns it.
+///
+/// `worker_keys` names the selected subset of the planner's allowed workers;
+/// `assignments` names the one worker for each planner subtask.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerChoice {
+    pub worker_keys: Vec<String>,
+    pub assignments: Vec<ManagerAssignment>,
+}
+
+/// The worker the manager chose for one subtask.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerAssignment {
+    pub subtask_id: String,
+    pub worker_key: String,
+}
+
 #[async_trait]
 pub trait AgentRuntime: Send + Sync {
     async fn plan(&self, input: PlanInput) -> anyhow::Result<AgentCall<PlanOutcome>>;
     async fn execute(&self, input: ExecuteInput) -> anyhow::Result<AgentCall<ExecuteOutput>>;
+
+    /// Lets the runtime's manager choose the actual DHI+ workers and subtasks.
+    ///
+    /// The default keeps the planner's plan unchanged, so a runtime that does
+    /// not implement a manager selects exactly what the planner proposed.
+    /// This phase runs manager selection as a worker-role call; a dedicated
+    /// manager role is a later refinement.
+    async fn select_team(
+        &self,
+        input: TeamSelectionInput,
+    ) -> anyhow::Result<AgentCall<dhi_core::IntentPlan>> {
+        Ok(AgentCall {
+            output: input.plan,
+            meta: AgentCallMeta::default(),
+            prompt: String::new(),
+            response: String::new(),
+            thinking: None,
+        })
+    }
 
     /// Answers one advisory side question from a frozen snapshot.
     ///
@@ -442,6 +495,188 @@ pub fn record_role(role: Role) -> dhi_core::AgentRole {
         Role::Planner => dhi_core::AgentRole::Planner,
         Role::Worker => dhi_core::AgentRole::Worker,
     }
+}
+
+/// Applies a pure manager choice to the planner's plan.
+///
+/// This is the only place a model-supplied selection becomes a plan. Every
+/// rule is checked before any worker runs: the choice selects a non-empty,
+/// duplicate-free subset of the planner's allowed workers within
+/// `max_workers`; every planner subtask has exactly one assignment; no
+/// assignment names an unknown subtask or an unselected worker. The selected
+/// plan keeps the planner's worker order and subtask order, and its limits.
+/// The result is validated with [`dhi_core::IntentPlan::validate`].
+pub fn apply_manager_choice(
+    plan: &dhi_core::IntentPlan,
+    choice: &ManagerChoice,
+) -> anyhow::Result<dhi_core::IntentPlan> {
+    if choice.worker_keys.is_empty() {
+        anyhow::bail!("manager choice selected no workers");
+    }
+    if choice.worker_keys.len() > plan.limits.max_workers {
+        anyhow::bail!(
+            "manager choice selected {} workers, above max_workers {}",
+            choice.worker_keys.len(),
+            plan.limits.max_workers
+        );
+    }
+
+    let allowed: HashSet<&str> = plan
+        .workers
+        .iter()
+        .map(|worker| worker.key.as_str())
+        .collect();
+    let mut selected: HashSet<&str> = HashSet::with_capacity(choice.worker_keys.len());
+    for key in &choice.worker_keys {
+        if !allowed.contains(key.as_str()) {
+            anyhow::bail!("manager choice names unknown worker {key:?}");
+        }
+        if !selected.insert(key.as_str()) {
+            anyhow::bail!("manager choice repeats worker {key:?}");
+        }
+    }
+
+    let subtask_ids: HashSet<&str> = plan
+        .subtasks
+        .iter()
+        .map(|subtask| subtask.id.as_str())
+        .collect();
+    let mut assignments: HashMap<&str, &str> = HashMap::with_capacity(choice.assignments.len());
+    for assignment in &choice.assignments {
+        if !subtask_ids.contains(assignment.subtask_id.as_str()) {
+            anyhow::bail!(
+                "manager choice assigns unknown subtask {:?}",
+                assignment.subtask_id
+            );
+        }
+        if !selected.contains(assignment.worker_key.as_str()) {
+            anyhow::bail!(
+                "manager choice assigns subtask {:?} to unselected worker {:?}",
+                assignment.subtask_id,
+                assignment.worker_key
+            );
+        }
+        if assignments
+            .insert(
+                assignment.subtask_id.as_str(),
+                assignment.worker_key.as_str(),
+            )
+            .is_some()
+        {
+            anyhow::bail!(
+                "manager choice assigns subtask {:?} more than once",
+                assignment.subtask_id
+            );
+        }
+    }
+    for subtask in &plan.subtasks {
+        if !assignments.contains_key(subtask.id.as_str()) {
+            anyhow::bail!(
+                "manager choice has no assignment for subtask {:?}",
+                subtask.id
+            );
+        }
+    }
+
+    let mut selected_plan = plan.clone();
+    // The planner's order is authoritative, not the model's list order.
+    selected_plan.workers = plan
+        .workers
+        .iter()
+        .filter(|worker| selected.contains(worker.key.as_str()))
+        .cloned()
+        .collect();
+    for subtask in &mut selected_plan.subtasks {
+        subtask.worker_key = assignments
+            .get(subtask.id.as_str())
+            .map(|key| (*key).to_string());
+    }
+    selected_plan.validate()?;
+    Ok(selected_plan)
+}
+
+/// The manager selection prompt: the system contract plus the JSON input.
+///
+/// Kept free of I/O so a test can assert the exact contract without a model.
+/// The input mirrors the planner's plan: `allowed_workers`, every subtask with
+/// a null `worker_key` (the manager chooses), and the planner's limits, which
+/// the manager may not widen.
+pub fn manager_selection_prompt(plan: &dhi_core::IntentPlan) -> (String, String) {
+    let system = format!(
+        "You are the DHI manager. Choose only from the allowed_workers in the input; \
+         never invent a worker. Return JSON only, with this schema: \
+         {{\"worker_keys\":[\"...\"],\"assignments\":[{{\"subtask_id\":\"...\",\"worker_key\":\"...\"}}]}}. \
+         Select at most {} worker(s) (the plan's max_workers). \
+         Assign every subtask exactly once, to a selected worker.",
+        plan.limits.max_workers
+    );
+    let input = serde_json::json!({
+        "intent": plan.intent,
+        "allowed_workers": plan
+            .workers
+            .iter()
+            .map(|worker| serde_json::json!({
+                "key": worker.key,
+                "role": worker.role,
+                "prompt": worker.prompt,
+                "max_turns": worker.max_turns,
+            }))
+            .collect::<Vec<_>>(),
+        "subtasks": plan
+            .subtasks
+            .iter()
+            .map(|subtask| serde_json::json!({
+                "id": subtask.id,
+                "description": subtask.description,
+                "worker_key": serde_json::Value::Null,
+            }))
+            .collect::<Vec<_>>(),
+        "limits": {
+            "max_workers": plan.limits.max_workers,
+            "max_parallel": plan.limits.max_parallel,
+            "max_rounds": plan.limits.max_rounds,
+            "max_messages": plan.limits.max_messages,
+        },
+    });
+    (system, input.to_string())
+}
+
+/// Parses the manager's JSON choice.
+///
+/// Code fences are stripped when present and the first `{` through the last
+/// `}` is parsed, so surrounding prose is tolerated. The parsed choice is not
+/// applied here; [`apply_manager_choice`] owns every validation rule.
+pub fn parse_manager_choice(text: &str) -> anyhow::Result<ManagerChoice> {
+    let text = strip_code_fences(text);
+    let start = text
+        .find('{')
+        .ok_or_else(|| anyhow::anyhow!("manager response contains no JSON object"))?;
+    let end = text
+        .rfind('}')
+        .ok_or_else(|| anyhow::anyhow!("manager response contains no closing JSON brace"))?;
+    if end < start {
+        anyhow::bail!("manager response has malformed JSON braces");
+    }
+    serde_json::from_str(&text[start..=end])
+        .map_err(|err| anyhow::anyhow!("manager response is not valid manager JSON: {err}"))
+}
+
+/// Strips one Markdown code fence, if the text is wrapped in one.
+fn strip_code_fences(text: &str) -> &str {
+    let trimmed = text.trim();
+    let Some(after_open) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+    let after_open = after_open.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+    let after_open = after_open
+        .strip_prefix("\r\n")
+        .or_else(|| after_open.strip_prefix('\n'))
+        .or_else(|| after_open.strip_prefix('\r'))
+        .unwrap_or(after_open);
+    after_open
+        .strip_suffix("```")
+        .map(str::trim)
+        .unwrap_or_else(|| after_open.trim())
 }
 
 /// One rendered role call: the two prompt turns plus the model and profile
@@ -735,6 +970,18 @@ impl RigAgentRuntime {
         };
         let (system, user) = self.prompts.render_worker(&vars)?;
         Ok(self.rendered(Role::Worker, system, user))
+    }
+
+    /// Renders one manager selection call: the manager contract in the system
+    /// turn and the planner's JSON plan in the user turn.
+    ///
+    /// The call runs on the worker role and worker pool in this phase; a
+    /// dedicated manager role is a later refinement.
+    pub fn render_manager_selection(&self, plan: &dhi_core::IntentPlan) -> RenderedCall {
+        let (system, user) = manager_selection_prompt(plan);
+        let mut call = self.rendered(Role::Worker, system, user);
+        call.prompt_hash = format!("manager@{}", render_hash(&call));
+        call
     }
 
     /// Renders one side-question call: the advisory preamble in the system
@@ -1633,6 +1880,57 @@ impl AgentRuntime for RigAgentRuntime {
         })
     }
 
+    /// Chooses the actual DHI+ workers and subtasks through one worker-role
+    /// completion call.
+    ///
+    /// The manager gets no tools, one turn, and the task's pinned worker
+    /// profile. Its answer is parsed and applied by
+    /// [`apply_manager_choice`]; a parse or validation failure is returned to
+    /// the engine, never silently replaced by the planner's plan. A dedicated
+    /// manager role is a later refinement.
+    async fn select_team(
+        &self,
+        input: TeamSelectionInput,
+    ) -> anyhow::Result<AgentCall<dhi_core::IntentPlan>> {
+        let call = self.render_manager_selection(&input.plan);
+        let (text, response, latency, candidate, _sink) = self
+            .complete_via_pool(
+                Role::Worker,
+                input.worker_profile_id,
+                &call,
+                ToolSetup::default(),
+                || Ok::<_, anyhow::Error>(((), Vec::new())),
+                1,
+            )
+            .await?;
+        let thinking = response_thinking(&response);
+        let choice = parse_manager_choice(&text)
+            .and_then(|choice| apply_manager_choice(&input.plan, &choice))
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "manager selection failed for intent {}: {err}",
+                    input.intent_id
+                )
+            })?;
+        let record = self.call_record(
+            Role::Worker,
+            &candidate,
+            &call.prompt_hash,
+            &response,
+            latency,
+        );
+        Ok(AgentCall {
+            output: choice,
+            meta: AgentCallMeta {
+                usage: record.usage,
+                calls: vec![record],
+            },
+            prompt: call.user,
+            response: text,
+            thinking,
+        })
+    }
+
     /// Answers one advisory side question.
     ///
     /// It uses the worker-role failover chain (the task's worker pin first)
@@ -2316,6 +2614,240 @@ mod tests {
         );
         assert!(out.output.tool_calls.is_empty());
         assert!(out.meta.calls.is_empty());
+    }
+
+    fn manager_worker(key: &str) -> dhi_core::WorkerSpec {
+        dhi_core::WorkerSpec {
+            key: key.to_string(),
+            role: "role".to_string(),
+            prompt: format!("act as {key}"),
+            max_turns: 8,
+        }
+    }
+
+    fn manager_subtask(id: &str) -> dhi_core::Subtask {
+        dhi_core::Subtask {
+            id: id.to_string(),
+            description: format!("do {id}"),
+            worker_key: None,
+        }
+    }
+
+    fn manager_plan() -> dhi_core::IntentPlan {
+        dhi_core::IntentPlan {
+            intent: "review the patch".to_string(),
+            topology: dhi_core::Topology::ManagerWorker,
+            workers: vec![
+                manager_worker("alpha"),
+                manager_worker("beta"),
+                manager_worker("gamma"),
+            ],
+            subtasks: vec![manager_subtask("s1"), manager_subtask("s2")],
+            limits: dhi_core::CapabilityLimits {
+                max_workers: 2,
+                ..dhi_core::CapabilityLimits::default()
+            },
+        }
+    }
+
+    fn assignment(subtask_id: &str, worker_key: &str) -> ManagerAssignment {
+        ManagerAssignment {
+            subtask_id: subtask_id.to_string(),
+            worker_key: worker_key.to_string(),
+        }
+    }
+
+    #[test]
+    fn manager_choice_selects_workers_and_assigns_every_subtask() {
+        let plan = manager_plan();
+        let choice = ManagerChoice {
+            worker_keys: vec!["alpha".to_string(), "gamma".to_string()],
+            assignments: vec![assignment("s2", "gamma"), assignment("s1", "alpha")],
+        };
+
+        let selected = apply_manager_choice(&plan, &choice).expect("the choice applies");
+
+        assert_eq!(
+            selected
+                .workers
+                .iter()
+                .map(|worker| worker.key.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "gamma"]
+        );
+        assert_eq!(
+            selected
+                .subtasks
+                .iter()
+                .map(|subtask| (subtask.id.as_str(), subtask.worker_key.as_deref().unwrap()))
+                .collect::<Vec<_>>(),
+            [("s1", "alpha"), ("s2", "gamma")]
+        );
+        assert_eq!(selected.limits, plan.limits, "limits stay the planner's");
+        selected.validate().expect("the selected plan validates");
+    }
+
+    #[test]
+    fn manager_choice_rejects_an_unknown_worker() {
+        let plan = manager_plan();
+        let choice = ManagerChoice {
+            worker_keys: vec!["ghost".to_string()],
+            assignments: vec![assignment("s1", "ghost"), assignment("s2", "ghost")],
+        };
+
+        let err = apply_manager_choice(&plan, &choice).expect_err("ghost is not allowed");
+        assert!(err.to_string().contains("unknown worker"), "{err}");
+    }
+
+    #[test]
+    fn manager_choice_rejects_a_missing_subtask_assignment() {
+        let plan = manager_plan();
+        let choice = ManagerChoice {
+            worker_keys: vec!["alpha".to_string()],
+            assignments: vec![assignment("s1", "alpha")],
+        };
+
+        let err = apply_manager_choice(&plan, &choice).expect_err("s2 has no assignment");
+        assert!(
+            err.to_string().contains("no assignment for subtask \"s2\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn manager_choice_rejects_a_duplicate_assignment() {
+        let plan = manager_plan();
+        let choice = ManagerChoice {
+            worker_keys: vec!["alpha".to_string()],
+            assignments: vec![
+                assignment("s1", "alpha"),
+                assignment("s1", "alpha"),
+                assignment("s2", "alpha"),
+            ],
+        };
+
+        let err = apply_manager_choice(&plan, &choice).expect_err("s1 is assigned twice");
+        assert!(
+            err.to_string().contains("more than once"),
+            "duplicate assignment must be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn manager_choice_rejects_excess_workers() {
+        let plan = manager_plan();
+        let choice = ManagerChoice {
+            worker_keys: vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
+            assignments: vec![assignment("s1", "alpha"), assignment("s2", "beta")],
+        };
+
+        let err = apply_manager_choice(&plan, &choice).expect_err("max_workers is two");
+        assert!(err.to_string().contains("above max_workers"), "{err}");
+    }
+
+    #[test]
+    fn manager_choice_keeps_the_planners_worker_order() {
+        let mut plan = manager_plan();
+        plan.limits.max_workers = 3;
+        let choice = ManagerChoice {
+            worker_keys: vec!["gamma".to_string(), "alpha".to_string(), "beta".to_string()],
+            assignments: vec![assignment("s1", "gamma"), assignment("s2", "alpha")],
+        };
+
+        let selected = apply_manager_choice(&plan, &choice).expect("the choice applies");
+
+        assert_eq!(
+            selected
+                .workers
+                .iter()
+                .map(|worker| worker.key.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha", "beta", "gamma"],
+            "the selected plan follows the planner's worker order"
+        );
+        assert_eq!(
+            selected
+                .subtasks
+                .iter()
+                .map(|subtask| subtask.id.as_str())
+                .collect::<Vec<_>>(),
+            ["s1", "s2"],
+            "subtask order is preserved"
+        );
+    }
+
+    #[test]
+    fn manager_selection_prompt_names_workers_limits_and_schema() {
+        let plan = manager_plan();
+        let (system, user) = manager_selection_prompt(&plan);
+
+        assert!(system.contains("DHI manager"), "{system}");
+        assert!(system.contains("allowed_workers"), "{system}");
+        assert!(system.contains("JSON only"), "{system}");
+        assert!(
+            system.contains(
+                "{\"worker_keys\":[\"...\"],\"assignments\":[{\"subtask_id\":\"...\",\"worker_key\":\"...\"}]}"
+            ),
+            "{system}"
+        );
+        assert!(system.contains("max_workers"), "{system}");
+        assert!(system.contains("every subtask exactly once"), "{system}");
+
+        let input: serde_json::Value = serde_json::from_str(&user).expect("the input is JSON");
+        assert_eq!(input["intent"], "review the patch");
+        assert_eq!(input["allowed_workers"][0]["key"], "alpha");
+        assert_eq!(input["allowed_workers"][0]["max_turns"], 8);
+        assert_eq!(input["subtasks"][0]["worker_key"], serde_json::Value::Null);
+        assert_eq!(input["limits"]["max_workers"], 2);
+        assert_eq!(input["limits"]["max_parallel"], 4);
+    }
+
+    #[test]
+    fn manager_choice_parses_from_a_fenced_fixture_and_applies() {
+        let fixture = "Here is the choice:\n```json\n\
+            {\"worker_keys\":[\"beta\"],\"assignments\":[\
+            {\"subtask_id\":\"s1\",\"worker_key\":\"beta\"},\
+            {\"subtask_id\":\"s2\",\"worker_key\":\"beta\"}]}\n```\n";
+        let choice = parse_manager_choice(fixture).expect("the fenced JSON parses");
+        assert_eq!(choice.worker_keys, ["beta"]);
+        assert_eq!(choice.assignments.len(), 2);
+
+        let selected = apply_manager_choice(&manager_plan(), &choice).expect("the choice applies");
+        assert_eq!(selected.workers.len(), 1);
+        assert_eq!(selected.workers[0].key, "beta");
+        assert!(
+            selected
+                .subtasks
+                .iter()
+                .all(|subtask| subtask.worker_key.as_deref() == Some("beta"))
+        );
+    }
+
+    #[test]
+    fn manager_choice_rejects_non_json_text() {
+        let err = parse_manager_choice("I choose alpha.").expect_err("there is no JSON object");
+        assert!(err.to_string().contains("no JSON object"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn mock_select_team_leaves_the_plan_unchanged() {
+        let plan = manager_plan();
+        let call = MockAgentRuntime
+            .select_team(TeamSelectionInput {
+                task_id: Uuid::new_v4(),
+                intent_id: Uuid::new_v4(),
+                intent: plan.intent.clone(),
+                plan: plan.clone(),
+                worker_profile_id: None,
+            })
+            .await
+            .expect("the default selection succeeds");
+
+        assert_eq!(call.output, plan);
+        assert!(call.meta.calls.is_empty());
+        assert!(call.prompt.is_empty());
+        assert!(call.response.is_empty());
+        assert_eq!(call.thinking, None);
     }
 
     #[tokio::test]

@@ -201,6 +201,58 @@ fn swarm_message_kind(message: &SwarmMessage) -> Option<&'static str> {
     }
 }
 
+/// Chooses the DHI+ manager's actual workers through the task's agent runtime.
+///
+/// This phase runs manager selection on the worker role and the task's pinned
+/// worker profile; a dedicated manager role is a later refinement. The
+/// runtime call is recorded here because the manager runner owns only the
+/// selected plan, not the completion call that produced it. A failed selection
+/// is returned so the task fails visibly.
+struct RuntimeTeamSelector {
+    store: Arc<dyn GraphStore>,
+    agent: Arc<dyn AgentRuntime>,
+    task_id: Uuid,
+    intent_id: Uuid,
+    intent: String,
+    worker_profile_id: Option<i64>,
+}
+
+#[async_trait::async_trait]
+impl TeamSelector for RuntimeTeamSelector {
+    async fn select(&self, plan: &IntentPlan) -> anyhow::Result<IntentPlan> {
+        let call = self
+            .agent
+            .select_team(dhi_agent::TeamSelectionInput {
+                task_id: self.task_id,
+                intent_id: self.intent_id,
+                intent: self.intent.clone(),
+                plan: plan.clone(),
+                worker_profile_id: self.worker_profile_id,
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("manager selection failed: {err}"))?;
+
+        for record in &call.meta.calls {
+            let run = agent_run(
+                self.task_id,
+                Some(self.intent_id),
+                Some("manager"),
+                record,
+                &call,
+            );
+            if let Err(err) = self.store.save_agent_run(&run).await {
+                warn!(
+                    run_id = %record.run_id,
+                    role = record.role.as_str(),
+                    task_id = %self.task_id,
+                    "could not record manager agent run: {err}"
+                );
+            }
+        }
+        Ok(call.output)
+    }
+}
+
 pub struct Engine {
     store: Arc<dyn GraphStore>,
     agent: Arc<dyn AgentRuntime>,
@@ -296,12 +348,26 @@ impl Engine {
         });
         match plan.topology {
             Topology::ManagerWorker => match self.manager_selector.as_ref() {
+                // A test (or host) override always wins over the runtime
+                // manager.
                 Some(selector) => {
                     ManagerRunner::with_selector(executor, Arc::clone(selector))
                         .run(plan)
                         .await
                 }
-                None => ManagerRunner::new(executor).run(plan).await,
+                None => {
+                    let selector = RuntimeTeamSelector {
+                        store: Arc::clone(&self.store),
+                        agent: Arc::clone(&self.agent),
+                        task_id,
+                        intent_id: intent.id,
+                        intent: plan.intent.clone(),
+                        worker_profile_id: task.pinned_worker_profile_id,
+                    };
+                    ManagerRunner::with_selector(executor, selector)
+                        .run(plan)
+                        .await
+                }
             },
             Topology::Swarm => {
                 let runner = SwarmRunner::new(executor);
@@ -4189,6 +4255,68 @@ mod tests {
 
     // ---------- DHI+ plan execution ----------
 
+    /// Scripted team agent whose runtime manager keeps only alpha and assigns
+    /// every subtask to it. Every other call delegates to the scripted team
+    /// agent.
+    struct SelectingTeamAgent {
+        team: TeamAgent,
+    }
+
+    impl SelectingTeamAgent {
+        fn new(plans: Vec<ScriptedPlan>, workers: Vec<(&str, TeamWorker)>) -> Self {
+            Self {
+                team: TeamAgent::new(plans, workers),
+            }
+        }
+
+        fn calls(&self) -> Vec<ExecuteInput> {
+            self.team.calls()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRuntime for SelectingTeamAgent {
+        async fn plan(
+            &self,
+            input: PlanInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<PlanOutcome>> {
+            self.team.plan(input).await
+        }
+
+        async fn execute(
+            &self,
+            input: ExecuteInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<dhi_agent::ExecuteOutput>> {
+            self.team.execute(input).await
+        }
+
+        async fn select_team(
+            &self,
+            input: dhi_agent::TeamSelectionInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<IntentPlan>> {
+            let mut selected = input.plan;
+            selected.workers.retain(|worker| worker.key == "alpha");
+            for subtask in &mut selected.subtasks {
+                subtask.worker_key = Some("alpha".to_string());
+            }
+            let record = call_record(Role::Worker, "manager-m");
+            Ok(dhi_agent::AgentCall {
+                output: selected,
+                meta: dhi_agent::AgentCallMeta {
+                    usage: record.usage,
+                    calls: vec![record],
+                },
+                prompt: "manager prompt".to_string(),
+                response: "manager response".to_string(),
+                thinking: Some("manager reasoning".to_string()),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "selecting"
+        }
+    }
+
     struct AlphaOnlySelector;
 
     #[async_trait::async_trait]
@@ -4237,6 +4365,62 @@ mod tests {
             .find(|activity| activity.kind == "team_run")
             .expect("team_run activity");
         assert_eq!(team_run.payload["worker_keys"], json!(["alpha", "alpha"]));
+    }
+
+    #[tokio::test]
+    async fn engine_uses_the_runtime_manager_selection() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("runtime manager", 4);
+        let goal = seed_goal(&store, &task).await;
+        // The planner offers alpha and beta but starts the only subtask on
+        // beta; the runtime manager selects alpha only.
+        let mut plan = two_worker_plan("runtime manager", Topology::ManagerWorker);
+        plan.subtasks.truncate(1);
+        plan.subtasks[0].worker_key = Some("beta".to_string());
+        let agent = Arc::new(SelectingTeamAgent::new(
+            team_completion_plans("runtime manager", plan, goal.id),
+            vec![("subtask one", TeamWorker::Recorded("alpha finding"))],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone());
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        let calls = agent.calls();
+        assert_eq!(calls.len(), 1, "only the selected worker runs");
+        assert!(
+            calls[0]
+                .context
+                .iter()
+                .any(|line| line == "worker role: alpha (researcher)"),
+            "the selected worker executed the subtask"
+        );
+
+        let team_run = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "team_run")
+            .expect("team_run activity");
+        assert_eq!(team_run.payload["worker_keys"], json!(["alpha"]));
+        assert_eq!(team_run.payload["success"], 1);
+
+        let runs = store.agent_runs(task.id);
+        let mut keys: Vec<_> = runs
+            .iter()
+            .filter_map(|run| run.worker_key.clone())
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["alpha", "manager"]);
+
+        let intent_id = store.intents(task.id)[0].id;
+        let manager = runs
+            .iter()
+            .find(|run| run.worker_key.as_deref() == Some("manager"))
+            .expect("manager agent run");
+        assert_eq!(manager.intent_id, Some(intent_id));
+        assert_eq!(manager.prompt, "manager prompt");
+        assert_eq!(manager.response.as_deref(), Some("manager response"));
+        assert_eq!(manager.thinking.as_deref(), Some("manager reasoning"));
     }
 
     #[tokio::test]
