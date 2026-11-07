@@ -129,6 +129,11 @@ impl IntentPlan {
 
         let mut keys = HashSet::with_capacity(self.workers.len());
         for worker in &self.workers {
+            if worker.max_turns == 0 {
+                return Err(OrchestrationError::ZeroWorkerTurns {
+                    worker_key: worker.key.clone(),
+                });
+            }
             if !keys.insert(worker.key.as_str()) {
                 return Err(OrchestrationError::DuplicateWorkerKey {
                     key: worker.key.clone(),
@@ -207,6 +212,8 @@ pub enum OrchestrationError {
         max_workers: usize,
         actual: usize,
     },
+    #[error("worker {worker_key:?} has zero max_turns")]
+    ZeroWorkerTurns { worker_key: String },
     #[error("worker key {key:?} is declared more than once")]
     DuplicateWorkerKey { key: String },
     #[error(
@@ -279,6 +286,25 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Topology::ManagerWorker).unwrap(),
             "\"manager_worker\""
+        );
+    }
+
+    #[test]
+    fn validation_rejects_a_zero_turn_worker() {
+        let mut worker = worker("a");
+        worker.max_turns = 0;
+        let plan = IntentPlan {
+            intent: "ship it".to_owned(),
+            topology: Topology::ManagerWorker,
+            workers: vec![worker],
+            subtasks: vec![subtask("s0", None)],
+            limits: CapabilityLimits::default(),
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(OrchestrationError::ZeroWorkerTurns {
+                worker_key: "a".to_owned(),
+            })
         );
     }
 

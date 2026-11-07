@@ -321,4 +321,3 @@ test("hasSwarmTopology finds a swarm team fact and tolerates malformed facts", (
     false,
   );
 });
-
