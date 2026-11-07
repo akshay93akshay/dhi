@@ -16,21 +16,39 @@ DHI+ is the team-execution upgrade to DHI. A goal still becomes a task and a pla
 ## Core architecture
 
 ```mermaid
-flowchart LR
+flowchart TD
     G[Goal] --> P[Planner]
-    P --> IP[IntentPlan]
-    IP --> T{Topology}
+    P -->|add intent + IntentPlan| T{Topology}
+
     T -->|manager_worker| M[Manager selects workers]
-    M --> W[Workers: alpha / beta / gamma]
+    M --> W[Workers]
     T -->|swarm| S[Seed one subtask per worker]
     S --> W
+
     W --> GU[Guard + audit]
-    GU --> AG[Deterministic aggregate]
+    GU --> R{Worker results}
+
+    R -->|success or partial success| AG[Deterministic aggregate]
     AG --> F[One confirmed fact]
-    F --> PR[Planner proves goal]
+    F --> PR[Planner reviews fact]
+
+    R -->|all workers failed| RJ[Rejected result + team_failed]
+    RJ --> PF[Planner reviews failure]
+
+    PR -->|add next intent| P
+    PR -->|prove goal| DONE[Goal met; task done]
+
+    PF -->|retry with new plan or higher max_turns| P
+    PF -->|give up| STOP[Goal abandoned; task stops]
+
     C[Capacity ledger] -. pause / resume .-> P
-    UI[Work UI: team, capacity, swarm messages] -. reads .-> F
+    H[Host guards: bound, no-progress, rounds] -. stop .-> P
 ```
+
+A zero-success team run becomes a rejected result and a `team_failed` row.
+The planner reviews that failure and can retry with a different plan or a
+larger worker `max_turns`, change approach, or give up. Host guards still
+bound the loop.
 
 A DHI+ intent still follows the DHI lifecycle. The difference is the execution layer: the planner can expand one intent into a team, and the engine still records one fact.
 
@@ -153,6 +171,10 @@ docker compose up -d --no-build
 ```
 
 To roll back, set `DHI_IMAGE` to the previous `sha-...` tag, then pull and start again. The image contains the Rust server, the static UI, `ops/`, the Docker CLI, and the pinned chess MCP runtime; it has no Rust or Node compiler.
+
+For a final no-cache build, run the `fresh-image` workflow manually. It builds
+without BuildKit cache, pulls fresh base images, publishes `fresh-<short-sha>`,
+and verifies the pulled image. Use this for final deployment checks.
 
 ## Local development
 
