@@ -460,7 +460,7 @@ function DhiMark({
           </text>
           <text className={styles.tagline} x="350" y="237" textAnchor="middle">
             DYNAMIC HEURISTIC INTELLIGENCE
-            <tspan className={styles.taglinePlus} dy="-6">
+            <tspan className={styles.taglinePlus} dy="-8">
               +
             </tspan>
           </text>

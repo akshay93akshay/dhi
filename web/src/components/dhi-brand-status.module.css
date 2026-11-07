@@ -76,13 +76,13 @@
 .tagline {
   fill: var(--dhi-tagline);
   font-family: var(--font-sans);
-  font-size: 17px;
-  font-weight: 550;
+  font-size: 24px;
+  font-weight: 600;
   letter-spacing: 2.1px;
 }
 
 .taglinePlus {
-  font-size: 11px;
+  font-size: 16px;
   letter-spacing: 0;
 }
 
