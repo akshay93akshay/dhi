@@ -12,7 +12,7 @@
 //! `ResetRunningIntents` recovery. Activity rows record what happened.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -231,6 +231,9 @@ struct RuntimeTeamSelector {
     intent_id: Uuid,
     intent: String,
     worker_profile_id: Option<i64>,
+    /// Completion calls the manager selection made. The runner owns only the
+    /// selected plan, so the engine reads this after the run.
+    model_calls: Arc<AtomicUsize>,
 }
 
 #[async_trait::async_trait]
@@ -247,6 +250,9 @@ impl TeamSelector for RuntimeTeamSelector {
             })
             .await
             .map_err(|err| anyhow::anyhow!("manager selection failed: {err}"))?;
+
+        self.model_calls
+            .fetch_add(call.meta.calls.len(), Ordering::SeqCst);
 
         for record in &call.meta.calls {
             let run = agent_run(
@@ -348,8 +354,10 @@ impl Engine {
 
     /// Runs a non-single plan through its topology's runner.
     ///
-    /// Returns the run result and the effective plan: the planner's plan
-    /// narrowed by the task's DHI+ capacity. The stored plan is never changed.
+    /// Returns the run result, the effective plan (the planner's plan narrowed
+    /// by the task's DHI+ capacity), and the manager's model-call count. The
+    /// stored plan is never changed. The count is zero for a swarm run or an
+    /// explicit selector override, neither of which reports selection meta.
     async fn run_team_plan(
         &self,
         task_id: Uuid,
@@ -357,7 +365,7 @@ impl Engine {
         intent: &Intent,
         plan: &IntentPlan,
         facts: &[Fact],
-    ) -> anyhow::Result<(IntentResult, IntentPlan)> {
+    ) -> anyhow::Result<(IntentResult, IntentPlan, usize)> {
         let plan = apply_task_capacity(plan.clone(), task.capacity);
         let executor = Arc::new(RuntimeWorkerExecutor {
             agent: Arc::clone(&self.agent),
@@ -366,10 +374,11 @@ impl Engine {
             context: facts.iter().map(|fact| fact.claim.clone()).collect(),
             worker_profile_id: task.pinned_worker_profile_id,
         });
+        let manager_model_calls = Arc::new(AtomicUsize::new(0));
         let result = match plan.topology {
             Topology::ManagerWorker => match self.manager_selector.as_ref() {
                 // A test (or host) override always wins over the runtime
-                // manager.
+                // manager. It reports no selection meta, so it counts zero.
                 Some(selector) => {
                     ManagerRunner::with_selector(executor, Arc::clone(selector))
                         .run(&plan)
@@ -383,6 +392,7 @@ impl Engine {
                         intent_id: intent.id,
                         intent: plan.intent.clone(),
                         worker_profile_id: task.pinned_worker_profile_id,
+                        model_calls: Arc::clone(&manager_model_calls),
                     };
                     ManagerRunner::with_selector(executor, selector)
                         .run(&plan)
@@ -398,7 +408,7 @@ impl Engine {
             }
             Topology::Single => unreachable!("single plans use the worker path"),
         }?;
-        Ok((result, plan))
+        Ok((result, plan, manager_model_calls.load(Ordering::SeqCst)))
     }
 
     /// Persists the typed broadcast log of one swarm run.
@@ -1335,7 +1345,7 @@ impl Engine {
             };
 
             if let Some(plan) = plan.filter(|plan| plan.topology != Topology::Single) {
-                let (result, team_plan) = match self
+                let (result, team_plan, manager_model_calls) = match self
                     .run_team_plan(task_id, &task, &claimed, &plan, &facts)
                     .await
                 {
@@ -1369,6 +1379,7 @@ impl Engine {
                 //
                 // Failed calls that produced no `AgentCallMeta` cannot be
                 // counted; the ledger only sees calls a runtime reported.
+                model_calls += manager_model_calls;
                 model_calls += result
                     .worker_results
                     .iter()
@@ -1496,6 +1507,7 @@ impl Engine {
                         "success": successes,
                         "failed": failures,
                         "skipped": skipped,
+                        "manager_model_calls": manager_model_calls,
                     }),
                 )
                 .await?;
@@ -4846,6 +4858,10 @@ mod tests {
             .find(|activity| activity.kind == "team_run")
             .expect("team_run activity");
         assert_eq!(team_run.payload["worker_keys"], json!(["alpha", "alpha"]));
+        assert_eq!(
+            team_run.payload["manager_model_calls"], 0,
+            "an explicit selector reports no runtime manager calls"
+        );
     }
 
     #[tokio::test]
@@ -4884,6 +4900,7 @@ mod tests {
             .expect("team_run activity");
         assert_eq!(team_run.payload["worker_keys"], json!(["alpha"]));
         assert_eq!(team_run.payload["success"], 1);
+        assert_eq!(team_run.payload["manager_model_calls"], 1);
 
         let runs = store.agent_runs(task.id);
         let mut keys: Vec<_> = runs
@@ -4902,6 +4919,84 @@ mod tests {
         assert_eq!(manager.prompt, "manager prompt");
         assert_eq!(manager.response.as_deref(), Some("manager response"));
         assert_eq!(manager.thinking.as_deref(), Some("manager reasoning"));
+    }
+
+    /// A manager selection reports its completion call through the selector
+    /// counter, which the engine reads after the runner returns the plan.
+    #[tokio::test]
+    async fn runtime_manager_selection_counts_its_model_calls() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("manager model calls", 4);
+        let agent = Arc::new(SelectingTeamAgent::new(Vec::new(), Vec::new()));
+        let model_calls = Arc::new(AtomicUsize::new(0));
+        let selector = RuntimeTeamSelector {
+            store,
+            agent,
+            task_id: task.id,
+            intent_id: Uuid::new_v4(),
+            intent: "manager model calls".to_string(),
+            worker_profile_id: None,
+            model_calls: Arc::clone(&model_calls),
+        };
+        let plan = two_worker_plan("manager model calls", Topology::ManagerWorker);
+
+        let selected = selector.select(&plan).await.unwrap();
+
+        assert_eq!(model_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(selected.workers.len(), 1, "the selected plan is returned");
+        assert_eq!(selected.subtasks[0].worker_key.as_deref(), Some("alpha"));
+    }
+
+    /// The manager's reported call spends the task's model budget: the next
+    /// capacity check pauses the task even though the planner and worker
+    /// reported no calls of their own.
+    #[tokio::test]
+    async fn capacity_model_call_limit_counts_the_manager_selection() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("manager capacity", 100);
+        let goal = seed_goal(&store, &task).await;
+        GraphStore::set_task_capacity(
+            store.as_ref(),
+            task.id,
+            TaskCapacity {
+                max_model_calls: Some(1),
+                ..TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut plan = two_worker_plan("manager capacity", Topology::ManagerWorker);
+        plan.subtasks.truncate(1);
+        let agent = Arc::new(SelectingTeamAgent::new(
+            team_completion_plans("manager capacity", plan, goal.id),
+            vec![("subtask one", TeamWorker::Success("manager finding"))],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone());
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Paused);
+        assert_eq!(result.rounds, 2, "the planner added and the team claimed");
+        let exhausted = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "capacity_exhausted")
+            .expect("capacity_exhausted activity");
+        assert_eq!(exhausted.payload["reason"], "model_calls");
+        assert_eq!(exhausted.payload["model_calls"], 1);
+        assert_eq!(exhausted.payload["max_model_calls"], 1);
+        let team_run = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "team_run")
+            .expect("team_run activity");
+        assert_eq!(team_run.payload["manager_model_calls"], 1);
+        assert_eq!(team_run.payload["success"], 1);
+        assert_eq!(
+            store.intents(task.id)[0].state,
+            IntentState::Done,
+            "the pause comes after the manager/worker round finished"
+        );
     }
 
     /// A task's parallel capacity narrows a manager plan without stopping it,
