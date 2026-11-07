@@ -105,6 +105,12 @@ const MAX_TASK_LIMIT: i64 = 1_000;
 /// Page size of the work collections a task carries.
 const WORK_LIMIT: i64 = 1_000;
 
+/// Default page size of `GET /api/tasks/{id}/swarm-messages`.
+const DEFAULT_SWARM_MESSAGE_LIMIT: i64 = 200;
+
+/// Largest page size a caller may ask for on the swarm message route.
+const MAX_SWARM_MESSAGE_LIMIT: i64 = 1_000;
+
 /// How often the `GET /api/stream` handler polls the activity log.
 pub const STREAM_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -128,6 +134,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}/work", get(get_task_work))
         .route("/api/tasks/{id}/activity", get(get_task_activity))
         .route("/api/tasks/{id}/usage", get(get_task_usage))
+        .route(
+            "/api/tasks/{id}/swarm-messages",
+            get(get_task_swarm_messages),
+        )
         .route(
             "/api/tasks/{id}/side-questions",
             get(side_questions::list_side_questions).post(side_questions::ask_side_question),
@@ -387,6 +397,12 @@ struct DeleteTasksResponse {
 /// `GET /api/tasks` query string.
 #[derive(Debug, Default, Deserialize)]
 struct ListTasksQuery {
+    limit: Option<i64>,
+}
+
+/// `GET /api/tasks/{id}/swarm-messages` query string.
+#[derive(Debug, Default, Deserialize)]
+struct SwarmMessagesQuery {
     limit: Option<i64>,
 }
 
@@ -1659,6 +1675,26 @@ async fn get_task_usage(
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(json!({ "runs": runs })))
+}
+
+/// `GET /api/tasks/{id}/swarm-messages`: the DHI+ swarm audit log of a task,
+/// ordered by id. `limit` defaults to 200 and is clamped to `1..=1000`.
+async fn get_task_swarm_messages(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Query(query): Query<SwarmMessagesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_task(state.store.as_ref(), id).await?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_SWARM_MESSAGE_LIMIT)
+        .clamp(1, MAX_SWARM_MESSAGE_LIMIT);
+    let messages = state
+        .store
+        .list_swarm_messages(id, limit)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({ "messages": messages })))
 }
 
 /// `GET /api/approvals`: the pending approval queue of every task, enriched
@@ -4293,9 +4329,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_task_swarm_messages_orders_by_id() {
+        let store = Arc::new(MemoryStore::new());
+        let created = store.seed_task("split the swarm", 4);
+        let intent = store.seed_intent(created.id, created.origin_fact_id, "run the swarm");
+        let store_trait: Arc<dyn GraphStore> = store.clone();
+        for index in 0..3 {
+            GraphStore::append_swarm_message(
+                store_trait.as_ref(),
+                created.id,
+                intent.id,
+                "finding",
+                json!({ "index": index }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let app = router(test_state_with_store(store));
+        let (status, json) = send(
+            app,
+            get_uri(&format!("/api/tasks/{}/swarm-messages", created.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let messages = json["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        let ids: Vec<i64> = messages
+            .iter()
+            .map(|message| message["id"].as_i64().unwrap())
+            .collect();
+        assert!(
+            ids.windows(2).all(|pair| pair[0] < pair[1]),
+            "messages are ordered by id: {ids:?}"
+        );
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(message["task_id"], created.id.to_string());
+            assert_eq!(message["intent_id"], intent.id.to_string());
+            assert_eq!(message["kind"], "finding");
+            assert_eq!(message["payload"]["index"], index as i64);
+            assert!(message["created_at"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn get_task_swarm_messages_empty_task_returns_empty_list() {
+        let store = Arc::new(MemoryStore::new());
+        let created = store.seed_task("no swarm yet", 2);
+
+        let app = router(test_state_with_store(store));
+        let (status, json) = send(
+            app,
+            get_uri(&format!("/api/tasks/{}/swarm-messages", created.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["messages"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn get_task_swarm_messages_clamps_limit() {
+        let store = Arc::new(MemoryStore::new());
+        let created = store.seed_task("many messages", 2);
+        let intent = store.seed_intent(created.id, created.origin_fact_id, "run the swarm");
+        let store_trait: Arc<dyn GraphStore> = store.clone();
+        for index in 0..1_005 {
+            GraphStore::append_swarm_message(
+                store_trait.as_ref(),
+                created.id,
+                intent.id,
+                "finding",
+                json!({ "index": index }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let app = router(test_state_with_store(store));
+
+        let (status, json) = send(
+            app.clone(),
+            get_uri(&format!("/api/tasks/{}/swarm-messages", created.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["messages"].as_array().unwrap().len(),
+            200,
+            "limit defaults to 200"
+        );
+
+        let (status, json) = send(
+            app.clone(),
+            get_uri(&format!("/api/tasks/{}/swarm-messages?limit=0", created.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["messages"].as_array().unwrap().len(),
+            1,
+            "limit below the range clamps to 1"
+        );
+
+        let (status, json) = send(
+            app,
+            get_uri(&format!(
+                "/api/tasks/{}/swarm-messages?limit=5000",
+                created.id
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            json["messages"].as_array().unwrap().len(),
+            1_000,
+            "limit above the range clamps to 1000"
+        );
+    }
+
+    #[tokio::test]
     async fn missing_task_returns_404() {
         let app = router(test_state());
-        for suffix in ["", "/work", "/activity"] {
+        for suffix in ["", "/work", "/activity", "/swarm-messages"] {
             let (status, json) = send(
                 app.clone(),
                 get_uri(&format!("/api/tasks/{}{suffix}", Uuid::new_v4())),
