@@ -3,17 +3,22 @@ import { afterEach, test } from "node:test";
 import {
   FEED_FALLBACK_ERROR_STREAK,
   FEED_GRAPH_REFRESH_DEBOUNCE_MS,
-  FEED_MAX_ROWS,
+  FEED_LIVE_COUNT,
   FEED_RECENT_COUNT,
   FEED_STREAM_RETRY_MS,
+  FEED_TOOL_PREVIEW_CHARS,
   activityActor,
   activityKindView,
+  activityToolIo,
   advanceFeedConnection,
   capTimeline,
   createLiveFeedController,
   formatFeedTime,
+  formatToolValue,
   mergeTimeline,
   prettyJson,
+  previewFeedText,
+  toolIoFullText,
   type FeedSignal,
   type LiveFeedSnapshot,
 } from "./feed.ts";
@@ -55,12 +60,20 @@ test("mergeTimeline stitches history and live rows ascending with a rising curso
 
 test("mergeTimeline dedupes overlaps: history wins and replays vanish", () => {
   // History 1..3 plus a stream replay of 2..4 (classic reconnect overlap).
-  const merged = mergeTimeline([act(1), act(2), act(3)], [act(2), act(3), act(4)], 0);
+  const merged = mergeTimeline(
+    [act(1), act(2), act(3)],
+    [act(2), act(3), act(4)],
+    0,
+  );
   assert.deepEqual(ids(merged.rows), [1, 2, 3, 4]);
   assert.equal(merged.cursor, 4);
 
   // Duplicate ids within one batch keep the FIRST occurrence.
-  const duped = mergeTimeline([], [act(7, { message: "first" }), act(7, { message: "second" })], 0);
+  const duped = mergeTimeline(
+    [],
+    [act(7, { message: "first" }), act(7, { message: "second" })],
+    0,
+  );
   assert.deepEqual(ids(duped.rows), [7]);
   assert.equal(duped.rows[0]?.message, "first");
   // The cursor counts SEEN rows: a duplicate still advances it.
@@ -84,11 +97,14 @@ test("mergeTimeline accepts out-of-order and interleaved arrivals", () => {
 test("mergeTimeline handles cursor-only starts and empty inputs", () => {
   assert.deepEqual(mergeTimeline([], [], 12), { rows: [], cursor: 12 });
   // INCOMING rows obey the cursor floor (the dedupe guard)…
-  assert.deepEqual(ids(mergeTimeline([], [act(1), act(2), act(3)], 2).rows), [3]);
-  // …while the CARRIED TIMELINE passes through untouched (never evicted).
-  assert.deepEqual(ids(mergeTimeline([act(1), act(2)], [act(3)], 2).rows), [
-    1, 2, 3,
+  assert.deepEqual(ids(mergeTimeline([], [act(1), act(2), act(3)], 2).rows), [
+    3,
   ]);
+  // …while the CARRIED TIMELINE passes through untouched (never evicted).
+  assert.deepEqual(
+    ids(mergeTimeline([act(1), act(2)], [act(3)], 2).rows),
+    [1, 2, 3],
+  );
   // The cursor still remembers floors even with no usable rows at all.
   assert.equal(mergeTimeline([], [], 5).cursor, 5);
 });
@@ -150,10 +166,15 @@ test("capTimeline keeps the newest window and counts hidden older rows", () => {
   assert.deepEqual(ids(capped.kept), [8, 9, 10, 11, 12]);
   assert.equal(capped.hidden, 7);
 
-  assert.deepEqual(capTimeline(rows, FEED_MAX_ROWS), { kept: rows, hidden: 0 });
+  const live = capTimeline(rows, FEED_LIVE_COUNT);
+  assert.deepEqual(ids(live.kept), [3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+  assert.equal(live.hidden, 2);
   assert.deepEqual(capTimeline([], FEED_RECENT_COUNT), { kept: [], hidden: 0 });
-  // Degenerate caps fall back to the default instead of hiding everything.
-  assert.deepEqual(ids(capTimeline(rows, 0).kept), ids(rows));
+  // Degenerate caps fall back to the live window instead of hiding everything.
+  assert.deepEqual(
+    ids(capTimeline(rows, 0).kept),
+    ids(rows.slice(-FEED_LIVE_COUNT)),
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -237,12 +258,80 @@ test("prettyJson expands payloads readably and survives junk", () => {
   assert.match(prettyJson(cyclic), /\[object Object\]|circular/);
 });
 
+test("tool input and output share one formatted view, including old rows", () => {
+  assert.equal(formatToolValue("ls -la"), "ls -la");
+  assert.equal(formatToolValue({ command: "ls" }), '{\n  "command": "ls"\n}');
+  assert.equal(
+    formatToolValue({ truncated: true, preview: "first 500 chars" }),
+    "first 500 chars\n… (truncated by the server)",
+  );
+  assert.equal(formatToolValue(null), null);
+  assert.equal(formatToolValue(undefined), null);
+
+  const fresh = activityToolIo(
+    act(1, {
+      kind: "tool_allowed",
+      payload: { tool: "shell", input: "ls", output: "a\nb" },
+    }),
+  );
+  assert.deepEqual(fresh, { input: "ls", output: "a\nb" });
+  assert.equal(toolIoFullText(fresh!), "Input:\nls\n\nOutput:\na\nb");
+
+  // Older rows predate the contract's `input`; output alone still renders.
+  const old = activityToolIo(
+    act(2, {
+      kind: "tool_allowed",
+      payload: { tool: "shell", output: { truncated: true, preview: "ok" } },
+    }),
+  );
+  assert.deepEqual(old, {
+    input: null,
+    output: "ok\n… (truncated by the server)",
+  });
+  assert.equal(
+    toolIoFullText(old!),
+    "Output:\nok\n… (truncated by the server)",
+  );
+
+  // Non-tool activity keeps the generic payload expansion.
+  assert.equal(
+    activityToolIo(act(3, { kind: "task_created", payload: { goal: "g" } })),
+    null,
+  );
+});
+
+test("previewFeedText truncates long input/output and flags expansion", () => {
+  assert.deepEqual(previewFeedText("short"), {
+    preview: "short",
+    truncated: false,
+  });
+  const long = "x".repeat(FEED_TOOL_PREVIEW_CHARS + 20);
+  const preview = previewFeedText(long);
+  assert.equal(preview.truncated, true);
+  assert.equal(preview.preview.length, FEED_TOOL_PREVIEW_CHARS);
+  assert.match(preview.preview, /…$/);
+  assert.deepEqual(previewFeedText("abcdef", 4), {
+    preview: "abc…",
+    truncated: true,
+  });
+  // Degenerate caps fall back to the documented preview length.
+  assert.equal(
+    previewFeedText(long, 0).preview.length,
+    FEED_TOOL_PREVIEW_CHARS,
+  );
+});
+
 // ---------------------------------------------------------------------------
 // advanceFeedConnection — indicator state machine
 // ---------------------------------------------------------------------------
 
 test("advanceFeedConnection goes live on hello from every state", () => {
-  for (const prev of ["connecting", "live", "reconnecting", "polling"] as const) {
+  for (const prev of [
+    "connecting",
+    "live",
+    "reconnecting",
+    "polling",
+  ] as const) {
     assert.deepEqual(advanceFeedConnection(prev, "hello", 3, 5), {
       state: "live",
       fallbackTriggered: false,
@@ -503,7 +592,8 @@ test("controller falls back to polling after persistent stream errors and wins t
   assert.equal(lastSnapshot(harness).connection, "polling");
   assert.ok(
     harness.signals.some(
-      (signal) => signal.kind === "connection" && signal.connection === "polling",
+      (signal) =>
+        signal.kind === "connection" && signal.connection === "polling",
     ),
     "the owning page hears about the fallback (poll suspension decision)",
   );
@@ -511,7 +601,10 @@ test("controller falls back to polling after persistent stream errors and wins t
   // The parked stream's connection is closed; the loader now drives rows.
   assert.equal(stream.closed, true);
   const polledCalls = harness.loader.callCount();
-  assert.ok(polledCalls >= 2, `immediate + interval polls ran (got ${polledCalls})`);
+  assert.ok(
+    polledCalls >= 2,
+    `immediate + interval polls ran (got ${polledCalls})`,
+  );
   await sleep(15);
   assert.deepEqual(ids(lastSnapshot(harness).rows), [1, 2, 3, 4]);
 
@@ -578,7 +671,10 @@ test("controller polls immediately on visibility while polling and skips ticks w
 });
 
 test("controller heals the timeline from history when the tab becomes visible while live", async () => {
-  const harness = makeHarness([[act(1), act(2), act(3)], [act(1), act(2), act(3)]]);
+  const harness = makeHarness([
+    [act(1), act(2), act(3)],
+    [act(1), act(2), act(3)],
+  ]);
   await sleep(20);
 
   const stream = FakeEventSource.last;
@@ -661,8 +757,9 @@ test("controller stops cleanly on dispose", async () => {
 });
 
 test("feed tunables keep the documented cadences", () => {
-  assert.equal(FEED_MAX_ROWS, 500);
+  assert.equal(FEED_LIVE_COUNT, 10);
   assert.equal(FEED_RECENT_COUNT, 10);
+  assert.equal(FEED_TOOL_PREVIEW_CHARS, 280);
   assert.equal(FEED_STREAM_RETRY_MS, 30_000);
   assert.equal(FEED_GRAPH_REFRESH_DEBOUNCE_MS, 2500);
 });

@@ -8,7 +8,12 @@
  */
 
 import { ApiError } from "./api.ts";
-import type { CreateTaskInput, Health, JsonObject } from "./types.ts";
+import type {
+  CreateTaskInput,
+  Health,
+  JsonObject,
+  TaskTopology,
+} from "./types.ts";
 
 /** The three visual states of the DHI brand-status block. */
 export type ServiceState = "healthy" | "error" | "loading";
@@ -191,7 +196,50 @@ export type CreateFormValues = {
   goal: string;
   plannerPin: string;
   workerPin: string;
+  /** Create-form topology value; omitted/blank means "let the planner decide". */
+  topology?: string;
 };
+
+/** Select options for the create-task topology picker, in display order. */
+export const TOPOLOGY_OPTIONS = [
+  { value: "", label: "Let planner decide" },
+  { value: "single", label: "Single agent" },
+  { value: "manager_worker", label: "Multi agent" },
+  { value: "swarm", label: "Swarm" },
+] as const;
+
+/** Human label for a task topology (or `null` for "planner decides"). */
+export function topologyLabel(topology: TaskTopology | null): string | null {
+  switch (topology) {
+    case "single":
+      return "Single agent";
+    case "manager_worker":
+      return "Multi agent";
+    case "swarm":
+      return "Swarm";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Maps the create-form topology `<select>` value onto the wire enum.
+ * Anything blank or unrecognized means the planner decides (`null`).
+ */
+export function parseTopology(
+  raw: string | null | undefined,
+): TaskTopology | null {
+  switch ((raw ?? "").trim().toLowerCase()) {
+    case "single":
+      return "single";
+    case "manager_worker":
+      return "manager_worker";
+    case "swarm":
+      return "swarm";
+    default:
+      return null;
+  }
+}
 
 export type CreateFormResult =
   | { ok: true; input: CreateTaskInput }
@@ -203,7 +251,9 @@ export type CreateFormResult =
  * - the goal is trimmed; empty (after trim) refuses submission;
  * - pins map through {@link parsePin}; unset pins are OMITTED from the body
  *   entirely so the server defaults apply (matching the "omits absent pin
- *   fields" behavior covered in api.test.ts).
+ *   fields" behavior covered in api.test.ts);
+ * - topology is ALWAYS sent: `null` for "let the planner decide", otherwise
+ *   the selected enum value.
  */
 export function buildCreateTaskInput(
   values: CreateFormValues,
@@ -214,6 +264,7 @@ export function buildCreateTaskInput(
   }
   const input: CreateTaskInput = {
     goal: values.goal.trim(),
+    topology: parseTopology(values.topology),
   };
   const planner = parsePin(values.plannerPin);
   if (planner !== null) {

@@ -530,6 +530,88 @@ async fn task_capacity_defaults_round_trips_and_updates(pool: PgPool) {
     );
 }
 
+/// Topology is creation-time data: it round-trips through every task read
+/// path and survives capacity writes and a reopen unchanged.
+#[sqlx::test]
+async fn task_topology_round_trips_and_survives_capacity_and_reopen(pool: PgPool) {
+    let store = Store::new(pool);
+
+    let plain = store.create_task("no topology").await.unwrap();
+    assert_eq!(plain.topology, None);
+    assert_eq!(
+        store
+            .get_task(plain.id)
+            .await
+            .unwrap()
+            .expect("task exists")
+            .topology,
+        None
+    );
+
+    let task = store
+        .create_task_with_pins("swarm task", None, None, Some(Topology::Swarm))
+        .await
+        .unwrap();
+    assert_eq!(task.topology, Some(Topology::Swarm));
+    assert_eq!(
+        store
+            .get_task(task.id)
+            .await
+            .unwrap()
+            .expect("task exists")
+            .topology,
+        Some(Topology::Swarm),
+        "get_task keeps topology"
+    );
+    assert_eq!(
+        store
+            .list_tasks(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == task.id)
+            .expect("task is listed")
+            .topology,
+        Some(Topology::Swarm),
+        "list_tasks keeps topology"
+    );
+
+    let updated = store
+        .set_task_capacity(
+            task.id,
+            TaskCapacity {
+                max_rounds: Some(2),
+                ..TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        updated.topology,
+        Some(Topology::Swarm),
+        "capacity must not rewrite topology"
+    );
+
+    dhi_core::GraphStore::set_task_state_guarded(&store, task.id, TaskState::Running)
+        .await
+        .unwrap();
+    dhi_core::GraphStore::set_task_state_guarded(&store, task.id, TaskState::Done)
+        .await
+        .unwrap();
+    let reopened = store
+        .reopen_task_with_goal(task.id, "a new goal")
+        .await
+        .unwrap();
+    let dhi_core::ReopenOutcome::Reopened { task, .. } = reopened else {
+        panic!("a terminal task must reopen");
+    };
+    assert_eq!(
+        task.topology,
+        Some(Topology::Swarm),
+        "reopen keeps topology"
+    );
+}
+
 /// An unknown task is a normal not-found error, not a panic.
 #[sqlx::test]
 async fn set_task_capacity_unknown_task_is_not_found(pool: PgPool) {

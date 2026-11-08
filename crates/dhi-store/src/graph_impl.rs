@@ -25,8 +25,9 @@ impl GraphStore for Store {
         goal: String,
         planner_pin: Option<i64>,
         worker_pin: Option<i64>,
+        topology: Option<dhi_core::Topology>,
     ) -> anyhow::Result<Task> {
-        Ok(Store::create_task_with_pins(self, &goal, planner_pin, worker_pin).await?)
+        Ok(Store::create_task_with_pins(self, &goal, planner_pin, worker_pin, topology).await?)
     }
 
     async fn get_task(&self, id: TaskId) -> anyhow::Result<Option<Task>> {

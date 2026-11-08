@@ -65,6 +65,49 @@ fn confirmed_fact_count(facts: &[Fact]) -> usize {
         .count()
 }
 
+/// Caps one `tool_allowed` activity payload's tool value preview. The durable
+/// `tool_calls` row keeps the full value; the feed only shows a short preview.
+fn activity_preview(value: &serde_json::Value) -> serde_json::Value {
+    const MAX_CHARS: usize = 500;
+    let text = match value {
+        serde_json::Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    if text.chars().count() <= MAX_CHARS {
+        value.clone()
+    } else {
+        serde_json::json!({
+            "truncated": true,
+            "preview": text.chars().take(MAX_CHARS).collect::<String>(),
+        })
+    }
+}
+
+/// Enforce the task's creation-time topology on the planner's plan.
+///
+/// The planner tool guard already rejects most violations; this second check
+/// protects every other `AgentRuntime` and fails the task with a visible
+/// reason instead of executing a plan the user did not ask for.
+fn enforce_required_topology(
+    required: Option<Topology>,
+    plan: Option<IntentPlan>,
+) -> Result<Option<IntentPlan>, String> {
+    match required {
+        None => Ok(plan),
+        Some(Topology::Single) => Ok(None),
+        Some(required) => match plan {
+            Some(plan) if plan.topology == required => Ok(Some(plan)),
+            Some(plan) => Err(format!(
+                "required topology {required}, but the planner declared {}",
+                plan.topology
+            )),
+            None => Err(format!(
+                "required topology {required}, but the planner supplied no plan"
+            )),
+        },
+    }
+}
+
 /// Fact context for one DHI+ subworker.
 ///
 /// The origin fact is the task's full goal text and names every worker and
@@ -1023,6 +1066,7 @@ impl Engine {
                         open_intents: 0,
                         failures,
                         planner_profile_id: task.pinned_planner_profile_id,
+                        required_topology: task.topology,
                     })
                     .await
                 {
@@ -1136,6 +1180,14 @@ impl Engine {
                         anyhow::bail!("{message}");
                     }
                     PlanOutcome::AddIntent { description, plan } => {
+                        let plan = match enforce_required_topology(task.topology, plan) {
+                            Ok(plan) => plan,
+                            Err(reason) => {
+                                self.fail_task(task_id, &mut task, reason.clone(), "topology")
+                                    .await?;
+                                anyhow::bail!("{reason}");
+                            }
+                        };
                         if rounds >= round_limit {
                             if capacity.max_rounds.is_some() {
                                 return self
@@ -1855,6 +1907,7 @@ impl Engine {
                     let mut payload = serde_json::json!({
                         "intent_id": intent_id,
                         "tool": tool,
+                        "input": activity_preview(&request.input),
                         "output": output,
                     });
                     if let Some(worker_key) = worker_key {
@@ -2702,6 +2755,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn engine_fails_a_plan_that_does_not_match_the_required_topology() {
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            "split the work".to_string(),
+            None,
+            None,
+            Some(Topology::Swarm),
+        )
+        .await
+        .unwrap();
+        let agent = Arc::new(ScriptedAgent::new(
+            vec![planned_intent(
+                "split the work",
+                two_worker_plan("split the work", Topology::ManagerWorker),
+            )],
+            vec![],
+        ));
+        let engine = Engine::new(store.clone(), agent);
+
+        let err = engine
+            .run_task(task.id)
+            .await
+            .expect_err("a mismatched plan fails the task");
+        assert!(err.to_string().contains("required topology swarm"), "{err}");
+
+        let row = store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Failed);
+        let failed = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "task_failed")
+            .expect("task_failed activity");
+        assert_eq!(failed.payload["source"], "topology");
+        assert!(
+            failed.payload["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("manager_worker"),
+            "{failed:?}"
+        );
+        assert!(
+            store.intents(task.id).is_empty(),
+            "the mismatched plan must not create an intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_ignores_a_plan_when_single_is_required() {
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            "just do it".to_string(),
+            None,
+            None,
+            Some(Topology::Single),
+        )
+        .await
+        .unwrap();
+        let goal = seed_goal(&store, &task).await;
+        let agent = Arc::new(ScriptedAgent::with_plans(
+            vec![
+                ScriptedPlan::Outcome(planned_intent(
+                    "do it single",
+                    two_worker_plan("do it single", Topology::Swarm),
+                )),
+                ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+            ],
+            vec![execute_output("done single", vec![])],
+        ));
+        let engine = Engine::new(store.clone(), agent);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(result.task.topology, Some(Topology::Single));
+        let intents = store.intents(task.id);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            store.get_intent_plan(intents[0].id).await.unwrap(),
+            None,
+            "single ignores the planner's plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn planner_receives_the_task_topology() {
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            "swarm task".to_string(),
+            None,
+            None,
+            Some(Topology::Swarm),
+        )
+        .await
+        .unwrap();
+        let goal = seed_goal(&store, &task).await;
+        let agent = Arc::new(ScriptedAgent::with_plans(
+            vec![ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id }],
+            vec![],
+        ));
+        let engine = Engine::new(store.clone(), Arc::clone(&agent) as Arc<dyn AgentRuntime>);
+
+        let _ = engine.run_task(task.id).await;
+
+        assert_eq!(
+            agent.plan_inputs()[0].required_topology,
+            Some(Topology::Swarm)
+        );
+    }
+
+    #[tokio::test]
     async fn planner_give_up_fails_the_task_with_a_visible_reason() {
         let store = Arc::new(MemoryStore::new());
         let task = store.seed_task("impossible task");
@@ -2999,6 +3165,7 @@ mod tests {
         let activities = store.activities(task.id);
         assert!(activities.iter().any(|a| a.kind == "tool_allowed"
             && a.payload["tool"] == "createGame"
+            && a.payload["input"] == json!({"color": "white"})
             && a.payload["output"]["result"]["game_id"] == "g-1"));
 
         let intents = store.intents(task.id);
@@ -4192,9 +4359,10 @@ mod tests {
             goal: String,
             planner_pin: Option<i64>,
             worker_pin: Option<i64>,
+            topology: Option<dhi_core::Topology>,
         ) -> anyhow::Result<Task> {
             self.inner
-                .create_task_with_pins(goal, planner_pin, worker_pin)
+                .create_task_with_pins(goal, planner_pin, worker_pin, topology)
                 .await
         }
 

@@ -213,6 +213,7 @@ impl GraphStore for MemoryStore {
         goal: String,
         planner_pin: Option<i64>,
         worker_pin: Option<i64>,
+        topology: Option<dhi_core::Topology>,
     ) -> anyhow::Result<Task> {
         let task = self.create_task(goal).await?;
         let mut inner = self.inner.lock().unwrap();
@@ -222,10 +223,12 @@ impl GraphStore for MemoryStore {
             .expect("the task create just inserted the row");
         stored.pinned_planner_profile_id = planner_pin;
         stored.pinned_worker_profile_id = worker_pin;
+        stored.topology = topology;
         drop(inner);
         let mut task = task;
         task.pinned_planner_profile_id = planner_pin;
         task.pinned_worker_profile_id = worker_pin;
+        task.topology = topology;
         Ok(task)
     }
 

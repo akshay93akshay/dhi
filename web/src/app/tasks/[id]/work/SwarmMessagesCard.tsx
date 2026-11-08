@@ -1,15 +1,19 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { MessageSquareText, RefreshCw } from "lucide-react";
+import { ChevronDown, MessageSquareText, RefreshCw } from "lucide-react";
 
 import { getSwarmMessages } from "@/lib/api";
 import { formatLocalClock, formatLocalTimestamp } from "@/lib/localTime";
 import { describeApiError } from "@/lib/ui";
 import {
+  groupSwarmMessages,
   parseSwarmMessages,
   swarmKindLabel,
+  swarmMessageCounts,
   type SwarmMessageView,
+  type SwarmRoundGroup,
+  type SwarmWorkerGroup,
 } from "@/lib/workTeam";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -20,11 +24,10 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { CopyButton } from "@/components/ui/copy-button";
 
 /** Badge tone per persisted swarm kind; unknown kinds stay neutral. */
-function kindVariant(
-  kind: string,
-): "success" | "info" | "warning" | "muted" {
+function kindVariant(kind: string): "success" | "info" | "warning" | "muted" {
   switch (kind.toLowerCase()) {
     case "finding":
       return "success";
@@ -37,20 +40,138 @@ function kindVariant(
   }
 }
 
+function KindCounts(props: { counts: Record<string, number> }) {
+  const entries = Object.entries(props.counts).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  );
+  return (
+    <>
+      {entries.map(([kind, count]) => (
+        <Badge key={kind} variant={kindVariant(kind)} className="font-normal">
+          {count} {swarmKindLabel(kind).toLowerCase()}
+        </Badge>
+      ))}
+    </>
+  );
+}
+
+function SwarmMessageRow(props: { message: SwarmMessageView }) {
+  const { message } = props;
+  return (
+    <li>
+      <details className="group rounded-md border border-border bg-card">
+        <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-2 gap-y-1 px-2.5 py-1.5 [&::-webkit-details-marker]:hidden">
+          <Badge className="font-normal" variant={kindVariant(message.kind)}>
+            {swarmKindLabel(message.kind)}
+          </Badge>
+          <span className="text-[11px] text-muted-foreground">
+            from{" "}
+            <span className="mono font-medium text-foreground">
+              {message.from ?? "unknown"}
+            </span>
+          </span>
+          <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground">
+            {message.summary}
+          </span>
+          <span
+            className="text-[10.5px] text-muted-foreground"
+            title={
+              message.createdAt === ""
+                ? undefined
+                : formatLocalTimestamp(message.createdAt)
+            }
+          >
+            {message.createdAt === ""
+              ? "—"
+              : formatLocalClock(message.createdAt)}
+          </span>
+          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+        </summary>
+        <div className="border-t border-border px-3 py-2">
+          <pre className="pre mt-0 max-h-80 overflow-auto">
+            {message.fullText}
+          </pre>
+          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10.5px] text-muted-foreground">
+            <span>
+              intent{" "}
+              <span className="mono" title={message.intentId || undefined}>
+                {message.intentShort === "" ? "—" : message.intentShort}
+              </span>
+            </span>
+            {message.subtaskId !== null ? (
+              <span>
+                subtask <span className="mono">{message.subtaskId}</span>
+              </span>
+            ) : null}
+            <CopyButton
+              className="ml-auto"
+              text={message.fullText}
+              label="swarm message"
+              size="icon"
+            />
+          </div>
+        </div>
+      </details>
+    </li>
+  );
+}
+
+function SwarmRoundSection(props: { group: SwarmRoundGroup }) {
+  const { group } = props;
+  return (
+    <div className="mt-2">
+      <div className="flex flex-wrap items-center gap-1.5 px-0.5">
+        <span className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+          {group.round === null ? "Round ?" : `Round ${group.round}`}
+        </span>
+        <Badge variant="outline" className="font-mono font-normal">
+          {group.counts.total}
+        </Badge>
+        <KindCounts counts={group.counts.byKind} />
+      </div>
+      <ul className="mt-1.5 space-y-1.5">
+        {group.messages.map((message) => (
+          <SwarmMessageRow key={message.id} message={message} />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function SwarmWorkerSection(props: { group: SwarmWorkerGroup }) {
+  const { group } = props;
+  return (
+    <section className="rounded-lg border border-border bg-surface-subtle px-2.5 py-2.5">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="mono text-[12px] font-semibold">{group.worker}</span>
+        <Badge variant="outline" className="font-normal">
+          {group.counts.total} message{group.counts.total === 1 ? "" : "s"}
+        </Badge>
+        <span className="text-[10.5px] text-muted-foreground">
+          {group.rounds.length} round{group.rounds.length === 1 ? "" : "s"}
+        </span>
+        <KindCounts counts={group.counts.byKind} />
+      </div>
+      {group.rounds.map((round) => (
+        <SwarmRoundSection
+          key={`${group.worker}:${round.round ?? "unknown"}`}
+          group={round}
+        />
+      ))}
+    </section>
+  );
+}
+
 /**
- * Compact audit log of a task's DHI+ swarm broadcasts.
+ * Grouped audit view of a task's DHI+ swarm broadcasts.
  *
- * It fetches once automatically when the work view has already seen a swarm
- * `team_run` (`autoLoad`), otherwise behind the explicit button. There is no
- * polling: refresh is manual and in-flight responses are sequence-guarded.
+ * Messages are grouped by worker and then by swarm round; each row shows the
+ * type, sender, and a short summary, and expands to the untruncated text.
+ * There is no polling: the tab fetch runs on mount and refresh is manual.
  */
-export function SwarmMessagesCard(props: {
-  taskId: string;
-  autoLoad: boolean;
-}) {
-  const { taskId, autoLoad } = props;
+export function SwarmMessagesCard(props: { taskId: string }) {
+  const { taskId } = props;
   const [messages, setMessages] = useState<SwarmMessageView[] | null>(null);
-  const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -74,7 +195,6 @@ export function SwarmMessagesCard(props: {
         return;
       }
       setMessages(parseSwarmMessages(records));
-      setLoaded(true);
     } catch (err) {
       if (!mounted.current || token !== seq.current) {
         return;
@@ -87,21 +207,21 @@ export function SwarmMessagesCard(props: {
     }
   }, [taskId]);
 
-  // Reset local state when the route moves to another task (the parent also
-  // keys this card, but the guard keeps it correct on its own).
+  // Reset local state when the route moves to another task; the parent also
+  // keys this card, but the guard keeps it correct on its own.
   useEffect(() => {
     seq.current += 1;
     setMessages(null);
-    setLoaded(false);
     setLoading(false);
     setError(null);
   }, [taskId]);
 
   useEffect(() => {
-    if (autoLoad) {
-      void load();
-    }
-  }, [autoLoad, load]);
+    void load();
+  }, [load]);
+
+  const groups = messages === null ? [] : groupSwarmMessages(messages);
+  const counts = swarmMessageCounts(messages ?? []);
 
   return (
     <Card>
@@ -113,14 +233,14 @@ export function SwarmMessagesCard(props: {
           <div>
             <CardTitle className="text-base">Swarm messages</CardTitle>
             <CardDescription className="mt-0.5">
-              Typed peer broadcasts from DHI<sup>+</sup> swarm runs.
+              Typed peer broadcasts grouped by worker and round.
             </CardDescription>
           </div>
         </div>
         <div className="flex items-center gap-2">
-          {loaded && messages !== null ? (
+          {messages !== null ? (
             <Badge variant="outline" className="font-mono font-normal">
-              {messages.length}
+              {counts.total}
             </Badge>
           ) : null}
           <Button
@@ -134,11 +254,7 @@ export function SwarmMessagesCard(props: {
             <RefreshCw
               className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`}
             />
-            {loading
-              ? "Loading…"
-              : loaded || error !== null
-                ? "Refresh"
-                : "Load swarm messages"}
+            {loading ? "Loading…" : messages !== null ? "Refresh" : "Load"}
           </Button>
         </div>
       </CardHeader>
@@ -153,59 +269,32 @@ export function SwarmMessagesCard(props: {
           <p className="empty">Loading swarm messages…</p>
         ) : null}
 
-        {!loading && loaded && messages !== null && messages.length === 0 ? (
+        {messages !== null && messages.length === 0 ? (
           <div className="rounded-lg border border-dashed border-border bg-surface-subtle px-4 py-6 text-center text-xs text-muted-foreground">
-            No swarm messages
+            No swarm messages recorded for this task.
           </div>
         ) : null}
 
         {messages !== null && messages.length > 0 ? (
-          <ul className="space-y-1.5">
-            {messages.map((message) => (
-              <li
-                className="rounded-lg border border-border bg-surface-subtle px-3 py-2"
-                key={message.id}
-              >
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                  <Badge
-                    className="font-normal"
-                    variant={kindVariant(message.kind)}
-                  >
-                    {swarmKindLabel(message.kind)}
-                  </Badge>
-                  {message.from !== null ? (
-                    <span className="text-[11px] text-muted-foreground">
-                      from{" "}
-                      <span className="mono font-medium text-foreground">
-                        {message.from}
-                      </span>
-                    </span>
-                  ) : null}
-                  <span
-                    className="mono text-[10.5px] text-muted-foreground"
-                    title={message.intentId === "" ? undefined : message.intentId}
-                  >
-                    intent {message.intentShort === "" ? "—" : message.intentShort}
-                  </span>
-                  <span
-                    className="ml-auto text-[10.5px] text-muted-foreground"
-                    title={
-                      message.createdAt === ""
-                        ? undefined
-                        : formatLocalTimestamp(message.createdAt)
-                    }
-                  >
-                    {message.createdAt === ""
-                      ? "—"
-                      : formatLocalClock(message.createdAt)}
-                  </span>
-                </div>
-                <p className="mt-1 break-words text-[12px] leading-5">
-                  {message.summary}
-                </p>
-              </li>
-            ))}
-          </ul>
+          <>
+            <div className="mb-3 flex flex-wrap items-center gap-1.5">
+              <Badge variant="outline" className="font-normal">
+                {counts.total} message{counts.total === 1 ? "" : "s"}
+              </Badge>
+              <Badge variant="outline" className="font-normal">
+                {counts.workers} worker{counts.workers === 1 ? "" : "s"}
+              </Badge>
+              <Badge variant="outline" className="font-normal">
+                {counts.rounds} round{counts.rounds === 1 ? "" : "s"}
+              </Badge>
+              <KindCounts counts={counts.byKind} />
+            </div>
+            <div className="space-y-2.5">
+              {groups.map((group) => (
+                <SwarmWorkerSection key={group.worker} group={group} />
+              ))}
+            </div>
+          </>
         ) : null}
       </CardContent>
     </Card>

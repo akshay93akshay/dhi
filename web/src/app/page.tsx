@@ -7,6 +7,7 @@ import { Plus } from "lucide-react";
 import { createTask, getHealth, listProfiles } from "@/lib/api";
 import type { Health, LlmProfile } from "@/lib/types";
 import {
+  TOPOLOGY_OPTIONS,
   buildCreateTaskInput,
   describeApiError,
   serviceState,
@@ -118,6 +119,7 @@ function CreateTaskCard(props: {
   const [goal, setGoal] = useState("");
   const [plannerPin, setPlannerPin] = useState("");
   const [workerPin, setWorkerPin] = useState("");
+  const [topology, setTopology] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const activityTimeoutRef = useRef<number | null>(null);
@@ -155,7 +157,12 @@ function CreateTaskCard(props: {
     event.preventDefault();
     reportActivity("submit");
     setFormError(null);
-    const parsed = buildCreateTaskInput({ goal, plannerPin, workerPin });
+    const parsed = buildCreateTaskInput({
+      goal,
+      plannerPin,
+      workerPin,
+      topology,
+    });
     if (!parsed.ok) {
       setFormError(parsed.error);
       reportTimedActivity("error", 2_600);
@@ -190,7 +197,10 @@ function CreateTaskCard(props: {
         </div>
       </CardHeader>
       <CardContent className="flex-1 pt-4">
-        <form onSubmit={(event) => void handleSubmit(event)} className="space-y-4">
+        <form
+          onSubmit={(event) => void handleSubmit(event)}
+          className="space-y-4"
+        >
           <div className="space-y-1.5">
             <label
               className="text-xs font-semibold text-foreground"
@@ -285,6 +295,35 @@ function CreateTaskCard(props: {
               </div>
             </div>
           ) : null}
+
+          <div className="space-y-1.5">
+            <label
+              className="text-xs font-semibold text-foreground"
+              htmlFor="create-topology"
+            >
+              Topology
+            </label>
+            <select
+              id="create-topology"
+              className="h-9 w-full rounded-md border-input bg-card text-[13px]"
+              value={topology}
+              onChange={(event) => {
+                setTopology(event.target.value);
+                if (formError !== null) {
+                  setFormError(null);
+                }
+              }}
+            >
+              {TOPOLOGY_OPTIONS.map((option) => (
+                <option key={option.label} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+            <p className="text-[11px] leading-4 text-muted-foreground">
+              Unset lets the planner choose the topology per intent.
+            </p>
+          </div>
 
           {formError !== null ? (
             <div

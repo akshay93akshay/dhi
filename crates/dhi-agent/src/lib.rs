@@ -76,6 +76,11 @@ pub struct PlanInput {
     /// task row. `None` follows the planner's default chain.
     #[serde(default)]
     pub planner_profile_id: Option<i64>,
+    /// The topology the user required at task creation. `None` leaves the
+    /// plan optional; a present value is a hard requirement the planner tool
+    /// guard enforces before the engine sees the plan.
+    #[serde(default)]
+    pub required_topology: Option<dhi_core::Topology>,
 }
 
 /// What one planner call decided.
@@ -982,6 +987,9 @@ impl RigAgentRuntime {
             facts: fact_lines(&input.facts),
             open_intents: input.open_intents,
             failures: failure_lines(&input.failures),
+            required_topology: input
+                .required_topology
+                .map_or_else(|| "none".to_string(), |topology| topology.to_string()),
         };
         let (system, user) = self.prompts.render_planner(&vars)?;
         Ok(self.rendered(Role::Planner, system, user))
@@ -1406,9 +1414,19 @@ fn fallback_prompts() -> PromptSet {
 #[derive(Default)]
 struct PlannerSink {
     outcome: Arc<Mutex<Option<PlanOutcome>>>,
+    /// Enforced inside the `add_intent` tool closure so a plan-less or
+    /// mismatched call is a tool error the model can retry in the same run.
+    required_topology: Option<dhi_core::Topology>,
 }
 
 impl PlannerSink {
+    fn with_required_topology(required_topology: Option<dhi_core::Topology>) -> Self {
+        Self {
+            outcome: Arc::default(),
+            required_topology,
+        }
+    }
+
     fn finish(&self, text: &str) -> PlanOutcome {
         if let Ok(slot) = self.outcome.lock()
             && let Some(outcome) = slot.as_ref()
@@ -1427,6 +1445,7 @@ impl PlannerSink {
     }
 
     fn tools(&self) -> anyhow::Result<Vec<DynamicTool>> {
+        let required_topology = self.required_topology;
         let add_name = ToolName::new("add_intent")
             .map_err(|err| anyhow::anyhow!("invalid planner tool name: {err}"))?;
         let prove_name = ToolName::new("prove_goal")
@@ -1531,7 +1550,14 @@ impl PlannerSink {
                                 "description must be a non-empty string",
                             )
                         })?;
-                    let plan = parse_plan_arg(&args, description)?;
+                    let plan = if required_topology == Some(dhi_core::Topology::Single) {
+                        // Single is an instruction to the engine: a supplied
+                        // plan is ignored entirely, even if malformed.
+                        None
+                    } else {
+                        let plan = parse_plan_arg(&args, description)?;
+                        enforce_required_topology(required_topology, plan)?
+                    };
                     record_plan(
                         &sink,
                         PlanOutcome::AddIntent {
@@ -1663,6 +1689,32 @@ fn parse_uuid_arg(args: &serde_json::Value, key: &str) -> Result<Uuid, ToolExecu
         .ok_or_else(|| ToolExecutionError::invalid_args(format!("{key} must be a string")))?;
     Uuid::parse_str(raw)
         .map_err(|_| ToolExecutionError::invalid_args(format!("{key} must be a UUID")))
+}
+
+/// Enforce the selector's required topology on an `add_intent` plan.
+///
+/// `single` is an instruction to the engine, not a plan: any supplied plan is
+/// ignored. `manager_worker` and `swarm` require a plan whose topology matches
+/// exactly; a missing or mismatched plan is an invalid-args tool error so the
+/// model retries in the same run.
+fn enforce_required_topology(
+    required: Option<dhi_core::Topology>,
+    plan: Option<dhi_core::IntentPlan>,
+) -> Result<Option<dhi_core::IntentPlan>, ToolExecutionError> {
+    match required {
+        None => Ok(plan),
+        Some(dhi_core::Topology::Single) => Ok(None),
+        Some(required) => match plan {
+            Some(plan) if plan.topology == required => Ok(Some(plan)),
+            Some(plan) => Err(ToolExecutionError::invalid_args(format!(
+                "required topology {required}, but the plan declares {}; retry with a {required} plan",
+                plan.topology
+            ))),
+            None => Err(ToolExecutionError::invalid_args(format!(
+                "required topology {required} needs a plan with topology {required}; retry with a plan"
+            ))),
+        },
+    }
 }
 
 /// Parse and validate the optional planner plan.
@@ -1849,6 +1901,7 @@ fn record_worker_fact(
 impl AgentRuntime for RigAgentRuntime {
     async fn plan(&self, input: PlanInput) -> anyhow::Result<AgentCall<PlanOutcome>> {
         let call = self.render_plan(&input)?;
+        let required_topology = input.required_topology;
         // The planner runs no guarded tools: no scope, no registry churn.
         let (text, response, latency, candidate, sink) = self
             .complete_via_pool(
@@ -1857,7 +1910,7 @@ impl AgentRuntime for RigAgentRuntime {
                 &call,
                 ToolSetup::default(),
                 || {
-                    let sink = PlannerSink::default();
+                    let sink = PlannerSink::with_required_topology(required_topology);
                     let tools = sink.tools()?;
                     Ok((sink, tools))
                 },
@@ -2138,6 +2191,7 @@ mod tests {
             open_intents: 1,
             failures: vec![],
             planner_profile_id: None,
+            required_topology: None,
         }
     }
 
@@ -2497,6 +2551,155 @@ mod tests {
             }
         );
         plan.validate().expect("the accepted plan validates");
+    }
+
+    #[tokio::test]
+    async fn add_intent_requires_a_matching_plan_when_topology_is_required() {
+        for required in [dhi_core::Topology::ManagerWorker, dhi_core::Topology::Swarm] {
+            let sink = PlannerSink::with_required_topology(Some(required));
+            let tools = sink.tools().expect("planner tools build");
+            let err = tools[0]
+                .run(serde_json::json!({"description": "do it"}))
+                .await
+                .expect_err("a missing plan must be a tool error");
+            assert!(
+                format!("{err}").contains("required topology"),
+                "{required}: {err}"
+            );
+        }
+
+        let sink = PlannerSink::with_required_topology(Some(dhi_core::Topology::Swarm));
+        let tools = sink.tools().expect("planner tools build");
+        let err = tools[0]
+            .run(serde_json::json!({
+                "description": "review the patch",
+                "plan": {
+                    "topology": "manager_worker",
+                    "workers": [{
+                        "key": "worker-a",
+                        "role": "reviewer",
+                        "prompt": "review the patch",
+                        "max_turns": 4
+                    }],
+                    "subtasks": [{
+                        "id": "sub-1",
+                        "description": "review the change",
+                        "worker_key": "worker-a"
+                    }]
+                }
+            }))
+            .await
+            .expect_err("a mismatched plan must be a tool error");
+        assert!(
+            format!("{err}").contains("required topology swarm"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_intent_accepts_a_matching_plan_when_topology_is_required() {
+        let sink = PlannerSink::with_required_topology(Some(dhi_core::Topology::ManagerWorker));
+        let tools = sink.tools().expect("planner tools build");
+        tools[0]
+            .run(serde_json::json!({
+                "description": "review the patch",
+                "plan": {
+                    "topology": "manager_worker",
+                    "workers": [{
+                        "key": "worker-a",
+                        "role": "reviewer",
+                        "prompt": "review the patch",
+                        "max_turns": 4
+                    }],
+                    "subtasks": [{
+                        "id": "sub-1",
+                        "description": "review the change",
+                        "worker_key": "worker-a"
+                    }]
+                }
+            }))
+            .await
+            .expect("a matching plan is accepted");
+
+        let PlanOutcome::AddIntent {
+            plan: Some(plan), ..
+        } = sink.finish("ignored after a tool call")
+        else {
+            panic!("expected a plan");
+        };
+        assert_eq!(plan.topology, dhi_core::Topology::ManagerWorker);
+    }
+
+    #[tokio::test]
+    async fn add_intent_ignores_a_plan_when_single_is_required() {
+        let sink = PlannerSink::with_required_topology(Some(dhi_core::Topology::Single));
+        let tools = sink.tools().expect("planner tools build");
+        tools[0]
+            .run(serde_json::json!({
+                "description": "just do it",
+                "plan": {
+                    "topology": "swarm",
+                    "workers": [{
+                        "key": "worker-a",
+                        "role": "reviewer",
+                        "prompt": "review the patch",
+                        "max_turns": 4
+                    }],
+                    "subtasks": [{
+                        "id": "sub-1",
+                        "description": "review the change",
+                        "worker_key": "worker-a"
+                    }]
+                }
+            }))
+            .await
+            .expect("single accepts the call");
+
+        assert_eq!(
+            sink.finish("ignored after a tool call"),
+            PlanOutcome::AddIntent {
+                description: "just do it".to_string(),
+                plan: None,
+            },
+            "single must ignore the supplied plan"
+        );
+
+        let sink = PlannerSink::with_required_topology(Some(dhi_core::Topology::Single));
+        let tools = sink.tools().expect("planner tools build");
+        tools[0]
+            .run(serde_json::json!({
+                "description": "just do it",
+                "plan": {"topology": "mesh"}
+            }))
+            .await
+            .expect("single ignores even a malformed plan");
+        assert_eq!(
+            sink.finish("ignored after a tool call"),
+            PlanOutcome::AddIntent {
+                description: "just do it".to_string(),
+                plan: None,
+            }
+        );
+    }
+
+    #[test]
+    fn render_plan_states_the_required_topology() {
+        let runtime = runtime_with("planner-x", "worker-y");
+        let mut input = plan_input();
+        input.required_topology = Some(dhi_core::Topology::Swarm);
+
+        let call = runtime.render_plan(&input).expect("renders");
+
+        assert!(
+            call.user.contains("Required topology: swarm"),
+            "the user turn names the selector's topology: {}",
+            call.user
+        );
+        assert!(
+            call.system.contains("Required topology"),
+            "the protocol explains the requirement: {}",
+            call.system
+        );
     }
 
     #[tokio::test]

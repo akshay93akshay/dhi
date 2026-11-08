@@ -4,25 +4,33 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useParams, usePathname } from "next/navigation";
 import {
+  AlertTriangle,
   ArrowLeft,
   CheckCircle2,
   GitBranch,
   ListTree,
+  MessageSquareText,
   Radio,
 } from "lucide-react";
 
-import { ApiError, getTaskWork } from "@/lib/api";
-import type { Fact, ResultRecord, TaskWork } from "@/lib/types";
+import { ApiError, getTaskActivity, getTaskWork } from "@/lib/api";
+import type { Activity, Fact, ResultRecord, TaskWork } from "@/lib/types";
 import { FEED_GRAPH_REFRESH_DEBOUNCE_MS, type FeedSignal } from "@/lib/feed";
 import {
   describeApiError,
   renderProvenance,
   shortenId,
   taskIdFromPathname,
+  topologyLabel,
 } from "@/lib/ui";
 import { formatLocalTimestamp } from "@/lib/localTime";
 import { crumbTrailSegments } from "@/lib/nav";
-import { hasSwarmTopology } from "@/lib/workTeam";
+import {
+  capacityPauseNotice,
+  resolveTaskTopology,
+  taskUsesSwarm,
+  type CapacityPauseNotice,
+} from "@/lib/workTeam";
 import { Crumbs } from "@/app/_components/Crumbs";
 import { LiveActivityFeed } from "@/app/_components/ActivityLog";
 import { CopyButton } from "@/components/ui/copy-button";
@@ -43,6 +51,9 @@ import { SwarmMessagesCard } from "./SwarmMessagesCard";
 
 /** Poll cadence for the work view; suspended while the SSE stream is live. */
 const POLL_INTERVAL_MS = 5000;
+
+/** Tabs in the work view; Swarm is only offered for swarm tasks. */
+type WorkTab = "graph" | "activity" | "swarm";
 
 /**
  * Work view: goals, intents, facts, and results of one task, plus the live
@@ -67,6 +78,8 @@ function TaskWorkView() {
   const [loading, setLoading] = useState(true);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [streamLive, setStreamLive] = useState(false);
+  const [activityRows, setActivityRows] = useState<Activity[]>([]);
+  const [activeTab, setActiveTab] = useState<WorkTab>("graph");
 
   // Mirrors for closures that must read/write cross-cutting state without
   // re-subscribing the effect below (keyed on [id]).
@@ -83,14 +96,24 @@ function TaskWorkView() {
     let haveSnapshot = false;
     streamLiveRef.current = false;
     setStreamLive(false);
+    setActivityRows([]);
+    setActiveTab("graph");
 
     const load = async (): Promise<void> => {
       try {
-        const snapshot = await getTaskWork(id);
+        const [snapshot, rows] = await Promise.all([
+          getTaskWork(id),
+          // Activity failure must never hide the work graph; the notice and
+          // topology fallback simply stay unavailable until the next load.
+          getTaskActivity(id).catch(() => null),
+        ]);
         if (!mounted) {
           return;
         }
         setWork(snapshot);
+        if (rows !== null) {
+          setActivityRows(rows);
+        }
         setPollError(null);
         setPageError(null);
         setNotFound(false);
@@ -208,7 +231,8 @@ function TaskWorkView() {
         <Card>
           <CardContent className="pt-5">
             <p className="text-sm text-muted-foreground">
-              No task with id <code>{id}</code> exists, so there is no work graph to show.
+              No task with id <code>{id}</code> exists, so there is no work
+              graph to show.
             </p>
           </CardContent>
         </Card>
@@ -242,9 +266,27 @@ function TaskWorkView() {
       proofByFactId.set(goal.proof_fact_id, goal.description);
     }
   }
-  // The work API exposes no task-level topology; the team fact records the
-  // topology each DHI+ plan ran with, so a swarm task auto-loads its log.
-  const autoLoadSwarm = hasSwarmTopology(work.facts);
+  // `task.topology` is authoritative when present; older rows fall back to the
+  // latest team_run. The Swarm tab follows the same signal.
+  const effectiveTopology = resolveTaskTopology(
+    work.task.topology,
+    activityRows,
+  );
+  const topologyName = topologyLabel(effectiveTopology);
+  const swarmAvailable = taskUsesSwarm(work.task.topology, activityRows);
+  const capacityNotice = capacityPauseNotice(work.task, activityRows);
+  const shownTab: WorkTab =
+    activeTab === "swarm" && !swarmAvailable ? "graph" : activeTab;
+  // The live feed only exists on the Activity tab; leaving it unmounts the
+  // controller, which never emits a final connection signal. Clear the
+  // suspension flag here so the work graph poll resumes.
+  const selectTab = (tab: WorkTab): void => {
+    if (tab !== "activity") {
+      streamLiveRef.current = false;
+      setStreamLive(false);
+    }
+    setActiveTab(tab);
+  };
 
   return (
     <main className="space-y-5">
@@ -252,7 +294,8 @@ function TaskWorkView() {
 
       {pollError !== null ? (
         <div className="errorbox" role="alert">
-          Auto-refresh failed: {pollError} — keeping the last snapshot and retrying.
+          Auto-refresh failed: {pollError} — keeping the last snapshot and
+          retrying.
         </div>
       ) : null}
 
@@ -263,6 +306,11 @@ function TaskWorkView() {
         description={
           <span className="flex flex-wrap items-center gap-2">
             <StateBadge state={work.task.state} />
+            {topologyName !== null ? (
+              <Badge variant="outline" title="Task topology">
+                Topology: {topologyName}
+              </Badge>
+            ) : null}
             <span className="mono" title={work.task.id}>
               #{shortenId(work.task.id)}
             </span>
@@ -283,7 +331,7 @@ function TaskWorkView() {
           <>
             <Button asChild className="h-9 rounded-full">
               <Link href={`/tasks/${work.task.id}/graph`}>
-                <GitBranch className="h-3.5 w-3.5" /> Graph
+                <GitBranch className="h-3.5 w-3.5" /> Visual graph
               </Link>
             </Button>
             <Button asChild variant="outline" className="h-9 rounded-full">
@@ -300,6 +348,10 @@ function TaskWorkView() {
         }
       />
 
+      {capacityNotice !== null ? (
+        <CapacityNoticeBar notice={capacityNotice} />
+      ) : null}
+
       <CapacityCard
         task={work.task}
         onTaskUpdated={(updated) =>
@@ -309,138 +361,160 @@ function TaskWorkView() {
         }
       />
 
-      <SectionCard
-        title="Goals"
-        count={work.goals.length}
-        description="Outcomes the planner is trying to prove."
-      >
-        {work.goals.length === 0 ? (
-          <EmptyState message="No goals yet." />
-        ) : (
-          work.goals.map((goal) => (
-            <div
-              className="rounded-lg border border-border bg-surface-subtle px-3.5 py-3"
-              key={goal.id}
-            >
-              <div className="flex items-start justify-between gap-3">
-                <strong className="text-[13.5px] font-medium leading-5">
-                  {goal.description}
-                </strong>
-                <StateBadge state={goal.state} />
-              </div>
-              {goal.proof_fact_id !== null ? (
-                <p className="mt-2 flex items-center gap-1.5 text-[11px] text-success">
-                  <CheckCircle2 className="h-3 w-3" />
-                  Proved by fact{" "}
-                  <span className="mono" title={goal.proof_fact_id}>
-                    {shortenId(goal.proof_fact_id)}
-                  </span>
-                  (highlighted below)
-                </p>
-              ) : null}
-            </div>
-          ))
-        )}
-      </SectionCard>
-
-      <SectionCard
-        title="Intents"
-        count={work.intents.length}
-        description="Planner proposals; workers claim one and stop."
-      >
-        {work.intents.length === 0 ? (
-          <EmptyState message="No intents yet — the planner has not planned." />
-        ) : (
-          work.intents.map((intent) => (
-            <div
-              className="rounded-lg border border-border bg-surface-subtle px-3.5 py-3"
-              key={intent.id}
-            >
-              <div className="flex items-start justify-between gap-3">
-                <strong className="text-[13.5px] font-medium leading-5">
-                  {intent.description}
-                </strong>
-                <StateBadge state={intent.state} />
-              </div>
-              <p className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
-                <span className="mono" title={intent.id}>
-                  {shortenId(intent.id)}
-                </span>
-                <span>·</span>
-                <span>owner {intent.owner ?? "unclaimed"}</span>
-                <span>·</span>
-                <span>priority {intent.priority}</span>
-                {intent.completed_at !== null ? (
-                  <>
-                    <span>·</span>
-                    <span>completed {formatLocalTimestamp(intent.completed_at)}</span>
-                  </>
-                ) : null}
-              </p>
-            </div>
-          ))
-        )}
-      </SectionCard>
-
-      <LiveActivityFeed
-        taskId={work.task.id}
-        onSignal={(signal) => signalBridgeRef.current?.(signal)}
+      <WorkTabBar
+        active={shownTab}
+        onSelect={selectTab}
+        swarmAvailable={swarmAvailable}
       />
 
-      <SwarmMessagesCard
-        autoLoad={autoLoadSwarm}
-        key={work.task.id}
-        taskId={work.task.id}
-      />
-
-      <SectionCard
-        title="Facts"
-        count={work.facts.length}
-        description="Evidence the workers persisted; proven facts are highlighted."
-      >
-        {work.facts.length === 0 ? (
-          <EmptyState message="No facts recorded yet." />
-        ) : (
-          work.facts.map((fact) => (
-            <FactLine
-              key={fact.id}
-              fact={fact}
-              proofOf={proofByFactId.get(fact.id)}
-            />
-          ))
-        )}
-      </SectionCard>
-
-      {work.results.length > 0 ? (
-        <SectionCard
-          title="Results"
-          count={work.results.length}
-          description="Acceptance decisions with their supporting evidence."
-        >
-          {work.results.map((result) => (
-            <div
-              className="rounded-lg border border-border bg-surface-subtle px-3.5 py-3"
-              key={result.id}
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex min-w-0 items-start gap-1">
-                  <strong className="text-[13.5px] font-medium leading-5">{result.claim}</strong>
-                  <CopyButton text={result.claim} label="result claim" size="icon" />
+      {shownTab === "graph" ? (
+        <>
+          <SectionCard
+            title="Goals"
+            count={work.goals.length}
+            description="Outcomes the planner is trying to prove."
+          >
+            {work.goals.length === 0 ? (
+              <EmptyState message="No goals yet." />
+            ) : (
+              work.goals.map((goal) => (
+                <div
+                  className="rounded-lg border border-border bg-surface-subtle px-3.5 py-3"
+                  key={goal.id}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <strong className="text-[13.5px] font-medium leading-5">
+                      {goal.description}
+                    </strong>
+                    <StateBadge state={goal.state} />
+                  </div>
+                  {goal.proof_fact_id !== null ? (
+                    <p className="mt-2 flex items-center gap-1.5 text-[11px] text-success">
+                      <CheckCircle2 className="h-3 w-3" />
+                      Proved by fact{" "}
+                      <span className="mono" title={goal.proof_fact_id}>
+                        {shortenId(goal.proof_fact_id)}
+                      </span>
+                      (highlighted below)
+                    </p>
+                  ) : null}
                 </div>
-                <StateBadge state={result.acceptance} />
-              </div>
-              <p className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
-                <span>intent</span>
-                <span className="mono" title={result.intent_id}>
-                  {shortenId(result.intent_id)}
-                </span>
-                <span>·</span>
-                <span>{formatLocalTimestamp(result.created_at)}</span>
-              </p>
-              <EvidenceBlock evidence={result.evidence} />
-            </div>
-          ))}
-        </SectionCard>
+              ))
+            )}
+          </SectionCard>
+
+          <SectionCard
+            title="Intents"
+            count={work.intents.length}
+            description="Planner proposals; workers claim one and stop."
+          >
+            {work.intents.length === 0 ? (
+              <EmptyState message="No intents yet — the planner has not planned." />
+            ) : (
+              work.intents.map((intent) => (
+                <div
+                  className="rounded-lg border border-border bg-surface-subtle px-3.5 py-3"
+                  key={intent.id}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <strong className="text-[13.5px] font-medium leading-5">
+                      {intent.description}
+                    </strong>
+                    <StateBadge state={intent.state} />
+                  </div>
+                  <p className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <span className="mono" title={intent.id}>
+                      {shortenId(intent.id)}
+                    </span>
+                    <span>·</span>
+                    <span>owner {intent.owner ?? "unclaimed"}</span>
+                    <span>·</span>
+                    <span>priority {intent.priority}</span>
+                    {intent.completed_at !== null ? (
+                      <>
+                        <span>·</span>
+                        <span>
+                          completed {formatLocalTimestamp(intent.completed_at)}
+                        </span>
+                      </>
+                    ) : null}
+                  </p>
+                </div>
+              ))
+            )}
+          </SectionCard>
+        </>
+      ) : null}
+
+      {shownTab === "activity" ? (
+        <LiveActivityFeed
+          taskId={work.task.id}
+          onSignal={(signal) => signalBridgeRef.current?.(signal)}
+        />
+      ) : null}
+
+      {shownTab === "swarm" && swarmAvailable ? (
+        <SwarmMessagesCard key={work.task.id} taskId={work.task.id} />
+      ) : null}
+
+      {shownTab === "graph" ? (
+        <>
+          <SectionCard
+            title="Facts"
+            count={work.facts.length}
+            description="Evidence the workers persisted; proven facts are highlighted."
+          >
+            {work.facts.length === 0 ? (
+              <EmptyState message="No facts recorded yet." />
+            ) : (
+              work.facts.map((fact) => (
+                <FactLine
+                  key={fact.id}
+                  fact={fact}
+                  proofOf={proofByFactId.get(fact.id)}
+                />
+              ))
+            )}
+          </SectionCard>
+
+          {work.results.length > 0 ? (
+            <SectionCard
+              title="Results"
+              count={work.results.length}
+              description="Acceptance decisions with their supporting evidence."
+            >
+              {work.results.map((result) => (
+                <div
+                  className="rounded-lg border border-border bg-surface-subtle px-3.5 py-3"
+                  key={result.id}
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex min-w-0 items-start gap-1">
+                      <strong className="text-[13.5px] font-medium leading-5">
+                        {result.claim}
+                      </strong>
+                      <CopyButton
+                        text={result.claim}
+                        label="result claim"
+                        size="icon"
+                      />
+                    </div>
+                    <StateBadge state={result.acceptance} />
+                  </div>
+                  <p className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                    <span>intent</span>
+                    <span className="mono" title={result.intent_id}>
+                      {shortenId(result.intent_id)}
+                    </span>
+                    <span>·</span>
+                    <span>{formatLocalTimestamp(result.created_at)}</span>
+                  </p>
+                  <EvidenceBlock evidence={result.evidence} />
+                </div>
+              ))}
+            </SectionCard>
+          ) : null}
+        </>
       ) : null}
     </main>
   );
@@ -449,6 +523,79 @@ function TaskWorkView() {
 // ---------------------------------------------------------------------------
 // Pieces
 // ---------------------------------------------------------------------------
+
+/** Warning bar above the capacity editor while a limit keeps the task paused. */
+function CapacityNoticeBar(props: { notice: CapacityPauseNotice }) {
+  return (
+    <div
+      className="flex items-start gap-2.5 rounded-lg border border-warning/40 bg-warning/10 px-3.5 py-2.5 text-[13px] leading-5 text-warning"
+      role="status"
+    >
+      <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+      <div className="min-w-0">
+        <p className="font-medium">{props.notice.text}</p>
+        <p className="mt-0.5 text-[11.5px] text-warning/85">
+          Extend the exhausted limit below to resume the task.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/** Work-view tab strip: Graph, Activity, and (swarm tasks only) Swarm. */
+function WorkTabBar(props: {
+  active: WorkTab;
+  onSelect: (tab: WorkTab) => void;
+  swarmAvailable: boolean;
+}) {
+  const tabs: Array<{ id: WorkTab; label: string; icon: React.ReactNode }> = [
+    {
+      id: "graph",
+      label: "Graph",
+      icon: <GitBranch className="h-3.5 w-3.5" />,
+    },
+    {
+      id: "activity",
+      label: "Activity",
+      icon: <Radio className="h-3.5 w-3.5" />,
+    },
+  ];
+  if (props.swarmAvailable) {
+    tabs.push({
+      id: "swarm",
+      label: "Swarm",
+      icon: <MessageSquareText className="h-3.5 w-3.5" />,
+    });
+  }
+  return (
+    <div
+      aria-label="Work view tabs"
+      className="flex flex-wrap items-center gap-1 border-b border-border pb-2"
+      role="tablist"
+    >
+      {tabs.map((tab) => {
+        const selected = tab.id === props.active;
+        return (
+          <button
+            key={tab.id}
+            aria-selected={selected}
+            className={`inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-[12.5px] font-medium transition-colors ${
+              selected
+                ? "border-accent-foreground/30 bg-accent text-accent-foreground"
+                : "border-transparent text-muted-foreground hover:bg-surface-subtle hover:text-foreground"
+            }`}
+            onClick={() => props.onSelect(tab.id)}
+            role="tab"
+            type="button"
+          >
+            {tab.icon}
+            {tab.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
 /**
  * One fact: claim, state badge, and its provenance rendered according to the
@@ -469,7 +616,9 @@ function FactLine(props: { fact: Fact; proofOf?: string }) {
     >
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 items-start gap-1">
-          <strong className="text-[13.5px] font-medium leading-5">{fact.claim}</strong>
+          <strong className="text-[13.5px] font-medium leading-5">
+            {fact.claim}
+          </strong>
           <CopyButton text={fact.claim} label="fact claim" size="icon" />
         </div>
         <StateBadge state={fact.state} />
@@ -516,9 +665,13 @@ function EvidenceBlock(props: { evidence: ResultRecord["evidence"] }) {
       <dl className="mt-2 space-y-2 text-[11px]">
         {entries.map(([key, value]) => (
           <div key={key}>
-            <dt className="font-semibold uppercase tracking-wide text-muted-foreground">{key}</dt>
+            <dt className="font-semibold uppercase tracking-wide text-muted-foreground">
+              {key}
+            </dt>
             <dd className="mt-0.5 break-words font-mono">
-              {typeof value === "string" ? value : JSON.stringify(value, null, 2)}
+              {typeof value === "string"
+                ? value
+                : JSON.stringify(value, null, 2)}
             </dd>
           </div>
         ))}

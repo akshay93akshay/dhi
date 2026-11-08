@@ -8,7 +8,7 @@ use crate::{
     GuardDecision, GuardDecisionId, GuardVerdict, Intent, IntentId, IntentPlan, IntentState,
     NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus, SideQuestionRequest,
     SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task, TaskCapacity, TaskId,
-    TaskState, ToolCall, ToolCallId,
+    TaskState, ToolCall, ToolCallId, Topology,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -21,14 +21,16 @@ pub trait GraphStore: Send + Sync {
     /// Creates a task with its origin fact and one `task_created` activity.
     async fn create_task(&self, goal: String) -> anyhow::Result<Task>;
 
-    /// Like [`GraphStore::create_task`] with optional per-task role pins.
-    /// `None` keeps the task on the role's default chain; a present id must
-    /// reference an existing `llm_profiles` row (the caller validates).
+    /// Like [`GraphStore::create_task`] with optional per-task role pins and
+    /// a creation-time topology. `None` keeps the task on the role's default
+    /// chain or leaves topology to the planner; a present pin must reference
+    /// an existing `llm_profiles` row (the caller validates).
     async fn create_task_with_pins(
         &self,
         goal: String,
         planner_pin: Option<i64>,
         worker_pin: Option<i64>,
+        topology: Option<Topology>,
     ) -> anyhow::Result<Task>;
 
     async fn get_task(&self, id: TaskId) -> anyhow::Result<Option<Task>>;

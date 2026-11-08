@@ -71,6 +71,13 @@ export type GuardAction = "allow" | "deny" | "ask";
 /** `dhi_core::ApprovalStatus` — 4 values. */
 export type ApprovalStatus = "pending" | "granted" | "denied" | "expired";
 
+/**
+ * Task-level execution topology chosen at creation. `null`/omitted means the
+ * planner decides; the planner's eventual choice also appears as
+ * `topology` on the latest `team_run` activity.
+ */
+export type TaskTopology = "single" | "manager_worker" | "swarm";
+
 /** `dhi_core::ApprovalDecision` — the body of `POST /api/approvals/{id}/decision`. */
 export type ApprovalDecision = "allow" | "deny";
 
@@ -104,13 +111,7 @@ export type ThinkingType = "" | "disabled" | "enabled";
  * Optional reasoning-effort control. `""` means the field is not sent;
  * the remaining values are sent verbatim.
  */
-export type ReasoningEffort =
-  | ""
-  | "low"
-  | "medium"
-  | "high"
-  | "xhigh"
-  | "max";
+export type ReasoningEffort = "" | "low" | "medium" | "high" | "xhigh" | "max";
 
 /** What a guard rule matches against — 2 values. */
 export type MatchTarget = "tool_name" | "tool_input";
@@ -174,6 +175,12 @@ export type Task = {
    * then treated as the engine default.
    */
   capacity?: TaskCapacity;
+  /**
+   * Execution topology pinned at creation (`single`, `manager_worker`,
+   * `swarm`), or `null`/omitted when the planner decides. Older servers omit
+   * the field; the latest `team_run` activity is the fallback signal.
+   */
+  topology?: TaskTopology | null;
   created_at: string;
   updated_at: string;
 };
@@ -238,9 +245,16 @@ export type Activity = {
   kind: string;
   message: string;
   /**
-   * Free-form payload object, convention-dependent: structured markers such
-   * as `{ "approval_id": ..., "tool_call_id": ..., "reason": ... }` on
-   * `approval_denied`; workers/steps attach their own extras.
+   * Free-form payload object, convention-dependent:
+   * - `tool_allowed`: `{ "intent_id": ..., "tool": ..., "input": ...,
+   *   "output": ..., "worker_key"?: ... }` — one row per tool call; `input`
+   *   is absent on older rows;
+   * - `tool_denied`: `{ "intent_id": ..., "tool": ..., "reason": ... }`;
+   * - `capacity_exhausted`: `{ "reason": "model_calls" | "wall_time" |
+   *   "rounds", "rounds": ..., "model_calls": ..., "elapsed_secs": ...,
+   *   "max_model_calls": ..., "max_wall_secs": ..., "max_rounds": ... }`;
+   * - `approval_denied`: `{ "approval_id": ..., "tool_call_id": ...,
+   *   "reason": ... }`; workers/steps attach their own extras.
    */
   payload: JsonObject;
   created_at: string;
@@ -868,6 +882,11 @@ export type CreateTaskInput = {
   planner_profile_id?: number | null;
   worker_profile_id?: number | null;
   capacity?: TaskCapacity;
+  /**
+   * `null` (or omitted) lets the planner decide; otherwise pins the task to
+   * one execution topology.
+   */
+  topology?: TaskTopology | null;
 };
 
 /**

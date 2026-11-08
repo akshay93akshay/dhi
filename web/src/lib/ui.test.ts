@@ -3,14 +3,17 @@ import { test } from "node:test";
 import { ApiError } from "./api.ts";
 import {
   PIN_UNSET,
+  TOPOLOGY_OPTIONS,
   buildCreateTaskInput,
   describeApiError,
   parsePin,
+  parseTopology,
   renderProvenance,
   serviceState,
   serviceStatusText,
   shortenId,
   taskIdFromPathname,
+  topologyLabel,
   validateGoal,
 } from "./ui.ts";
 
@@ -86,16 +89,64 @@ test("parsePin maps select values onto ids or null", () => {
   assert.equal(parsePin("2.5"), null);
 });
 
-test("buildCreateTaskInput omits unset pins and trims the goal", () => {
+test("buildCreateTaskInput always sends topology, defaulting to null", () => {
   const result = buildCreateTaskInput({
     goal: "  mate in two  ",
     plannerPin: "",
     workerPin: "",
   });
   assert.ok(result.ok);
-  // Exactly `goal`: absent keys, matching the server defaults path.
-  assert.deepEqual(Object.keys(result.input).sort(), ["goal"]);
-  assert.deepEqual(result.input, { goal: "mate in two" });
+  // Topology is explicit (`null` = planner decides); absent pins stay absent.
+  assert.deepEqual(result.input, { goal: "mate in two", topology: null });
+  assert.deepEqual(Object.keys(result.input).sort(), ["goal", "topology"]);
+
+  const blank = buildCreateTaskInput({
+    goal: "g",
+    plannerPin: "",
+    workerPin: "",
+    topology: "",
+  });
+  assert.ok(blank.ok);
+  assert.deepEqual(blank.input, { goal: "g", topology: null });
+});
+
+test("buildCreateTaskInput carries a selected topology enum", () => {
+  for (const topology of ["single", "manager_worker", "swarm"] as const) {
+    const result = buildCreateTaskInput({
+      goal: "g",
+      plannerPin: "",
+      workerPin: "",
+      topology,
+    });
+    assert.ok(result.ok);
+    assert.deepEqual(result.input, { goal: "g", topology });
+  }
+  // Unknown/blank values degrade to "planner decides" instead of failing.
+  const unknown = buildCreateTaskInput({
+    goal: "g",
+    plannerPin: "",
+    workerPin: "",
+    topology: "mystery",
+  });
+  assert.ok(unknown.ok);
+  assert.equal(unknown.input.topology, null);
+});
+
+test("parseTopology and topologyLabel map the select vocabulary", () => {
+  assert.equal(parseTopology(""), null);
+  assert.equal(parseTopology(undefined), null);
+  assert.equal(parseTopology(" SINGLE "), "single");
+  assert.equal(parseTopology("manager_worker"), "manager_worker");
+  assert.equal(parseTopology("swarm"), "swarm");
+  assert.equal(parseTopology("other"), null);
+  assert.deepEqual(
+    TOPOLOGY_OPTIONS.map((option) => option.label),
+    ["Let planner decide", "Single agent", "Multi agent", "Swarm"],
+  );
+  assert.equal(topologyLabel(null), null);
+  assert.equal(topologyLabel("single"), "Single agent");
+  assert.equal(topologyLabel("manager_worker"), "Multi agent");
+  assert.equal(topologyLabel("swarm"), "Swarm");
 });
 
 test("buildCreateTaskInput carries numeric pins into the canonical fields", () => {
@@ -107,6 +158,7 @@ test("buildCreateTaskInput carries numeric pins into the canonical fields", () =
   assert.ok(result.ok);
   assert.deepEqual(result.input, {
     goal: "g",
+    topology: null,
     planner_profile_id: 7,
     worker_profile_id: 9,
   });
@@ -208,7 +260,12 @@ test("renderProvenance falls back to raw JSON for unknown shapes", () => {
   assert.equal(
     exotic.lines[0],
     JSON.stringify(
-      { trace: { nested: [1, 2] }, notes: "kept verbatim", count: 2, flag: null },
+      {
+        trace: { nested: [1, 2] },
+        notes: "kept verbatim",
+        count: 2,
+        flag: null,
+      },
       null,
       2,
     ),
@@ -243,16 +300,19 @@ test("renderProvenance never crashes on hostile value types", () => {
 // ---------------------------------------------------------------------------
 
 test("describeApiError words each failure class distinctly", () => {
-  assert.match(describeApiError(new ApiError(0, "socket hung up")), /^Network error:/);
+  assert.match(
+    describeApiError(new ApiError(0, "socket hung up")),
+    /^Network error:/,
+  );
   assert.match(
     describeApiError(new ApiError(400, "goal must not be empty")),
     /^Invalid request:/,
   );
-  assert.match(describeApiError(new ApiError(404, "task not found: x")), /^Not found:/);
-  assert.equal(
-    describeApiError(new ApiError(500, "boom")),
-    "boom (HTTP 500)",
+  assert.match(
+    describeApiError(new ApiError(404, "task not found: x")),
+    /^Not found:/,
   );
+  assert.equal(describeApiError(new ApiError(500, "boom")), "boom (HTTP 500)");
   assert.equal(describeApiError(new Error("plain")), "plain");
   assert.equal(describeApiError("just a string"), "just a string");
 });

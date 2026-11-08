@@ -93,6 +93,7 @@ const sampleTask: Task = {
     max_wall_secs: null,
     max_parallel_workers: 4,
   },
+  topology: "manager_worker",
   created_at: "2026-10-30T00:00:00Z",
   updated_at: "2026-10-30T00:00:00Z",
 };
@@ -209,9 +210,21 @@ test("createTask omits absent pin fields (server defaults apply)", async () => {
 
   await createTask({ goal: "solo" });
 
-  assert.equal(
-    recorder.calls[0]?.init?.body,
-    JSON.stringify({ goal: "solo" }),
+  assert.equal(recorder.calls[0]?.init?.body, JSON.stringify({ goal: "solo" }));
+});
+
+test("createTask forwards topology, including an explicit null", async () => {
+  const recorder = stubFetch(() => jsonResponse(sampleTask, 201));
+
+  await createTask({ goal: "swarm task", topology: "swarm" });
+  await createTask({ goal: "planner task", topology: null });
+
+  assert.deepEqual(
+    recorder.calls.map((call) => JSON.parse(String(call.init?.body))),
+    [
+      { goal: "swarm task", topology: "swarm" },
+      { goal: "planner task", topology: null },
+    ],
   );
 });
 
@@ -225,7 +238,10 @@ test("getTask reads a bare task by id", async () => {
 
 test("addGoal posts the description and returns {task, goal}", async () => {
   const recorder = stubFetch(() =>
-    jsonResponse({ task: { ...sampleTask, state: "running" }, goal: sampleGoal }),
+    jsonResponse({
+      task: { ...sampleTask, state: "running" },
+      goal: sampleGoal,
+    }),
   );
 
   const result = await addGoal(sampleTask.id, "Find a second mating line");
@@ -423,7 +439,9 @@ test("updateTaskCapacity exposes the terminal-task 409 as a conflict", async () 
     ),
   );
 
-  const error = await updateTaskCapacity(sampleTask.id, { max_rounds: 90 }).then(
+  const error = await updateTaskCapacity(sampleTask.id, {
+    max_rounds: 90,
+  }).then(
     () => {
       throw new Error("updateTaskCapacity must reject a 409");
     },
@@ -460,7 +478,9 @@ test("getSwarmMessages unwraps { messages } and forwards the limit", async () =>
 });
 
 test("getTaskActivity unwraps the { activity } envelope", async () => {
-  const recorder = stubFetch(() => jsonResponse({ activity: [sampleActivity] }));
+  const recorder = stubFetch(() =>
+    jsonResponse({ activity: [sampleActivity] }),
+  );
 
   const activity = await getTaskActivity(sampleTask.id);
   assert.equal(recorder.urls[0], `/api/tasks/${sampleTask.id}/activity`);
@@ -508,10 +528,7 @@ test("listSideQuestions unwraps the { sessions } envelope", async () => {
   );
 
   const sessions = await listSideQuestions(sampleTask.id);
-  assert.equal(
-    recorder.urls[0],
-    `/api/tasks/${sampleTask.id}/side-questions`,
-  );
+  assert.equal(recorder.urls[0], `/api/tasks/${sampleTask.id}/side-questions`);
   assert.deepEqual(sessions, [sampleSideSession]);
 });
 
@@ -529,14 +546,8 @@ test("askSideQuestion posts the question and omits an absent session_id", async 
     });
   });
 
-  const response = await askSideQuestion(
-    sampleTask.id,
-    "Why did this finish?",
-  );
-  assert.equal(
-    recorder.urls[0],
-    `/api/tasks/${sampleTask.id}/side-questions`,
-  );
+  const response = await askSideQuestion(sampleTask.id, "Why did this finish?");
+  assert.equal(recorder.urls[0], `/api/tasks/${sampleTask.id}/side-questions`);
   assert.equal(response.session_id, sampleSideSession.id);
   assert.deepEqual(response.request, sampleSideRequest);
   assert.equal(response.answer, sampleSideRequest.answer);
@@ -563,10 +574,7 @@ test("askSideQuestion appends with session_id when one is active", async () => {
     "And the evidence?",
     sampleSideSession.id,
   );
-  assert.equal(
-    recorder.urls[0],
-    `/api/tasks/${sampleTask.id}/side-questions`,
-  );
+  assert.equal(recorder.urls[0], `/api/tasks/${sampleTask.id}/side-questions`);
 });
 
 test("side-question 400 and 409 responses keep their status helpers", async () => {
@@ -955,7 +963,11 @@ const sampleTinyfish = {
 };
 
 const sampleProviders = {
-  search_read_order: ["tinyfish" as const, "parallel" as const, "firecrawl" as const],
+  search_read_order: [
+    "tinyfish" as const,
+    "parallel" as const,
+    "firecrawl" as const,
+  ],
   research_order: ["parallel" as const],
   providers: [
     sampleTinyfish,
@@ -1024,10 +1036,9 @@ test("saveWebProvider PUTs the partial body and returns one provider DTO", async
 test("saveWebProvider percent-encodes the provider path segment", async () => {
   const recorder = stubFetch(() => jsonResponse(sampleTinyfish));
 
-  await saveWebProvider(
-    "tiny/fish" as Parameters<typeof saveWebProvider>[0],
-    { timeout_secs: 60 },
-  );
+  await saveWebProvider("tiny/fish" as Parameters<typeof saveWebProvider>[0], {
+    timeout_secs: 60,
+  });
   assert.equal(recorder.urls[0], "/api/web/providers/tiny%2Ffish");
 });
 

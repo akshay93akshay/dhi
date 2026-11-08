@@ -35,6 +35,7 @@ async fn live_river_planner_smoke() {
             open_intents: 0,
             failures: vec![],
             planner_profile_id: None,
+            required_topology: None,
         })
         .await
         .expect("the live planner call must succeed");

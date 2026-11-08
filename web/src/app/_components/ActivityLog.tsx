@@ -4,19 +4,23 @@ import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import {
   FEED_FALLBACK_ERROR_STREAK,
-  FEED_MAX_ROWS,
+  FEED_LIVE_COUNT,
   FEED_POLL_INTERVAL_MS,
   FEED_RECENT_COUNT,
   FEED_STREAM_RETRY_MS,
   activityActor,
   activityKindView,
+  activityToolIo,
   capTimeline,
   createLiveFeedController,
   formatFeedTime,
   hasVisiblePayload,
   prettyJson,
+  previewFeedText,
+  toolIoFullText,
   type FeedConnection,
   type FeedSignal,
+  type FeedToolIo,
   type LiveFeedSnapshot,
 } from "@/lib/feed";
 import type { Activity } from "@/lib/types";
@@ -40,10 +44,12 @@ import { StateBadge } from "@/components/ui/state-badge";
  * - `ActivityTimeline` — the shared presentational piece: a vertical event
  *   log, NEWEST AT BOTTOM (the header says so), each entry showing the
  *   system-local time (short clock, full stamp on hover), the kind as a
- *   badge, the actor when derivable, the message, and the payload collapsed
- *   behind a one-click `<details>`.
+ *   badge, the actor when derivable, the message, and either one combined
+ *   tool input/output cell for `tool_allowed` rows or the generic payload
+ *   collapsed behind a one-click `<details>`.
  * - `LiveActivityFeed` — the work view's live log: history seed + SSE
- *   stream + connection indicator + graceful polling fallback.
+ *   stream + connection indicator + graceful polling fallback, showing the
+ *   newest ten events.
  * - `RecentActivityFeed` — the task detail page's compact list: last ten
  *   rows, no stream, linking to the work view (keeps detail fast).
  */
@@ -126,13 +132,14 @@ function connectionDescription(
   }
 }
 
-function ConnectionChip(props: {
-  connection: FeedConnection;
-  cursor: number;
-}) {
+function ConnectionChip(props: { connection: FeedConnection; cursor: number }) {
   const { connection, cursor } = props;
   const dotClass =
-    connection === "live" ? "dot live" : connection === "reconnecting" ? "dot warn" : "dot";
+    connection === "live"
+      ? "dot live"
+      : connection === "reconnecting"
+        ? "dot warn"
+        : "dot";
   return (
     <span
       className="status subtle"
@@ -155,14 +162,71 @@ function displayText(value: unknown): string {
   return typeof value === "string" ? value : String(value ?? "");
 }
 
+function ToolValueBlock(props: { label: string; text: string }) {
+  const { label, text } = props;
+  const { preview, truncated } = previewFeedText(text);
+  const lower = label.toLowerCase();
+  return (
+    <div className="min-w-0">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+          {label}
+        </span>
+        <CopyButton text={text} label={lower} size="icon" />
+      </div>
+      <pre className="pre mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words">
+        {preview}
+      </pre>
+      {truncated ? (
+        <details className="feed-details">
+          <summary className="subtle">Show full {lower}</summary>
+          <pre className="pre max-h-80">{text}</pre>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * One tool call's input and output, combined in a single cell. Older
+ * `tool_allowed` rows have no `input`; they render the output alone.
+ */
+function ToolIoCell(props: { io: FeedToolIo }) {
+  const { io } = props;
+  return (
+    <div className="mt-2 rounded-lg border border-border bg-surface-subtle px-3 py-2">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+          Tool call
+        </span>
+        <CopyButton
+          text={toolIoFullText(io)}
+          label="tool input and output"
+          size="icon"
+        />
+      </div>
+      <div className="mt-1.5 space-y-2">
+        {io.input !== null ? (
+          <ToolValueBlock label="Input" text={io.input} />
+        ) : null}
+        {io.output !== null ? (
+          <ToolValueBlock label="Output" text={io.output} />
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function ActivityEntry(props: { activity: Activity }) {
   const { activity } = props;
   const kind = activityKindView(activity.kind);
   const actor = activityActor(activity.kind);
   const message = displayText(activity.message);
-  const payload = hasVisiblePayload(activity.payload)
-    ? prettyJson(activity.payload)
-    : null;
+  const toolIo = activityToolIo(activity);
+  const payload =
+    toolIo === null && hasVisiblePayload(activity.payload)
+      ? prettyJson(activity.payload)
+      : null;
   return (
     <li className="feed-item">
       <div className="feed-meta">
@@ -181,6 +245,7 @@ function ActivityEntry(props: { activity: Activity }) {
         <span className="feed-msg">{message}</span>
         <CopyButton text={message} label="message" size="icon" />
       </div>
+      {toolIo !== null ? <ToolIoCell io={toolIo} /> : null}
       {payload !== null ? (
         <details className="feed-details">
           <summary className="subtle">payload</summary>
@@ -198,29 +263,20 @@ function ActivityEntry(props: { activity: Activity }) {
 }
 
 /**
- * The list itself: caps rendered rows (the history route is unbounded —
- * known debt), shows the "+N older hidden" line above the kept window, and
- * tolerates junk rows without crashing.
+ * The list itself: the newest window only, with no hidden-count line. One
+ * activity is one row; tool input and output never split into separate rows.
  */
 function ActivityList(props: { rows: readonly Activity[]; max: number }) {
-  const { kept, hidden } = capTimeline(props.rows, props.max);
+  const { kept } = capTimeline(props.rows, props.max);
   if (props.rows.length === 0) {
     return <p className="empty">No activity recorded yet.</p>;
   }
   return (
-    <>
-      {hidden > 0 ? (
-        <p className="empty">
-          +{hidden} older event{hidden === 1 ? "" : "s"} hidden — showing the
-          most recent {kept.length}.
-        </p>
-      ) : null}
-      <ul className="feed">
-        {kept.map((activity) => (
-          <ActivityEntry key={activity.id} activity={activity} />
-        ))}
-      </ul>
-    </>
+    <ul className="feed">
+      {kept.map((activity) => (
+        <ActivityEntry key={activity.id} activity={activity} />
+      ))}
+    </ul>
   );
 }
 
@@ -314,9 +370,14 @@ export function LiveActivityFeed(props: {
       <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
         <div>
           <CardTitle className="text-base">Activity</CardTitle>
-          <CardDescription className="mt-0.5">Live event log — newest last.</CardDescription>
+          <CardDescription className="mt-0.5">
+            Live event log — newest last, last ten shown.
+          </CardDescription>
         </div>
-        <Badge variant="outline" className="h-7 gap-1.5 bg-surface-subtle px-2.5 font-normal">
+        <Badge
+          variant="outline"
+          className="h-7 gap-1.5 bg-surface-subtle px-2.5 font-normal"
+        >
           <ConnectionChip
             connection={snapshot.connection}
             cursor={snapshot.cursor}
@@ -339,7 +400,7 @@ export function LiveActivityFeed(props: {
 
         {teamRun !== null ? <TeamRunPanel run={teamRun} /> : null}
 
-        <ActivityList rows={snapshot.rows} max={FEED_MAX_ROWS} />
+        <ActivityList rows={snapshot.rows} max={FEED_LIVE_COUNT} />
       </CardContent>
     </Card>
   );
@@ -361,7 +422,9 @@ export function RecentActivityFeed(props: {
       <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
         <div>
           <CardTitle className="text-base">Recent activity</CardTitle>
-          <CardDescription className="mt-0.5">Latest events — newest last.</CardDescription>
+          <CardDescription className="mt-0.5">
+            Latest events — newest last.
+          </CardDescription>
         </div>
         {props.rows !== null && rows.length > 0 ? (
           <Badge variant="outline" className="font-normal">

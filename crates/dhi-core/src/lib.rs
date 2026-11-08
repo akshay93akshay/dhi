@@ -333,6 +333,11 @@ pub struct Task {
     pub pinned_worker_profile_id: Option<i64>,
     /// Optional capacity limits. Stored in `tasks.capacity`.
     pub capacity: TaskCapacity,
+    /// Required orchestration topology, chosen at creation and immutable
+    /// afterwards. `None` lets the planner decide whether to attach a plan.
+    /// Stored in `tasks.topology`.
+    #[serde(default)]
+    pub topology: Option<Topology>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -349,6 +354,7 @@ impl Task {
             pinned_planner_profile_id: None,
             pinned_worker_profile_id: None,
             capacity: TaskCapacity::default(),
+            topology: None,
             created_at: now,
             updated_at: now,
         }

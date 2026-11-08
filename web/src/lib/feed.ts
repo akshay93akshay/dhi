@@ -15,10 +15,13 @@
  *   ascending timeline plus the advanced cursor. Idempotent against the
  *   overlap/replay races of a refresh (history + stream) and reconnects.
  * - `capTimeline` — client-side DOM protection (the history route is
- *   unbounded).
+ *   unbounded); the live and recent views both render only the newest ten.
  * - `activityKindView` / `activityActor` — kind strings as served are shown
  *   verbatim; known kinds additionally map onto the shared badge color
  *   vocabulary and a coarse actor label. Unknown/hostile kinds never crash.
+ * - `activityToolIo` / `previewFeedText` — one combined input/output cell for
+ *   `tool_allowed` rows, with a short collapsed preview and a full-text
+ *   expansion; old rows without `input` render output only.
  * - `advanceFeedConnection` — the connection-indicator state machine
  *   (connecting/live/reconnecting → polling fallback after N error streak).
  * - `createLiveFeedController` — the headless feed controller the work-view
@@ -40,11 +43,17 @@ import type { Activity } from "./types.ts";
 // Tunables (surfaced for tests and docs)
 // ---------------------------------------------------------------------------
 
-/** Maximum timeline rows held in the DOM at once (server history is unbounded). */
-export const FEED_MAX_ROWS = 500;
+/**
+ * Rows shown by the live work-view feed. The task detail's compact list uses
+ * the same window: exactly the newest ten events.
+ */
+export const FEED_LIVE_COUNT = 10;
 
 /** Rows shown by the task detail page's compact "Recent activity" list. */
-export const FEED_RECENT_COUNT = 10;
+export const FEED_RECENT_COUNT = FEED_LIVE_COUNT;
+
+/** Collapsed preview length for tool input/output text. */
+export const FEED_TOOL_PREVIEW_CHARS = 280;
 
 /** Consecutive stream error events after which the feed falls back to polling. */
 export const FEED_FALLBACK_ERROR_STREAK = 5;
@@ -79,9 +88,7 @@ function isUsableActivityRow(value: unknown): value is Activity {
     return false;
   }
   const id = (value as { id?: unknown }).id;
-  return (
-    typeof id === "number" && Number.isSafeInteger(id) && id >= 0
-  );
+  return typeof id === "number" && Number.isSafeInteger(id) && id >= 0;
 }
 
 /**
@@ -156,13 +163,14 @@ export type TimelineCap = {
 
 /**
  * Keeps the newest `max` rows for rendering and counts the rest as hidden.
- * Protects the DOM from the unbounded history response (known debt).
+ * Protects the DOM from the unbounded history response; the feed never shows
+ * a hidden-count line — the window is simply the newest ten.
  */
 export function capTimeline(
   rows: readonly Activity[],
-  max: number = FEED_MAX_ROWS,
+  max: number = FEED_LIVE_COUNT,
 ): TimelineCap {
-  const cap = Number.isSafeInteger(max) && max > 0 ? max : FEED_MAX_ROWS;
+  const cap = Number.isSafeInteger(max) && max > 0 ? max : FEED_LIVE_COUNT;
   if (rows.length <= cap) {
     return { kept: rows.slice(), hidden: 0 };
   }
@@ -191,6 +199,7 @@ const KIND_TONES: Readonly<Record<string, string>> = {
   approval_expired: "timeout",
   intent_orphaned: "blocked",
   engine_timeout: "timeout",
+  capacity_exhausted: "exhausted",
   task_done: "done",
 };
 
@@ -200,9 +209,7 @@ const KIND_TONES: Readonly<Record<string, string>> = {
  * derivation from the well-known kinds, displayed as a quiet label.
  * Unknown kinds yield `null` — no actor chip is rendered.
  */
-const KIND_ACTORS: Readonly<
-  Record<string, "planner" | "worker" | "system">
-> = {
+const KIND_ACTORS: Readonly<Record<string, "planner" | "worker" | "system">> = {
   intents_added: "planner",
   goal_proven: "planner",
   intent_claimed: "worker",
@@ -215,6 +222,7 @@ const KIND_ACTORS: Readonly<
   approval_expired: "system",
   intent_orphaned: "system",
   engine_timeout: "system",
+  capacity_exhausted: "system",
 };
 
 /** Renderable view of one activity kind: badge label plus optional tone. */
@@ -310,6 +318,106 @@ export function hasVisiblePayload(payload: unknown): boolean {
 
 type JsonObjectLike = { [key: string]: unknown };
 
+function isJsonObject(value: unknown): value is JsonObjectLike {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOwn(object: JsonObjectLike, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(object, key);
+}
+
+/** One tool call's combined input/output text, ready for a single feed cell. */
+export type FeedToolIo = {
+  /** `payload.input` formatted for display, or `null` on old rows. */
+  input: string | null;
+  /** `payload.output` formatted for display, or `null` when absent. */
+  output: string | null;
+};
+
+/**
+ * Formats one tool value. Strings pass through; server-capped output objects
+ * (`{ truncated: true, preview: "…" }`) show their preview; every other JSON
+ * value is pretty-printed. `null`/missing values mean "no such side".
+ */
+export function formatToolValue(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  if (typeof value === "string") {
+    return value;
+  }
+  if (
+    isJsonObject(value) &&
+    value.truncated === true &&
+    typeof value.preview === "string"
+  ) {
+    return `${value.preview}\n… (truncated by the server)`;
+  }
+  return prettyJson(value);
+}
+
+/**
+ * Extracts the combined input/output cell for a `tool_allowed` activity.
+ * Rows written before the contract gained `input` simply return output only.
+ * Non-tool activity without either key returns `null` so its payload keeps
+ * the generic JSON expansion.
+ */
+export function activityToolIo(activity: Activity): FeedToolIo | null {
+  if (!isJsonObject(activity.payload)) {
+    return null;
+  }
+  const payload = activity.payload;
+  const hasInput = hasOwn(payload, "input");
+  const hasOutput = hasOwn(payload, "output");
+  const looksLikeToolCall =
+    activity.kind === "tool_allowed" || hasOwn(payload, "tool");
+  if (!looksLikeToolCall && !hasInput && !hasOutput) {
+    return null;
+  }
+  const input = hasInput ? formatToolValue(payload.input) : null;
+  const output = hasOutput ? formatToolValue(payload.output) : null;
+  if (input === null && output === null) {
+    return null;
+  }
+  return { input, output };
+}
+
+/** Result of {@link previewFeedText}: collapsed text plus a truncation flag. */
+export type FeedTextPreview = {
+  preview: string;
+  truncated: boolean;
+};
+
+/**
+ * Truncates long tool text for the collapsed cell. The returned preview ends
+ * with an ellipsis when expanded text exists, which is the expand cue.
+ */
+export function previewFeedText(
+  text: string,
+  maxChars: number = FEED_TOOL_PREVIEW_CHARS,
+): FeedTextPreview {
+  const cap =
+    Number.isSafeInteger(maxChars) && maxChars > 0
+      ? maxChars
+      : FEED_TOOL_PREVIEW_CHARS;
+  if (text.length <= cap) {
+    return { preview: text, truncated: false };
+  }
+  return { preview: `${text.slice(0, cap - 1)}…`, truncated: true };
+}
+
+/** Full combined text copied from the expanded tool cell. */
+export function toolIoFullText(io: FeedToolIo): string {
+  const parts: string[] = [];
+  if (io.input !== null) {
+    parts.push(`Input:\n${io.input}`);
+  }
+  if (io.output !== null) {
+    parts.push(`Output:\n${io.output}`);
+  }
+  return parts.join("\n\n");
+}
+
 // ---------------------------------------------------------------------------
 // Connection indicator state machine (pure)
 // ---------------------------------------------------------------------------
@@ -322,11 +430,7 @@ type JsonObjectLike = { [key: string]: unknown };
  * - `polling` — degraded: stream parked, activity polling sustains the log
  *   (grey dot; the stream is retried periodically).
  */
-export type FeedConnection =
-  | "connecting"
-  | "live"
-  | "reconnecting"
-  | "polling";
+export type FeedConnection = "connecting" | "live" | "reconnecting" | "polling";
 
 /** One observable stream event. */
 export type FeedClockEvent = "hello" | "error";
@@ -446,18 +550,14 @@ function defaultIsVisible(): boolean {
   );
 }
 
-function makeDefaultConnect(
-  resumeDelayMs: number | undefined,
-): StreamConnect {
+function makeDefaultConnect(resumeDelayMs: number | undefined): StreamConnect {
   return (taskId, after, handlers) =>
     connectTaskStream(taskId, {
       after,
       onHello: handlers.onHello,
       onActivity: handlers.onActivity,
       onError: () => handlers.onError(),
-      ...(resumeDelayMs === undefined
-        ? {}
-        : { resumeDelayMs }),
+      ...(resumeDelayMs === undefined ? {} : { resumeDelayMs }),
     });
 }
 
@@ -488,8 +588,7 @@ export function createLiveFeedController(
   const connect = deps.connect ?? makeDefaultConnect(deps.streamResumeDelayMs);
   const pollIntervalMs = deps.pollIntervalMs ?? FEED_POLL_INTERVAL_MS;
   const streamRetryMs = deps.streamRetryMs ?? FEED_STREAM_RETRY_MS;
-  const errorStreakLimit =
-    deps.errorStreakLimit ?? FEED_FALLBACK_ERROR_STREAK;
+  const errorStreakLimit = deps.errorStreakLimit ?? FEED_FALLBACK_ERROR_STREAK;
   const describeError = deps.describeError ?? defaultDescribeError;
   const isVisible = deps.isVisible ?? defaultIsVisible;
 

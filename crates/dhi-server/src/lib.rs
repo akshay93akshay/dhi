@@ -33,7 +33,7 @@ use axum::{Json, Router};
 use dhi_agent::{AgentRuntime, LlmPool, PoolSnapshot, RawProfile, ResolvedProfile};
 use dhi_core::{
     AgentRole, AgentRun, Approval, ApprovalDecision, ApprovalStatus, GraphStore, GuardStore,
-    GuardVerdict, ReopenOutcome, Task, TaskCapacity, TaskId, TaskState,
+    GuardVerdict, ReopenOutcome, Task, TaskCapacity, TaskId, TaskState, Topology,
 };
 use dhi_engine::Engine;
 use dhi_guard::ToolBackend;
@@ -322,6 +322,9 @@ impl IntoResponse for ApiError {
 ///
 /// An optional `capacity` ledger is written before the engine's first run,
 /// so that run already sees the limits instead of racing a later extension.
+///
+/// An optional `topology` pins the task's execution shape for its whole life;
+/// it can only be set here, never changed through the capacity route.
 #[derive(Debug, Deserialize)]
 struct CreateTaskRequest {
     goal: String,
@@ -330,6 +333,8 @@ struct CreateTaskRequest {
     #[serde(alias = "pinned_worker_profile_id")]
     worker_profile_id: Option<i64>,
     capacity: Option<TaskCapacity>,
+    #[serde(default)]
+    topology: Option<Topology>,
 }
 
 /// `POST /api/tasks/{id}/goals` input.
@@ -493,7 +498,12 @@ async fn create_task(
 
     let mut task = state
         .store
-        .create_task_with_pins(body.goal, body.planner_profile_id, body.worker_profile_id)
+        .create_task_with_pins(
+            body.goal,
+            body.planner_profile_id,
+            body.worker_profile_id,
+            body.topology,
+        )
         .await
         .map_err(ApiError::internal)?;
 
@@ -1947,16 +1957,16 @@ impl GuardedToolSink {
     }
 }
 
-/// Caps one activity payload's output preview. The durable `tool_calls` row
-/// keeps the full output; the feed only needs the step and a short preview.
-fn activity_output(output: &serde_json::Value) -> serde_json::Value {
+/// Caps one activity payload's tool value preview. The durable `tool_calls`
+/// row keeps the full value; the feed only needs the step and a short preview.
+fn activity_preview(value: &serde_json::Value) -> serde_json::Value {
     const MAX_CHARS: usize = 500;
-    let text = match output {
+    let text = match value {
         serde_json::Value::String(text) => text.clone(),
         other => other.to_string(),
     };
     if text.chars().count() <= MAX_CHARS {
-        output.clone()
+        value.clone()
     } else {
         json!({
             "truncated": true,
@@ -1974,6 +1984,7 @@ impl dhi_agent::ToolSink for GuardedToolSink {
         request: dhi_core::ToolCallRequest,
     ) -> anyhow::Result<dhi_core::ToolCallOutcome> {
         let tool = request.tool.clone();
+        let input = request.input.clone();
         let outcome = self.executor.execute(task_id, intent_id, request).await?;
         if let Some(store) = &self.activity {
             let event = match &outcome {
@@ -1983,7 +1994,8 @@ impl dhi_agent::ToolSink for GuardedToolSink {
                     json!({
                         "intent_id": intent_id,
                         "tool": tool,
-                        "output": activity_output(output),
+                        "input": activity_preview(&input),
+                        "output": activity_preview(output),
                     }),
                 )),
                 dhi_core::ToolCallOutcome::Denied { reason } => Some((
@@ -2342,7 +2354,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use dhi_agent::{MockAgentRuntime, RuntimeSink as _, ToolSink as _};
-    use dhi_core::{ApprovalDecision, ApprovalStatus, GuardStore, TaskState};
+    use dhi_core::{ApprovalDecision, ApprovalStatus, GuardStore, TaskState, Topology};
     use dhi_guard::{GuardedExecutor, Policy};
     use dhi_testkit::MemoryStore;
     use http_body_util::BodyExt;
@@ -2586,6 +2598,11 @@ mod tests {
             .find(|activity| activity.kind == "tool_allowed")
             .expect("tool_allowed activity");
         assert_eq!(allowed.payload["tool"], "createGame");
+        assert_eq!(
+            allowed.payload["input"],
+            json!({ "color": "white" }),
+            "the activity preview carries the tool input"
+        );
         assert_eq!(allowed.payload["intent_id"], intent_id.to_string());
         let denied = activities
             .iter()
@@ -3784,6 +3801,70 @@ mod tests {
         assert_eq!(
             store.get_task(id).await.unwrap().unwrap().capacity,
             TaskCapacity::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_defaults_topology_to_null() {
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store.clone()));
+
+        let (status, json) = create_one(app, "no topology needed").await;
+
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert!(json["topology"].is_null(), "{json}");
+        let id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(store.get_task(id).await.unwrap().unwrap().topology, None);
+    }
+
+    #[tokio::test]
+    async fn create_task_accepts_topology() {
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store.clone()));
+
+        let (status, json) = send(
+            app,
+            post_json(
+                "/api/tasks",
+                json!({ "goal": "split the research", "topology": "swarm" }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert_eq!(json["topology"], "swarm", "{json}");
+        let id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            store.get_task(id).await.unwrap().unwrap().topology,
+            Some(Topology::Swarm)
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_extension_never_changes_topology() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store
+            .create_task_with_pins(
+                "keep my topology".to_string(),
+                None,
+                None,
+                Some(Topology::Single),
+            )
+            .await
+            .unwrap();
+        let app = router(test_state_with_store(store.clone()));
+
+        let (status, json) = send(
+            app,
+            post_capacity(task.id, json!({ "max_rounds": 9, "topology": "swarm" })),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["topology"], "single", "{json}");
+        assert_eq!(
+            store.get_task(task.id).await.unwrap().unwrap().topology,
+            Some(Topology::Single)
         );
     }
 

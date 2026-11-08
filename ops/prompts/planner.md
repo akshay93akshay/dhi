@@ -23,6 +23,18 @@ and the first call stands. If neither applies, answer with one sentence that
 starts `NO PLAN:` and say why. Do not answer with JSON, a code fence, or a
 boolean.
 
+## Required topology
+
+The task context states the required topology. When a topology is named, it is
+a hard requirement from the user and overrides the optional rule below:
+
+- `single`: no plan is needed. Omit `plan`; the engine runs the intent single
+  and ignores any plan.
+- `manager_worker` or `swarm`: a plan is mandatory and `plan.topology` must
+  match the required topology exactly. Do not use a different topology and do
+  not omit the plan.
+- `none`: no topology is required; the optional plan rules below apply.
+
 ## Optional plan for `add_intent`
 
 `add_intent` takes an optional `plan` object. Omit `plan` for one small intent
@@ -56,6 +68,8 @@ set to finish the task.
 The goal is:
 
 {{goal}}
+
+Required topology: {{required_topology}}. This is a hard requirement from the user.
 
 If the confirmed evidence proves the goal cannot be met, call `give_up` instead
 of adding another intent.

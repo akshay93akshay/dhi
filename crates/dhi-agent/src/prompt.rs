@@ -30,14 +30,15 @@ Worker: you never create intents. Write one fact draft through `record_fact`; do
 Use only the output mechanism this role is given. Never answer in JSON text.\n";
 
 /// The only variables this crate defines: `goal`, `goals`, `facts`,
-/// `open_intents`, `failures`, `intent`, `context`. Nothing else is
-/// renderable.
+/// `open_intents`, `failures`, `required_topology`, `intent`, `context`.
+/// Nothing else is renderable.
 pub const DECLARED_VARIABLES: &[&str] = &[
     "goal",
     "goals",
     "facts",
     "open_intents",
     "failures",
+    "required_topology",
     "intent",
     "context",
 ];
@@ -51,6 +52,9 @@ pub struct PlannerVars {
     pub facts: String,
     pub open_intents: usize,
     pub failures: String,
+    /// The selector-required topology as a display value, `none` when the
+    /// plan stays optional.
+    pub required_topology: String,
 }
 
 /// Variables of one worker render. The intent text goes in the system prompt.
@@ -69,16 +73,18 @@ impl PlannerVars {
             "facts": self.facts,
             "open_intents": self.open_intents,
             "failures": self.failures,
+            "required_topology": self.required_topology,
         })
     }
 
-    fn pairs(&self) -> [(&'static str, String); 5] {
+    fn pairs(&self) -> [(&'static str, String); 6] {
         [
             ("goal", self.goal.clone()),
             ("goals", self.goals.clone()),
             ("facts", self.facts.clone()),
             ("open_intents", self.open_intents.to_string()),
             ("failures", self.failures.clone()),
+            ("required_topology", self.required_topology.clone()),
         ]
     }
 }
@@ -340,6 +346,7 @@ mod tests {
                 .to_string(),
             open_intents: 2,
             failures: "- DHI+ swarm team produced no successful worker result".to_string(),
+            required_topology: "none".to_string(),
         }
     }
 

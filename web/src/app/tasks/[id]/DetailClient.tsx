@@ -26,9 +26,11 @@ import {
   describeApiError,
   shortenId,
   taskIdFromPathname,
+  topologyLabel,
   type ServiceState,
 } from "@/lib/ui";
 import { formatLocalTimestamp } from "@/lib/localTime";
+import { resolveTaskTopology } from "@/lib/workTeam";
 import {
   DhiBrandStatus,
   type BrandActivity,
@@ -262,6 +264,11 @@ function TaskDetail() {
 
   const { task, runs, runsError, activity: activityRows, activityError } = data;
 
+  // Pinned topology wins; tasks created before the field existed fall back to
+  // the latest team_run's choice (when one has run).
+  const topology = resolveTaskTopology(task.topology, activityRows ?? []);
+  const topologyName = topologyLabel(topology);
+
   const visualState =
     task.state === "done"
       ? "healthy"
@@ -324,6 +331,14 @@ function TaskDetail() {
           </span>
           <span aria-hidden="true">·</span>
           <StateBadge state={task.state} />
+          {topologyName !== null ? (
+            <>
+              <span aria-hidden="true">·</span>
+              <Badge variant="outline" title="Task topology">
+                Topology: {topologyName}
+              </Badge>
+            </>
+          ) : null}
           <span aria-hidden="true">·</span>
           <span>updated {formatLocalTimestamp(task.updated_at)}</span>
         </div>
@@ -520,6 +535,11 @@ function TaskDetail() {
             )}
           </dd>
 
+          <dt className="text-xs leading-5 text-muted-foreground">Topology</dt>
+          <dd className="m-0 text-xs leading-5 text-muted-foreground">
+            {topologyName ?? "Planner decides"}
+          </dd>
+
           <dt className="text-xs leading-5 text-muted-foreground">Created</dt>
           <dd className="m-0 text-xs leading-5 text-muted-foreground">
             {formatLocalTimestamp(task.created_at)}
@@ -593,7 +613,9 @@ function ThinkingTranscript(props: { runs: AgentRun[] }) {
                 {run.reasoning_tokens} reasoning tokens
               </span>
             </div>
-            <pre className="mt-3 max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-[10px] bg-surface-subtle px-4 py-3 font-mono text-[12px] leading-6 text-foreground [overflow-wrap:anywhere]">{run.thinking}</pre>
+            <pre className="mt-3 max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-[10px] bg-surface-subtle px-4 py-3 font-mono text-[12px] leading-6 text-foreground [overflow-wrap:anywhere]">
+              {run.thinking}
+            </pre>
           </article>
         ))}
       </div>
