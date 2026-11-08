@@ -33,6 +33,7 @@ import {
 } from "@/lib/workTeam";
 import { Crumbs } from "@/app/_components/Crumbs";
 import { LiveActivityFeed } from "@/app/_components/ActivityLog";
+import { MarkdownMath } from "@/components/markdown-math";
 import { CopyButton } from "@/components/ui/copy-button";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -51,6 +52,9 @@ import { SwarmMessagesCard } from "./SwarmMessagesCard";
 
 /** Poll cadence for the work view; suspended while the SSE stream is live. */
 const POLL_INTERVAL_MS = 5000;
+
+/** Wide but readable content column; the app shell caps navigation separately. */
+const CONTENT_CLASS = "mx-auto w-full max-w-[1160px] space-y-5";
 
 /** Tabs in the work view; Swarm is only offered for swarm tasks. */
 type WorkTab = "graph" | "activity" | "swarm";
@@ -207,7 +211,7 @@ function TaskWorkView() {
 
   if (id === "") {
     return (
-      <main className="space-y-5">
+      <main className={CONTENT_CLASS}>
         <p className="empty">Waiting for the task id…</p>
       </main>
     );
@@ -215,7 +219,7 @@ function TaskWorkView() {
 
   if (notFound) {
     return (
-      <main className="space-y-5">
+      <main className={CONTENT_CLASS}>
         <PageHeader
           eyebrow="Work view"
           title="Task not found"
@@ -242,7 +246,7 @@ function TaskWorkView() {
 
   if (loading || work === null) {
     return (
-      <main className="space-y-5">
+      <main className={CONTENT_CLASS}>
         <Crumbs trail={crumbTrailSegments(id, "Work")} />
         {pageError !== null ? (
           <div className="errorbox" role="alert">
@@ -289,7 +293,7 @@ function TaskWorkView() {
   };
 
   return (
-    <main className="space-y-5">
+    <main className={CONTENT_CLASS}>
       <Crumbs trail={crumbTrailSegments(work.task.id, "Work")} />
 
       {pollError !== null ? (
@@ -302,7 +306,7 @@ function TaskWorkView() {
       <PageHeader
         eyebrow="Work graph"
         icon={<GitBranch className="h-3.5 w-3.5" />}
-        title={work.task.goal}
+        title="Work"
         description={
           <span className="flex flex-wrap items-center gap-2">
             <StateBadge state={work.task.state} />
@@ -347,6 +351,8 @@ function TaskWorkView() {
           </>
         }
       />
+
+      <GoalBlock text={work.task.goal} />
 
       {capacityNotice !== null ? (
         <CapacityNoticeBar notice={capacityNotice} />
@@ -490,9 +496,10 @@ function TaskWorkView() {
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex min-w-0 items-start gap-1">
-                      <strong className="text-[13.5px] font-medium leading-5">
-                        {result.claim}
-                      </strong>
+                      <MarkdownMath
+                        text={result.claim}
+                        className="min-w-0 flex-1 text-[13.5px] font-medium leading-5"
+                      />
                       <CopyButton
                         text={result.claim}
                         label="result claim"
@@ -523,6 +530,24 @@ function TaskWorkView() {
 // ---------------------------------------------------------------------------
 // Pieces
 // ---------------------------------------------------------------------------
+
+/** The task goal as quiet body text, never the oversized page title. */
+function GoalBlock(props: { text: string }) {
+  return (
+    <section aria-labelledby="task-goal-label">
+      <h2
+        id="task-goal-label"
+        className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground"
+      >
+        Goal
+      </h2>
+      <MarkdownMath
+        text={props.text}
+        className="mt-1.5 max-w-[80ch] text-[15.5px] leading-[1.7] text-foreground"
+      />
+    </section>
+  );
+}
 
 /** Warning bar above the capacity editor while a limit keeps the task paused. */
 function CapacityNoticeBar(props: { notice: CapacityPauseNotice }) {
@@ -615,10 +640,11 @@ function FactLine(props: { fact: Fact; proofOf?: string }) {
       }`}
     >
       <div className="flex items-start justify-between gap-3">
-        <div className="flex min-w-0 items-start gap-1">
-          <strong className="text-[13.5px] font-medium leading-5">
-            {fact.claim}
-          </strong>
+        <div className="flex min-w-0 flex-1 items-start gap-1">
+          <MarkdownMath
+            text={fact.claim}
+            className="min-w-0 flex-1 text-[13.5px] font-medium leading-5"
+          />
           <CopyButton text={fact.claim} label="fact claim" size="icon" />
         </div>
         <StateBadge state={fact.state} />
@@ -641,14 +667,38 @@ function FactLine(props: { fact: Fact; proofOf?: string }) {
       ) : (
         <p className="mt-1.5 flex flex-wrap gap-x-2 gap-y-1 text-[11px] leading-4 text-muted-foreground">
           {provenance.lines.map((line, index) => (
-            <span key={index}>
-              {line}
-              {index < provenance.lines.length - 1 ? " · " : ""}
-            </span>
+            <ProvenanceLine
+              key={index}
+              line={line}
+              last={index === provenance.lines.length - 1}
+            />
           ))}
         </p>
       )}
     </div>
+  );
+}
+
+/**
+ * One provenance fragment. Model-authored values (goal, detail, evidence)
+ * render Markdown + KaTeX; ids and confidence stay literal.
+ */
+function ProvenanceLine(props: { line: string; last: boolean }) {
+  const separator = props.line.indexOf(": ");
+  const label = separator === -1 ? null : props.line.slice(0, separator);
+  const value =
+    separator === -1 ? props.line : props.line.slice(separator + 2);
+  const rich = label === "Goal" || label === "Detail" || label === "Evidence";
+  return (
+    <span>
+      {label !== null ? `${label}: ` : null}
+      {rich ? (
+        <MarkdownMath text={value} variant="inline" />
+      ) : (
+        value
+      )}
+      {props.last ? null : " · "}
+    </span>
   );
 }
 

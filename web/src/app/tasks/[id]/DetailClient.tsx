@@ -36,6 +36,7 @@ import {
   type BrandActivity,
 } from "@/components/dhi-brand-status";
 import { RecentActivityFeed } from "@/app/_components/ActivityLog";
+import { MarkdownMath } from "@/components/markdown-math";
 import { SideQuestions } from "./SideQuestions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -61,7 +62,7 @@ type DetailData = {
   activityError: string | null;
 };
 
-const COLUMN_CLASS = "mx-auto w-full max-w-[760px] px-1 pb-16";
+const COLUMN_CLASS = "mx-auto w-full max-w-[1160px] px-1 pb-16";
 const TITLE_CLASS =
   "whitespace-pre-wrap break-words text-[28px] font-medium leading-[1.2] tracking-[-0.025em] text-foreground sm:text-[30px]";
 
@@ -84,6 +85,24 @@ function BrandMasthead(props: {
         activity={props.activity}
       />
     </div>
+  );
+}
+
+/** The task goal as quiet body text, never the oversized page title. */
+function GoalBlock(props: { text: string }) {
+  return (
+    <section aria-labelledby="task-goal-label">
+      <h2
+        id="task-goal-label"
+        className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground"
+      >
+        Goal
+      </h2>
+      <MarkdownMath
+        text={props.text}
+        className="mt-1.5 max-w-[80ch] text-[15.5px] leading-[1.7] text-foreground"
+      />
+    </section>
   );
 }
 
@@ -324,7 +343,8 @@ function TaskDetail() {
       <BrandMasthead state={visualState} activity={activity} />
 
       <header className="mt-10">
-        <h1 className={TITLE_CLASS}>{task.goal}</h1>
+        <h1 className="sr-only">Task detail</h1>
+        <GoalBlock text={task.goal} />
         <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1.5 text-[13px] text-muted-foreground">
           <span className="font-mono text-[12px]">
             Task #{shortenId(task.id)}
@@ -728,6 +748,50 @@ function UsageCard(props: { runs: AgentRun[]; runsError: string | null }) {
           </table>
         </div>
       ) : null}
+
+      <CompletionResponses runs={runs} />
     </section>
+  );
+}
+
+/**
+ * Model-authored completion responses, kept out of the numeric call table so
+ * the rows stay scannable. Response bodies render Markdown + KaTeX.
+ */
+function CompletionResponses(props: { runs: AgentRun[] }) {
+  const responses = props.runs.filter(
+    (run) => (run.response ?? "").trim() !== "",
+  );
+  if (responses.length === 0) {
+    return null;
+  }
+  return (
+    <div className="mt-6">
+      <h3 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+        Responses
+      </h3>
+      <div className="mt-1 divide-y divide-border/70 border-y border-border/70">
+        {responses.map((run) => (
+          <details key={run.id} className="group py-2">
+            <summary className={DISCLOSURE_SUMMARY}>
+              <span className="font-mono text-[11px]">
+                {run.call_index}/{shortenId(run.run_id)}
+              </span>
+              <span aria-hidden="true">·</span>
+              <span>{run.role}</span>
+              <span aria-hidden="true">·</span>
+              <span className="font-mono text-[11px]">{run.model}</span>
+              <span aria-hidden="true">·</span>
+              <span>{formatLocalTimestamp(run.created_at)}</span>
+              <ChevronRight className={DISCLOSURE_CHEVRON} />
+            </summary>
+            <MarkdownMath
+              text={run.response ?? ""}
+              className="mt-3 max-w-[80ch] text-[13.5px] leading-6"
+            />
+          </details>
+        ))}
+      </div>
+    </div>
   );
 }

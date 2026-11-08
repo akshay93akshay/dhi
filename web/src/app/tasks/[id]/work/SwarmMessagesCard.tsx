@@ -25,6 +25,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { CopyButton } from "@/components/ui/copy-button";
+import { MarkdownMath } from "@/components/markdown-math";
 
 /** Badge tone per persisted swarm kind; unknown kinds stay neutral. */
 function kindVariant(kind: string): "success" | "info" | "warning" | "muted" {
@@ -38,6 +39,23 @@ function kindVariant(kind: string): "success" | "info" | "warning" | "muted" {
     default:
       return "muted";
   }
+}
+
+/**
+ * `lib/workTeam` falls back to compact/pretty JSON for payload shapes it does
+ * not recognize. Those fallbacks must stay plain text — only model-authored
+ * prose is Markdown. Truncated compact JSON ends with an ellipsis, so accept
+ * that as a JSON marker too.
+ */
+function isSerializedJson(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.startsWith("{")) {
+    return trimmed.endsWith("}") || trimmed.endsWith("…");
+  }
+  if (trimmed.startsWith("[")) {
+    return trimmed.endsWith("]") || trimmed.endsWith("…");
+  }
+  return false;
 }
 
 function KindCounts(props: { counts: Record<string, number> }) {
@@ -70,9 +88,17 @@ function SwarmMessageRow(props: { message: SwarmMessageView }) {
               {message.from ?? "unknown"}
             </span>
           </span>
-          <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground">
-            {message.summary}
-          </span>
+          {isSerializedJson(message.summary) ? (
+            <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground">
+              {message.summary}
+            </span>
+          ) : (
+            <MarkdownMath
+              className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground"
+              text={message.summary}
+              variant="inline"
+            />
+          )}
           <span
             className="text-[10.5px] text-muted-foreground"
             title={
@@ -88,9 +114,17 @@ function SwarmMessageRow(props: { message: SwarmMessageView }) {
           <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
         </summary>
         <div className="border-t border-border px-3 py-2">
-          <pre className="pre mt-0 max-h-80 overflow-auto">
-            {message.fullText}
-          </pre>
+          {isSerializedJson(message.fullText) ? (
+            <pre className="pre mt-0 max-h-80 overflow-auto">
+              {message.fullText}
+            </pre>
+          ) : (
+            <MarkdownMath
+              className="mt-0 max-h-80 overflow-auto text-[13px] leading-5 [&_p+p]:mt-2 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1.5 [&_.katex-display]:my-1.5"
+              text={message.fullText}
+              variant="block"
+            />
+          )}
           <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[10.5px] text-muted-foreground">
             <span>
               intent{" "}

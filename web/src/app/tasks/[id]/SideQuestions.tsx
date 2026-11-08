@@ -28,6 +28,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { CopyButton } from "@/components/ui/copy-button";
+import { MarkdownMath } from "@/components/markdown-math";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StateBadge } from "@/components/ui/state-badge";
 import { Textarea } from "@/components/ui/textarea";
@@ -201,9 +202,13 @@ export function SideQuestions({ taskId }: { taskId: string }) {
                 {session.requests.map((request) => (
                   <div className="mt-3 space-y-1.5" key={request.id}>
                     <div className="flex items-start justify-between gap-2">
-                      <div className="flex items-start gap-2 text-[13.5px] font-medium leading-5 text-foreground">
+                      <div className="flex min-w-0 flex-1 items-start gap-2 text-[13.5px] font-medium leading-5 text-foreground">
                         <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-muted-foreground" />
-                        <span className="whitespace-pre-wrap break-words">{request.question}</span>
+                        <MarkdownMath
+                          className="min-w-0 flex-1 text-[13.5px] font-medium leading-5 [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1 [&_.katex-display]:my-1"
+                          text={request.question}
+                          variant="block"
+                        />
                       </div>
                       <CopyButton
                         className="shrink-0"
@@ -218,7 +223,13 @@ export function SideQuestions({ taskId }: { taskId: string }) {
                       </div>
                     ) : (
                       <>
-                        <div className="side-answer">{request.answer ?? "…"}</div>
+                        <div className="side-answer">
+                          <MarkdownMath
+                            className="mt-0 text-[13.5px] leading-[1.6] [&_p+p]:mt-2 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1.5 [&_.katex-display]:my-1.5"
+                            text={request.answer ?? "…"}
+                            variant="block"
+                          />
+                        </div>
                         {request.answer !== null ? (
                           <div className="flex justify-end">
                             <CopyButton text={request.answer} label="answer" size="icon" />

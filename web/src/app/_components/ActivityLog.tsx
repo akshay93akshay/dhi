@@ -28,6 +28,7 @@ import { describeApiError } from "@/lib/ui";
 import { formatLocalTimestamp } from "@/lib/localTime";
 import { latestTeamRun, type TeamRun } from "@/lib/teamRun";
 import { CopyButton } from "@/components/ui/copy-button";
+import { MarkdownMath } from "@/components/markdown-math";
 import {
   Card,
   CardContent,
@@ -242,7 +243,11 @@ function ActivityEntry(props: { activity: Activity }) {
         {actor !== null ? <span className="feed-actor">{actor}</span> : null}
       </div>
       <div className="row spread">
-        <span className="feed-msg">{message}</span>
+        <MarkdownMath
+          className="feed-msg min-w-0 flex-1 text-[13.5px] leading-5 [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1 [&_.katex-display]:my-1"
+          text={message}
+          variant="block"
+        />
         <CopyButton text={message} label="message" size="icon" />
       </div>
       {toolIo !== null ? <ToolIoCell io={toolIo} /> : null}
