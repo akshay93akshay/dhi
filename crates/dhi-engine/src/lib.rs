@@ -976,12 +976,21 @@ impl Engine {
                     .into_iter()
                     .filter(|goal| goal.state == GoalState::Open)
                     .collect();
-                // A team failure returns to the planner as a visible recent
-                // failure. Keep the newest lines so the prompt stays bounded.
-                let mut failures: Vec<String> = self
+                // Both a team step failure and a single-worker call failure
+                // return to the planner as a visible recent failure. Merge
+                // them chronologically and keep the newest lines so the
+                // prompt stays bounded.
+                let mut failed = self
                     .store
                     .list_activity(task_id, Some("team_failed"))
-                    .await?
+                    .await?;
+                failed.extend(
+                    self.store
+                        .list_activity(task_id, Some("intent_failed"))
+                        .await?,
+                );
+                failed.sort_by_key(|activity| activity.id);
+                let mut failures: Vec<String> = failed
                     .into_iter()
                     .map(|activity| activity.message)
                     .collect();
@@ -1689,15 +1698,24 @@ impl Engine {
                             )
                             .await;
                     }
+                    // A worker call failure is evidence for the planner, not
+                    // an automatic task failure. Exhaust this intent and
+                    // return to the planner, which can retry with a different
+                    // plan or give up. The host guards (no-progress, rounds,
+                    // capacity) still cap the loop.
+                    let error = err.to_string();
+                    self.store
+                        .finish_intent(claimed.id, IntentState::Exhausted)
+                        .await?;
                     self.forget_plan(claimed.id);
-                    self.fail_task(
+                    self.log_activity(
                         task_id,
-                        &mut task,
-                        format!("worker call failed: {err}"),
-                        "worker",
+                        "intent_failed",
+                        format!("worker call failed: {error}"),
+                        serde_json::json!({"intent_id": claimed.id, "error": error}),
                     )
                     .await?;
-                    return Err(err);
+                    continue;
                 }
             };
             // The row names the intent the worker was claimed for. A failed
@@ -5761,6 +5779,96 @@ mod tests {
                 .iter()
                 .any(|fact| fact.claim.contains("the retry found it")),
             "{facts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_call_failure_returns_to_the_planner() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("failed worker");
+        let goal = seed_goal(&store, &task).await;
+        let doomed = IntentPlan {
+            intent: "doomed work".to_string(),
+            topology: Topology::Single,
+            workers: vec![],
+            subtasks: vec![],
+            limits: CapabilityLimits::default(),
+        };
+        let retry = IntentPlan {
+            intent: "recovered work".to_string(),
+            topology: Topology::Single,
+            workers: vec![],
+            subtasks: vec![],
+            limits: CapabilityLimits::default(),
+        };
+        let agent = Arc::new(TeamAgent::new(
+            vec![
+                ScriptedPlan::Outcome(planned_intent("doomed work", doomed)),
+                ScriptedPlan::Outcome(planned_intent("recovered work", retry)),
+                ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+            ],
+            vec![
+                ("doomed work", TeamWorker::Failure("worker exploded")),
+                ("recovered work", TeamWorker::Success("the retry found it")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone());
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(
+            result.task.state,
+            TaskState::Done,
+            "a failed worker returns to the planner; it does not fail the task"
+        );
+        let intents = store.intents(task.id);
+        assert_eq!(intents.len(), 2, "the planner added a second intent");
+        let failed_intent = intents
+            .iter()
+            .find(|intent| intent.description == "doomed work")
+            .expect("the failed intent");
+        let retried_intent = intents
+            .iter()
+            .find(|intent| intent.description == "recovered work")
+            .expect("the retried intent");
+        assert_eq!(failed_intent.state, IntentState::Exhausted);
+        assert_eq!(retried_intent.state, IntentState::Done);
+
+        let activities = store.activities(task.id);
+        assert!(
+            !activities
+                .iter()
+                .any(|activity| activity.kind == "task_failed"),
+            "no host guard fired, so the task must not fail"
+        );
+        let intent_failed: Vec<_> = activities
+            .iter()
+            .filter(|activity| activity.kind == "intent_failed")
+            .collect();
+        assert_eq!(intent_failed.len(), 1, "one failed worker call");
+        assert_eq!(
+            intent_failed[0].payload["intent_id"],
+            failed_intent.id.to_string()
+        );
+        assert!(
+            intent_failed[0].message.contains("worker exploded"),
+            "{}",
+            intent_failed[0].message
+        );
+
+        let planner_inputs = agent.plan_inputs();
+        assert_eq!(
+            planner_inputs.len(),
+            3,
+            "the planner decides after the failure and after the recovery"
+        );
+        assert!(
+            planner_inputs[1]
+                .failures
+                .iter()
+                .any(|failure| failure.contains("worker exploded")),
+            "{:?}",
+            planner_inputs[1].failures
         );
     }
 

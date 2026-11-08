@@ -80,7 +80,8 @@ pub struct SpecialistEntry {
     /// The guarded tools this specialist may call. Everything else is
     /// invisible to it.
     pub tools: Vec<String>,
-    /// Model-call budget for one specialist run. `None` uses the default.
+    /// Accepted for compatibility and retained on the spec; this value no
+    /// longer caps a run. `None` uses the default.
     #[serde(default)]
     pub max_turns: Option<usize>,
     /// Optional pinned profile for the specialist's own LLM calls.
@@ -857,7 +858,7 @@ impl SpecialistFleet {
         let response = agent
             .prompt(user.to_string())
             .tool_context(tool_context)
-            .max_turns(handle.spec.max_turns)
+            .max_turns(crate::PER_RUN_MODEL_CALL_CEILING)
             .await
             .map_err(|err| {
                 warn!(specialist = %handle.spec.name, "specialist call failed: {err}");

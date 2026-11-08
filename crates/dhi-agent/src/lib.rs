@@ -49,6 +49,15 @@ pub use tools::{
     register_guarded_tool, register_native_tool,
 };
 
+/// The model-call ceiling for one run.
+///
+/// rig defaults an unset budget to one model call, and every tool-loop
+/// iteration needs another call. DHI+ therefore gives one run a ceiling far
+/// above any real derivation: tool use never ends a run. The task ledger
+/// (`TaskCapacity::max_model_calls`) is the budget that decides when the task
+/// stops.
+pub const PER_RUN_MODEL_CALL_CEILING: usize = 1_000_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanInput {
     pub task_id: Uuid,
@@ -121,8 +130,9 @@ pub struct ExecuteInput {
     /// chain.
     #[serde(default)]
     pub worker_profile_id: Option<i64>,
-    /// The planner's per-worker turn budget for a DHI+ team turn. `None` uses
-    /// the runtime's role/manager budget (the legacy single-worker path).
+    /// The planner's per-worker value, retained for the plan/audit contract:
+    /// DHI+ no longer caps a run by model calls, and the task budget is the
+    /// only budget.
     #[serde(default)]
     pub max_turns: Option<usize>,
 }
@@ -765,7 +775,8 @@ fn private_tool_server(shared: &ToolServerHandle) -> ToolServerHandle {
 
 pub struct RigAgentRuntime {
     /// Legacy role profiles: env-resolved defaults, the fallback render
-    /// models, and the per-role conversation budgets (`max_turns`).
+    /// models, and the per-role configured `max_turns` values (retained for
+    /// config compatibility; they no longer cap a run).
     profiles: RoleProfiles,
     /// The shared failover pool. Calls resolve their candidate chain here.
     pool: Arc<LlmPool>,
@@ -784,7 +795,7 @@ pub struct RigAgentRuntime {
     /// The specialist fleet, when configured. `execute()` builds one
     /// delegation tool per specialist with a fresh per-attempt budget.
     specialists: Option<Arc<SpecialistFleet>>,
-    /// Delegation limits (also caps the manager run's turn budget).
+    /// Delegation limits (how many delegations one manager run may make).
     limits: DelegationLimits,
 }
 
@@ -844,7 +855,7 @@ impl RigAgentRuntime {
     /// The production constructor: the shared pool the server built from the
     /// store (and swaps on mutation) plus the prompt set.
     pub fn with_pool(pool: Arc<LlmPool>, prompts: PromptSet) -> Self {
-        // Legacy accessors and per-role conversation budgets stay env-shaped;
+        // Legacy accessors and per-role `max_turns` values stay env-shaped;
         // `max_turns` is not a database column.
         let snapshot = pool.load();
         let head = |role: Role| -> Option<ResolvedProfile> {
@@ -963,15 +974,6 @@ impl RigAgentRuntime {
         self.specialists.as_ref()
     }
 
-    /// The manager run's turn budget: the configured manager cap while
-    /// specialists exist (delegation needs more turns), else the role's own.
-    fn manager_max_turns(&self) -> usize {
-        match &self.specialists {
-            Some(_) => self.limits.manager_max_turns,
-            None => self.profiles.worker.max_turns,
-        }
-    }
-
     /// Renders the planner call from a [`PlanInput`], with no network access.
     pub fn render_plan(&self, input: &PlanInput) -> Result<RenderedCall, PromptError> {
         let vars = PlannerVars {
@@ -1060,9 +1062,10 @@ impl RigAgentRuntime {
         anthropic_client(profile)
     }
 
-    /// One completion attempt on one pool candidate, with the role's turn
-    /// budget. The system turn is the rendered preamble; the user turn is the
-    /// rendered user prompt. `tool_context` is the dispatch context every
+    /// One completion attempt on one pool candidate. Rig runs the model's tool
+    /// loop to its own end under [`PER_RUN_MODEL_CALL_CEILING`]; DHI+ budgets
+    /// at task level. The system turn is the rendered preamble; the user turn
+    /// is the rendered user prompt. `tool_context` is the dispatch context every
     /// in-loop tool call of this attempt sees (the worker's `RunScope`); the
     /// shared `tool_server` handle carries the registered guarded tools.
     /// Returns the final text, the Rig response (for its usage), and how long
@@ -1075,7 +1078,6 @@ impl RigAgentRuntime {
         tools: Vec<DynamicTool>,
         tool_context: Option<ToolContext>,
         tool_server: Option<ToolServerHandle>,
-        max_turns: usize,
     ) -> anyhow::Result<(String, rig::agent::PromptResponse, i64)> {
         let mut builder = match candidate.format {
             ProfileFormat::Openai => {
@@ -1128,7 +1130,7 @@ impl RigAgentRuntime {
             Some(context) => runner.tool_context(context),
             None => runner,
         };
-        match runner.max_turns(max_turns).await {
+        match runner.max_turns(PER_RUN_MODEL_CALL_CEILING).await {
             Ok(response) => {
                 let latency = latency_ms(started);
                 Ok((response.output().to_string(), response, latency))
@@ -1164,7 +1166,6 @@ impl RigAgentRuntime {
         call: &RenderedCall,
         tool_setup: ToolSetup,
         attempt_tools: impl Fn() -> anyhow::Result<(S, Vec<DynamicTool>)>,
-        max_turns: usize,
     ) -> anyhow::Result<(String, rig::agent::PromptResponse, i64, ResolvedProfile, S)>
     where
         S: Send,
@@ -1192,7 +1193,6 @@ impl RigAgentRuntime {
                         tools,
                         tool_setup.context.clone(),
                         tool_setup.registry.clone(),
-                        max_turns,
                     )
                     .await
                 {
@@ -1476,7 +1476,7 @@ impl PlannerSink {
                                         "max_turns": {
                                             "type": "integer",
                                             "minimum": 1,
-                                            "description": "Model turns for this worker. Choose enough for its tool calls, record_fact, and answer; the engine passes it through exactly."
+                                            "description": "Retained for the plan/audit contract. DHI+ no longer caps a run by model calls; the task budget is the only budget."
                                         }
                                     },
                                     "required": ["key", "role", "prompt", "max_turns"],
@@ -1861,7 +1861,6 @@ impl AgentRuntime for RigAgentRuntime {
                     let tools = sink.tools()?;
                     Ok((sink, tools))
                 },
-                self.profiles.planner.max_turns,
             )
             .await?;
         let thinking = response_thinking(&response);
@@ -1913,9 +1912,9 @@ impl AgentRuntime for RigAgentRuntime {
             context: Some(tool_context),
             registry: Some(worker_registry),
         };
-        // The planner's per-worker budget is authoritative for a DHI+ team
-        // turn. The legacy single-worker path keeps the runtime's budget.
-        let max_turns = input.max_turns.unwrap_or_else(|| self.manager_max_turns());
+        // The planner's per-worker `max_turns` is retained in `input` for the
+        // plan/audit contract only: DHI+ no longer caps a run by model calls,
+        // and the task budget is the only budget.
         let attempt_tools = || {
             let sink = WorkerSink::default();
             let mut tools = sink.tools()?;
@@ -1934,7 +1933,6 @@ impl AgentRuntime for RigAgentRuntime {
                 &call,
                 tool_setup.clone(),
                 &attempt_tools,
-                max_turns,
             )
             .await?;
         // A worker that answered with prose never called `record_fact`, so the
@@ -1954,7 +1952,6 @@ impl AgentRuntime for RigAgentRuntime {
                         &retry_call,
                         tool_setup,
                         &attempt_tools,
-                        max_turns,
                     )
                     .await?;
                 // If the retry also fails, its error is returned.
@@ -2000,7 +1997,7 @@ impl AgentRuntime for RigAgentRuntime {
     /// Chooses the actual DHI+ workers and subtasks through one worker-role
     /// completion call.
     ///
-    /// The manager gets no tools, one turn, and the task's pinned worker
+    /// The manager gets no tools and the task's pinned worker
     /// profile. Its answer is parsed and applied by
     /// [`apply_manager_choice`]; a parse or validation failure is returned to
     /// the engine, never silently replaced by the planner's plan. A dedicated
@@ -2017,7 +2014,6 @@ impl AgentRuntime for RigAgentRuntime {
                 &call,
                 ToolSetup::default(),
                 || Ok::<_, anyhow::Error>(((), Vec::new())),
-                1,
             )
             .await?;
         let thinking = response_thinking(&response);
@@ -2052,9 +2048,9 @@ impl AgentRuntime for RigAgentRuntime {
     ///
     /// It uses the worker-role failover chain (the task's worker pin first)
     /// but deliberately differs from `execute` in every capability boundary:
-    /// no shared tool registry is attached, no native tools are built, no
-    /// `RunScope`/`ToolContext` is stamped, and `max_turns` is 1. The only
-    /// input is the frozen snapshot text and the question.
+    /// no shared tool registry is attached, no native tools are built, and no
+    /// `RunScope`/`ToolContext` is stamped. The only input is the frozen
+    /// snapshot text and the question.
     async fn side_answer(&self, input: SideQuestionInput) -> anyhow::Result<AgentCall<String>> {
         let call = self.render_side_question(&input);
         let (text, response, latency, candidate, _sink) = self
@@ -2064,7 +2060,6 @@ impl AgentRuntime for RigAgentRuntime {
                 &call,
                 ToolSetup::default(),
                 || Ok::<_, anyhow::Error>(((), Vec::new())),
-                1,
             )
             .await?;
         let thinking = response_thinking(&response);
@@ -2316,7 +2311,6 @@ mod tests {
         let fleet = runtime.specialists().expect("a fleet is attached");
         assert_eq!(fleet.manager_max_turns(), DEFAULT_MANAGER_MAX_TURNS);
         assert_eq!(fleet.max_delegations(), DEFAULT_MAX_DELEGATIONS);
-        assert_eq!(runtime.manager_max_turns(), DEFAULT_MANAGER_MAX_TURNS);
     }
 
     #[test]
@@ -2325,7 +2319,6 @@ mod tests {
 
         assert!(runtime.specialists().is_none());
         assert_eq!(runtime.worker_profile().max_turns, 24);
-        assert_eq!(runtime.manager_max_turns(), 24);
     }
 
     #[test]
@@ -2338,7 +2331,6 @@ mod tests {
         let fleet = runtime.specialists().expect("a fleet is attached");
         assert_eq!(fleet.manager_max_turns(), DEFAULT_MANAGER_MAX_TURNS);
         assert_eq!(fleet.max_delegations(), DEFAULT_MAX_DELEGATIONS);
-        assert_eq!(runtime.manager_max_turns(), DEFAULT_MANAGER_MAX_TURNS);
     }
 
     #[test]
