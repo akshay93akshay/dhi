@@ -134,7 +134,7 @@ export function SideQuestions({ taskId }: { taskId: string }) {
               <MessageSquareText className="h-4 w-4" />
             </span>
             <div>
-              <CardTitle className="text-[18px]">Ask about this task</CardTitle>
+              <CardTitle>Ask about this task</CardTitle>
               <CardDescription className="mt-0.5">
                 Frozen snapshot · advisory only · cannot change the task.
               </CardDescription>
@@ -179,8 +179,8 @@ export function SideQuestions({ taskId }: { taskId: string }) {
         {sessions !== null && sessions.length === 0 ? (
           <div className="rounded-xl border border-dashed border-border bg-surface-subtle px-5 py-8 text-center">
             <Bot className="mx-auto h-5 w-5 text-muted-foreground" />
-            <p className="mt-2 text-[15px] font-medium leading-[1.55] text-foreground">No questions yet</p>
-            <p className="mt-1 text-[13px] leading-5 text-muted-foreground">
+            <p className="mt-2 type-body font-medium text-foreground">No questions yet</p>
+            <p className="mt-1 type-meta text-muted-foreground">
               Ask what happened, why it finished, or what the evidence was.
             </p>
           </div>
@@ -191,7 +191,7 @@ export function SideQuestions({ taskId }: { taskId: string }) {
             {sessions.map((session) => (
               <section className="border-b border-border pb-5 last:border-0 last:pb-0" key={session.id}>
                 <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                  <span className="flex items-center gap-2 text-[12px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+                  <span className="flex items-center gap-2 type-label font-semibold uppercase tracking-[0.12em] text-muted-foreground">
                     <Bot className="h-3 w-3" /> Session · {formatLocalTimestamp(session.created_at)}
                   </span>
                   <StateBadge state={session.status} />
@@ -202,10 +202,10 @@ export function SideQuestions({ taskId }: { taskId: string }) {
                 {session.requests.map((request) => (
                   <div className="mt-3 space-y-1.5" key={request.id}>
                     <div className="flex items-start justify-between gap-2">
-                      <div className="flex min-w-0 flex-1 items-start gap-2 text-[15px] font-medium leading-[1.55] text-foreground">
+                      <div className="flex min-w-0 flex-1 items-start gap-2 type-body font-medium text-foreground">
                         <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-muted-foreground" />
                         <MarkdownMath
-                          className="min-w-0 flex-1 text-[15px] font-medium leading-[1.55] [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1 [&_.katex-display]:my-1"
+                          className="min-w-0 flex-1 type-body font-medium [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1 [&_.katex-display]:my-1"
                           text={request.question}
                           variant="block"
                         />
@@ -218,14 +218,14 @@ export function SideQuestions({ taskId }: { taskId: string }) {
                       />
                     </div>
                     {request.status === "error" ? (
-                      <div className="side-answer side-answer-error">
+                      <div className="side-answer side-answer-error type-goal">
                         Could not answer: {request.error ?? "the answerer failed"}
                       </div>
                     ) : (
                       <>
                         <div className="side-answer">
                           <MarkdownMath
-                            className="mt-0 text-[15px] leading-[1.55] [&_p+p]:mt-2 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1.5 [&_.katex-display]:my-1.5"
+                            className="mt-0 type-goal [&_p+p]:mt-2 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1.5 [&_.katex-display]:my-1.5"
                             text={request.answer ?? "…"}
                             variant="block"
                           />
@@ -237,9 +237,9 @@ export function SideQuestions({ taskId }: { taskId: string }) {
                         ) : null}
                       </>
                     )}
-                    <div className="flex flex-wrap items-center gap-2 text-[13px] leading-5 text-muted-foreground">
+                    <div className="flex flex-wrap items-center gap-2 type-meta text-muted-foreground">
                       <span>{formatLocalTimestamp(request.created_at)}</span>
-                      {request.model !== null ? <span className="font-mono text-[12.5px]">{request.model}</span> : null}
+                      {request.model !== null ? <span className="type-mono">{request.model}</span> : null}
                     </div>
                   </div>
                 ))}
@@ -261,7 +261,7 @@ export function SideQuestions({ taskId }: { taskId: string }) {
         ) : null}
 
         <form className="mt-4 space-y-2" onSubmit={(event) => void submit(event)}>
-          <label className="text-[12px] font-semibold text-foreground" htmlFor="side-question">
+          <label className="type-label font-semibold text-foreground" htmlFor="side-question">
             Question
           </label>
           <Textarea
@@ -274,7 +274,7 @@ export function SideQuestions({ taskId }: { taskId: string }) {
             onChange={(event) => setQuestion(event.target.value)}
           />
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="text-[12px] tabular-nums text-muted-foreground">
+            <span className="type-meta tabular-nums text-muted-foreground">
               {question.length}/{MAX_QUESTION_CHARS}
             </span>
             <Button
@@ -286,7 +286,7 @@ export function SideQuestions({ taskId }: { taskId: string }) {
               {pending ? "Asking…" : "Ask"}
             </Button>
           </div>
-          <p className="text-[13px] leading-5 text-muted-foreground">
+          <p className="type-meta text-muted-foreground">
             Answers are advisory text. They are never recorded as facts and
             cannot change goals, intents, or the work graph.
           </p>

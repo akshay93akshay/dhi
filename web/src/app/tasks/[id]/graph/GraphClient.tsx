@@ -184,8 +184,8 @@ function TaskGraphView() {
         />
         <div className="flex min-h-[240px] flex-col items-center justify-center rounded-xl border border-dashed border-border bg-surface-subtle px-6 py-10 text-center">
           <CircleAlert className="h-6 w-6 text-muted-foreground" />
-          <h2 className="mt-3 text-[18px] font-semibold">No work graph for this task</h2>
-          <p className="mt-1 max-w-md text-[13px] leading-5 text-muted-foreground">
+          <h2 className="type-section mt-3 font-semibold">No work graph for this task</h2>
+          <p className="type-meta mt-1 max-w-md text-muted-foreground">
             The id may belong to a different database, or the task may have been
             removed.
           </p>
@@ -238,9 +238,9 @@ function TaskGraphView() {
           className={`${GRAPH_PANEL_HEIGHT} flex flex-col items-center justify-center rounded-xl border border-border bg-card px-6 py-10 text-center`}
         >
           <CircleAlert className="h-6 w-6 text-destructive" />
-          <h2 className="mt-3 text-[18px] font-semibold">Could not load task graph</h2>
+          <h2 className="type-section mt-3 font-semibold">Could not load task graph</h2>
           <p
-            className="mt-1 max-w-lg break-words text-[13px] leading-5 text-muted-foreground"
+            className="type-meta mt-1 max-w-lg break-words text-muted-foreground"
             role="alert"
           >
             {pageError ?? "The work graph request failed."}
@@ -279,7 +279,7 @@ function TaskGraphView() {
               #{shortenId(work.task.id)}
             </span>
             {updatedAt !== null ? (
-              <span className="text-[13px] leading-5 text-muted-foreground">
+              <span className="type-meta text-muted-foreground">
                 updated {formatLocalTimestamp(updatedAt.toISOString())}
               </span>
             ) : null}
@@ -301,7 +301,7 @@ function TaskGraphView() {
 
       {pollError !== null ? (
         <p
-          className="text-[13px] leading-5 text-warning"
+          className="type-meta text-warning"
           role="status"
         >
           Auto-refresh failed: {pollError} — showing the last snapshot and

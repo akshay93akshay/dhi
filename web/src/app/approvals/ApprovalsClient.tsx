@@ -477,7 +477,7 @@ function ApprovalCard(props: {
           Asked because: {item.reason === "" ? "(no reason recorded)" : item.reason}
         </p>
 
-        <p className="mt-2 type-meta">
+        <p className="mt-2 type-table">
           Task:{" "}
           <Link
             href={`/tasks/${item.task_id}`}

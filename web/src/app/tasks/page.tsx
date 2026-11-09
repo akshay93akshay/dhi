@@ -310,8 +310,7 @@ export default function TasksPage() {
           <Button
             type="button"
             variant="outline"
-            size="sm"
-            className="h-8 rounded-full"
+            className="h-8 rounded-full px-3"
             onClick={() => void load()}
             disabled={refreshing}
           >
@@ -320,7 +319,7 @@ export default function TasksPage() {
             />
             Refresh
           </Button>
-          <Button asChild size="sm" className="h-8 rounded-full">
+          <Button asChild className="h-8 rounded-full px-3">
             <Link href="/#new-task">
               <Plus className="h-3.5 w-3.5" />
               New task
@@ -361,8 +360,7 @@ export default function TasksPage() {
             <Button
               type="button"
               variant="destructive"
-              size="sm"
-              className="h-8 rounded-full"
+              className="h-8 rounded-full px-3"
               onClick={() => {
                 setActionError(null);
                 setDeleteTarget(null);
@@ -401,7 +399,6 @@ export default function TasksPage() {
                   <Button
                     type="button"
                     variant="outline"
-                    size="sm"
                     onClick={() => void load()}
                   >
                     Retry
@@ -428,7 +425,7 @@ export default function TasksPage() {
             <div className="overflow-x-auto">
               <table className="w-full min-w-[900px] table-fixed type-table">
                 <thead>
-                  <tr className="border-y border-border bg-surface-subtle text-left type-label uppercase tracking-[0.09em] text-muted-foreground">
+                  <tr className="border-y border-border bg-surface-subtle text-left type-meta uppercase tracking-[0.09em] text-muted-foreground">
                     <th className="w-[52px] px-5 py-3 font-semibold">
                       <span className="sr-only">Select</span>
                     </th>
@@ -546,8 +543,7 @@ export default function TasksPage() {
                             <Button
                               type="button"
                               variant="outline"
-                              size="sm"
-                              className="h-8 gap-1.5 px-2.5 type-label"
+                              className="h-8 gap-1.5 px-2.5 type-table"
                               disabled
                             >
                               <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -557,8 +553,7 @@ export default function TasksPage() {
                             <Button
                               type="button"
                               variant="outline"
-                              size="sm"
-                              className="h-8 gap-1.5 px-2.5 type-label"
+                              className="h-8 gap-1.5 px-2.5 type-table"
                               onClick={() => setStopTarget(task)}
                               disabled={deleting}
                             >
@@ -569,8 +564,7 @@ export default function TasksPage() {
                             <Button
                               type="button"
                               variant="ghost"
-                              size="sm"
-                              className="h-8 gap-1.5 px-2.5 type-label text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                              className="h-8 gap-1.5 px-2.5 type-table text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                               onClick={() => {
                                 setActionError(null);
                                 setDeleteTarget(task);

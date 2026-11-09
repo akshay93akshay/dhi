@@ -164,7 +164,7 @@ export function ToolCatalogTable({
             <TableRow>
               <TableCell
                 colSpan={editable ? 6 : 5}
-                className="py-6 type-body text-muted-foreground"
+                className="py-6 type-table text-muted-foreground"
               >
                 {emptyMessage}
               </TableCell>
@@ -211,7 +211,7 @@ export function ToolCatalogTable({
                   </div>
                 </TableCell>
                 <TableCell className="max-w-[18rem]">
-                  <div className="type-meta text-muted-foreground">
+                  <div className="type-table text-muted-foreground">
                     {formatToolRoles(tool.default_roles)}
                   </div>
                 </TableCell>
@@ -219,7 +219,7 @@ export function ToolCatalogTable({
                   {tool.deferred ? (
                     <Badge variant="warning">deferred</Badge>
                   ) : (
-                    <span className="type-meta text-muted-foreground">—</span>
+                    <span className="type-table text-muted-foreground">—</span>
                   )}
                 </TableCell>
                 {editable ? (
@@ -270,7 +270,7 @@ export function ToolCatalogTable({
               {roleChoices.map((role) => (
                 <label
                   key={role}
-                  className="flex min-h-10 cursor-pointer items-center gap-2 rounded-md border border-border px-3 py-2 type-table"
+                  className="flex min-h-10 cursor-pointer items-center gap-2 rounded-md border border-border px-3 py-2 type-body"
                 >
                   <Checkbox
                     checked={selectedRoles.includes(role)}

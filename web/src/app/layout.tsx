@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import "@fontsource-variable/source-sans-3";
 import "./globals.css";
 import { AppShell } from "@/components/app-shell";
 import { PreferencesProvider } from "@/components/preferences-provider";

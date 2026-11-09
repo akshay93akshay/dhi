@@ -294,7 +294,7 @@ export function buildTaskGraphFlow(
       },
       labelStyle: {
         fill: TASK_GRAPH_FLOW_EDGE_LABEL_COLOR,
-        fontSize: 12,
+        fontSize: 13,
         fontWeight: 600,
       },
       labelBgStyle: {

@@ -108,12 +108,12 @@ export function CapacityCard(props: {
           <div className="grid grid-cols-2 gap-2.5 lg:grid-cols-4">
             {CAPACITY_FIELDS.map((field) => (
               <label className="space-y-1.5" key={field.key}>
-                <span className="block text-[12px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+                <span className="block type-label font-semibold uppercase tracking-[0.08em] text-muted-foreground">
                   {field.label}
                 </span>
                 <Input
                   aria-label={field.label}
-                  className="h-9 font-mono text-[12.5px]"
+                  className="h-10 type-mono"
                   disabled={pending}
                   inputMode="numeric"
                   min={1}
@@ -133,23 +133,23 @@ export function CapacityCard(props: {
           </div>
           <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
             <Button
-              className="h-8 rounded-full"
+              className="h-9 rounded-full"
               disabled={pending}
               size="sm"
               type="submit"
             >
               {pending ? "Extending…" : "Extend capacity"}
             </Button>
-            <p className="text-[13px] leading-5 text-muted-foreground">
+            <p className="type-meta text-muted-foreground">
               Blank fields keep their stored limit.
             </p>
             {notice !== null ? (
-              <span className="text-[13px] font-medium leading-5 text-success" role="status">
+              <span className="type-meta font-medium text-success" role="status">
                 {notice}
               </span>
             ) : null}
             {error !== null ? (
-              <span className="text-[13px] font-medium leading-5 text-destructive" role="alert">
+              <span className="type-meta font-medium text-destructive" role="alert">
                 {error}
               </span>
             ) : null}

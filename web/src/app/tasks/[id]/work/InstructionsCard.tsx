@@ -138,7 +138,7 @@ export function InstructionsCard(props: {
             <MessageSquareText className="h-4 w-4" />
           </span>
           <div>
-            <CardTitle className="text-[18px]">Instructions</CardTitle>
+            <CardTitle>Instructions</CardTitle>
             <CardDescription className="mt-0.5">
               Planner-only notes; workers never see them.
             </CardDescription>
@@ -152,7 +152,7 @@ export function InstructionsCard(props: {
       </CardHeader>
       <CardContent className="space-y-3 pt-4">
         <div>
-          <h3 className="text-[12px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+          <h3 className="type-label font-semibold uppercase tracking-[0.12em] text-muted-foreground">
             Instruction history
           </h3>
 
@@ -167,7 +167,7 @@ export function InstructionsCard(props: {
           ) : null}
 
           {instructions !== null && instructions.length === 0 ? (
-            <p className="mt-2 rounded-lg border border-dashed border-border bg-surface-subtle px-3 py-3 text-[13px] leading-5 text-muted-foreground">
+            <p className="mt-2 rounded-lg border border-dashed border-border bg-surface-subtle px-3.5 py-3 type-meta text-muted-foreground">
               No instructions yet.
             </p>
           ) : null}
@@ -178,14 +178,14 @@ export function InstructionsCard(props: {
                 const status = instructionStatus(instruction);
                 return (
                   <li
-                    className="rounded-md border border-border bg-surface-subtle px-3.5 py-2.5"
+                    className="rounded-md border border-border bg-surface-subtle px-4 py-3"
                     key={instruction.id}
                   >
                     <MarkdownMath
-                      className="text-[15px] leading-[1.55] text-foreground [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_.katex-display]:my-1"
+                      className="type-body text-foreground [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_.katex-display]:my-1"
                       text={instruction.text}
                     />
-                    <p className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] leading-5 text-muted-foreground">
+                    <p className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 type-meta text-muted-foreground">
                       <Badge
                         className="font-normal"
                         variant={status === "delivered" ? "success" : "outline"}
@@ -217,7 +217,7 @@ export function InstructionsCard(props: {
           <div className="flex flex-wrap items-center gap-2">
             <Input
               id="instruction-text"
-              className="h-9 min-w-0 flex-1 text-[15px]"
+              className="h-10 min-w-0 flex-1 type-body"
               value={text}
               placeholder="Tell the planner what to do next…"
               onChange={(event) => {
@@ -229,7 +229,7 @@ export function InstructionsCard(props: {
               disabled={sending || !accepts}
             />
             <Button
-              className="h-9 rounded-full"
+              className="h-10 rounded-full"
               disabled={sending || !accepts}
               size="sm"
               type="submit"
@@ -239,12 +239,12 @@ export function InstructionsCard(props: {
             </Button>
           </div>
           {!accepts ? (
-            <p className="mt-1.5 text-[12px] leading-[1.45] text-muted-foreground">
+            <p className="mt-1.5 type-meta text-muted-foreground">
               This task is terminal, so instructions are disabled.
             </p>
           ) : sendError !== null ? (
             <p
-              className="mt-1.5 text-[12px] leading-[1.45] text-destructive"
+              className="mt-1.5 type-meta text-destructive"
               role="alert"
             >
               {sendError}

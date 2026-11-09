@@ -41,7 +41,7 @@ function PreferenceSection({
 }) {
   return (
     <div className="space-y-1.5">
-      <div className="type-label font-semibold text-foreground">{label}</div>
+      <div className="type-meta font-semibold text-foreground">{label}</div>
       <ToggleGroup
         type="single"
         value={value}

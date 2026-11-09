@@ -247,7 +247,7 @@ export function McpServerFormDialog({
                   value={form.args}
                   onChange={(event) => update("args", event.target.value)}
                   placeholder={"-y\n@modelcontextprotocol/server-github"}
-                  className="type-mono"
+                  className="font-mono"
                 />
                 <p className="type-meta text-muted-foreground">
                   One argument per line preserves spaces inside an argument.
@@ -263,7 +263,7 @@ export function McpServerFormDialog({
                   value={form.env}
                   onChange={(event) => update("env", event.target.value)}
                   placeholder="GITHUB_TOKEN=…"
-                  className="type-mono"
+                  className="font-mono"
                 />
               </div>
             </div>
@@ -288,7 +288,7 @@ export function McpServerFormDialog({
                   value={form.headers}
                   onChange={(event) => update("headers", event.target.value)}
                   placeholder="Authorization=Bearer …"
-                  className="type-mono"
+                  className="font-mono"
                 />
                 <p className="type-meta text-muted-foreground">
                   Header values are write-only; the server returns only masked

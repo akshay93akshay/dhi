@@ -348,7 +348,7 @@ export function McpClient() {
                     <TableRow>
                       <TableCell
                         colSpan={9}
-                        className="py-6 type-body text-muted-foreground"
+                        className="py-6 type-table text-muted-foreground"
                       >
                         No MCP servers are configured. Add one here, or edit
                         ops/mcp.json and reload.
@@ -378,7 +378,7 @@ export function McpClient() {
                           <TableCell className="type-mono font-semibold">
                             {row.name}
                           </TableCell>
-                          <TableCell className="whitespace-nowrap type-meta">
+                          <TableCell className="whitespace-nowrap type-table">
                             {transport ?? "—"}
                             {timeout !== undefined ? (
                               <span className="text-muted-foreground">
@@ -402,7 +402,7 @@ export function McpClient() {
                             )}
                           </TableCell>
                           <TableCell
-                            className="type-meta"
+                            className="type-table"
                             title={tools.map((tool) => tool.name).join(", ")}
                           >
                             {row.status === undefined ? "—" : tools.length}
@@ -412,12 +412,12 @@ export function McpClient() {
                               {target ?? "—"}
                             </span>
                           </TableCell>
-                          <TableCell className="max-w-[14rem] type-meta text-muted-foreground">
+                          <TableCell className="max-w-[14rem] type-table text-muted-foreground">
                             {headerNames.length === 0
                               ? "—"
                               : headerNames.join(", ")}
                           </TableCell>
-                          <TableCell className="max-w-[18rem] break-words type-meta text-destructive">
+                          <TableCell className="max-w-[18rem] break-words type-table text-destructive">
                             {row.status?.last_error ?? "—"}
                           </TableCell>
                           <TableCell>

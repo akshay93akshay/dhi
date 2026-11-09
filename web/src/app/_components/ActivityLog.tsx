@@ -170,18 +170,18 @@ function ToolValueBlock(props: { label: string; text: string }) {
   return (
     <div className="min-w-0">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-[12px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+        <span className="type-label font-semibold uppercase tracking-[0.08em] text-muted-foreground">
           {label}
         </span>
         <CopyButton text={text} label={lower} size="icon" />
       </div>
-      <pre className="pre mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words">
+      <pre className="pre mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words type-mono">
         {preview}
       </pre>
       {truncated ? (
         <details className="feed-details">
           <summary className="subtle">Show full {lower}</summary>
-          <pre className="pre max-h-80">{text}</pre>
+          <pre className="pre max-h-96 type-mono">{text}</pre>
         </details>
       ) : null}
     </div>
@@ -195,9 +195,9 @@ function ToolValueBlock(props: { label: string; text: string }) {
 function ToolIoCell(props: { io: FeedToolIo }) {
   const { io } = props;
   return (
-    <div className="mt-2 rounded-lg border border-border bg-surface-subtle px-3 py-2">
+    <div className="mt-2 rounded-lg border border-border bg-surface-subtle px-3.5 py-2.5">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-[12px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+        <span className="type-label font-semibold uppercase tracking-[0.08em] text-muted-foreground">
           Tool call
         </span>
         <CopyButton
@@ -244,7 +244,7 @@ function ActivityEntry(props: { activity: Activity }) {
       </div>
       <div className="row spread">
         <MarkdownMath
-          className="feed-msg min-w-0 flex-1 text-[15px] leading-[1.55] [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1 [&_.katex-display]:my-1"
+          className="feed-msg min-w-0 flex-1 type-body [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1 [&_.katex-display]:my-1"
           text={message}
           variant="block"
         />
@@ -300,7 +300,7 @@ function TeamRunPanel(props: { run: TeamRun }) {
     <div className="mb-4 rounded-lg border border-border bg-surface-subtle px-3.5 py-3">
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="text-[12px] font-semibold uppercase tracking-wide text-muted-foreground">
+          <span className="type-label font-semibold uppercase tracking-wide text-muted-foreground">
             Team run
           </span>
           <Badge variant="outline" className="font-normal">
@@ -309,7 +309,7 @@ function TeamRunPanel(props: { run: TeamRun }) {
           <Badge variant="accent" className="font-mono">
             {run.topology}
           </Badge>
-          <span className="text-[13px] leading-5 text-muted-foreground">
+          <span className="type-meta text-muted-foreground">
             {run.workerCount} worker{run.workerCount === 1 ? "" : "s"}
           </span>
         </div>
@@ -336,7 +336,7 @@ function TeamRunPanel(props: { run: TeamRun }) {
           {run.workers.map((worker, index) => (
             <li
               key={`${worker.key}:${index}`}
-              className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border bg-card px-3 py-2 text-[13px] leading-5"
+              className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border bg-card px-3.5 py-2.5 type-meta"
             >
               <span className="mono font-medium" title={worker.key}>
                 {worker.key}
@@ -356,7 +356,7 @@ function TeamRunPanel(props: { run: TeamRun }) {
           ))}
         </ul>
       ) : (
-        <p className="mt-2 text-[13px] leading-5 text-muted-foreground">
+        <p className="mt-2 type-meta text-muted-foreground">
           Worker details were not recorded for this run.
         </p>
       )}
@@ -374,7 +374,7 @@ export function LiveActivityFeed(props: {
     <Card>
       <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
         <div>
-          <CardTitle className="text-[18px]">Activity</CardTitle>
+          <CardTitle>Activity</CardTitle>
           <CardDescription className="mt-0.5">
             Live event log — newest last, last ten shown.
           </CardDescription>
@@ -426,7 +426,7 @@ export function RecentActivityFeed(props: {
     <Card>
       <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
         <div>
-          <CardTitle className="text-[18px]">Recent activity</CardTitle>
+          <CardTitle>Recent activity</CardTitle>
           <CardDescription className="mt-0.5">
             Latest events — newest last.
           </CardDescription>
@@ -449,7 +449,7 @@ export function RecentActivityFeed(props: {
 
         <ActivityList rows={rows} max={FEED_RECENT_COUNT} />
 
-        <p className="mt-3 text-[13px] leading-5">
+        <p className="mt-3 type-meta">
           <Link
             href={`/tasks/${props.taskId}/work`}
             className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground"

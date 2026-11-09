@@ -157,7 +157,7 @@ function TaskGraphNodeCard({ data, selected }: NodeProps<TaskGraphFlowNode>) {
             aria-hidden="true"
           />
           <span
-            className="min-w-0 flex-1 text-[12px] font-bold uppercase tracking-[0.13em]"
+            className="type-label min-w-0 flex-1 font-bold uppercase tracking-[0.13em]"
             style={{ color }}
           >
             {node.kindLabel}
@@ -172,12 +172,12 @@ function TaskGraphNodeCard({ data, selected }: NodeProps<TaskGraphFlowNode>) {
           ) : null}
         </span>
         <span
-          className="mt-1.5 line-clamp-3 min-h-0 flex-1 break-words text-[15px] font-medium leading-[1.55] text-foreground [overflow-wrap:anywhere]"
+          className="mt-1.5 line-clamp-3 min-h-0 flex-1 break-words text-[16px] font-medium leading-[1.5] text-foreground [overflow-wrap:anywhere]"
           title={preview}
         >
           {preview}
         </span>
-        <span className="mt-2 flex min-w-0 items-start gap-1.5 text-[12px] leading-[1.4] text-muted-foreground">
+        <span className="type-label mt-2 flex min-w-0 items-start gap-1.5 text-muted-foreground">
           <span
             className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full"
             style={{ background: stateColor(node.state) }}
@@ -246,7 +246,7 @@ const EDGE_TYPES: EdgeTypes = {
 function InspectorSection(props: { title: string; children: ReactNode }) {
   return (
     <section>
-      <h3 className="text-[12px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+      <h3 className="type-label font-semibold uppercase tracking-[0.12em] text-muted-foreground">
         {props.title}
       </h3>
       {props.children}
@@ -291,13 +291,13 @@ function TaskGraphInspector(props: {
         </span>
         <div className="min-w-0 flex-1">
           <p
-            className="text-[12px] font-bold uppercase tracking-[0.13em]"
+            className="type-label font-bold uppercase tracking-[0.13em]"
             style={{ color }}
           >
             {TASK_GRAPH_KIND_LABELS[data.kind]}
           </p>
           <p
-            className="mono truncate text-[12.5px] text-muted-foreground"
+            className="type-mono truncate text-muted-foreground"
             title={data.nodeId}
           >
             {data.entityId}
@@ -328,11 +328,11 @@ function TaskGraphInspector(props: {
 
         <InspectorSection title={heading}>
           <MarkdownMath
-            className="mt-1 text-[15px] leading-[1.55] text-foreground [&_p+p]:mt-2 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_.katex-display]:my-1"
+            className="type-goal mt-1 text-foreground [&_p+p]:mt-2 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_.katex-display]:my-1 [&_pre]:text-[13.5px]"
             text={fullLabel}
           />
           <CopyButton
-            className="-ml-2 mt-1 h-7 text-[12px]"
+            className="-ml-2 mt-1 h-7 type-label"
             label="Copy label"
             text={fullLabel}
           />
@@ -340,7 +340,7 @@ function TaskGraphInspector(props: {
 
         <InspectorSection title="ID">
           <div className="mt-1 flex items-start gap-1 rounded-lg border border-border bg-surface-subtle px-3 py-2.5">
-            <code className="mono min-w-0 flex-1 break-all text-[12.5px] leading-[1.5] text-foreground">
+            <code className="type-mono min-w-0 flex-1 break-all text-foreground">
               {data.entityId}
             </code>
             <CopyButton
@@ -349,8 +349,8 @@ function TaskGraphInspector(props: {
               text={data.entityId}
             />
           </div>
-          <p className="mt-1 break-all text-[12px] leading-[1.45] text-muted-foreground">
-            node <span className="mono">{data.nodeId}</span>
+          <p className="type-label mt-1 break-all text-muted-foreground">
+            node <span className="type-mono">{data.nodeId}</span>
           </p>
         </InspectorSection>
       </div>
@@ -421,10 +421,10 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
         <span className="flex h-11 w-11 items-center justify-center rounded-full border border-border bg-card text-muted-foreground">
           <GitBranch className="h-5 w-5" />
         </span>
-        <h3 className="mt-3 text-[18px] font-semibold text-foreground">
+        <h3 className="type-section mt-3 font-semibold text-foreground">
           No work nodes yet
         </h3>
-        <p className="mt-1 max-w-md text-[13px] leading-5 text-muted-foreground">
+        <p className="type-meta mt-1 max-w-md text-muted-foreground">
           This task has no goals, intents, facts, or results. Its graph will
           appear here as the planner and workers record work.
         </p>
@@ -444,7 +444,7 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
             {KIND_ORDER.map((kind) => (
               <span
                 key={kind}
-                className="inline-flex items-center gap-1 text-[12px] font-medium text-muted-foreground"
+                className="type-label inline-flex items-center gap-1 font-medium text-muted-foreground"
               >
                 <span
                   className="h-1.5 w-1.5 rounded-full"
@@ -454,7 +454,7 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
                 {TASK_GRAPH_KIND_LABELS[kind]}
               </span>
             ))}
-            <span className="inline-flex items-center gap-1 text-[12px] font-medium text-muted-foreground">
+            <span className="type-label inline-flex items-center gap-1 font-medium text-muted-foreground">
               <span className="flex h-3 w-3 items-center justify-center rounded-full bg-success text-success-foreground">
                 <Check className="h-2 w-2" strokeWidth={3} aria-hidden="true" />
               </span>
@@ -463,7 +463,7 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
           </div>
           <Badge
             variant="outline"
-            className="ml-auto font-mono font-normal tabular-nums"
+            className="ml-auto type-meta font-mono font-normal tabular-nums"
           >
             {model.nodes.length} nodes · {model.edges.length} edges
           </Badge>
@@ -481,10 +481,11 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
             edgesReconnectable={false}
             elementsSelectable
             fitView
-            // The 0.9 floor keeps the 15px card text at 13.5px or larger.
-            fitViewOptions={{ padding: 0.06, minZoom: 0.9, maxZoom: 1.1 }}
+            // The 1x floor keeps card and edge labels at their spec size; the
+            // stage pans when a fitted graph is wider than the viewport.
+            fitViewOptions={{ padding: 0.06, minZoom: 1, maxZoom: 1.1 }}
             maxZoom={1.1}
-            minZoom={0.9}
+            minZoom={1}
             nodes={flow.nodes}
             nodesConnectable={false}
             nodesDraggable={false}
@@ -520,10 +521,10 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
             <span className="flex h-10 w-10 items-center justify-center rounded-full border border-border bg-surface-subtle text-muted-foreground">
               <MousePointerClick className="h-4 w-4" />
             </span>
-            <p className="mt-2 text-[15px] font-semibold leading-[1.55] text-foreground">
+            <p className="type-table mt-2 font-semibold text-foreground">
               Select a node
             </p>
-            <p className="mt-1 max-w-[240px] text-[13px] leading-5 text-muted-foreground">
+            <p className="type-meta mt-1 max-w-[240px] text-muted-foreground">
               Click any card to inspect its full label, state, and ids.
             </p>
           </div>

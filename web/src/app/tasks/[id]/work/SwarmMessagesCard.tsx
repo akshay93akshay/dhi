@@ -93,7 +93,7 @@ function SelectorButton(props: {
     <Button
       aria-pressed={props.active}
       className={cn(
-        "h-7 rounded-full px-2.5 text-[12px]",
+        "h-8 rounded-full px-2.5 type-label",
         props.active
           ? "border-accent-foreground/30 bg-accent text-accent-foreground hover:bg-accent"
           : "text-muted-foreground",
@@ -133,15 +133,15 @@ function buildFlowNodes(model: SwarmGraphModel): Node<WorkerNodeData>[] {
         recipient,
         label: (
           <div className="flex w-[150px] flex-col items-center gap-1">
-            <span className="mono max-w-full truncate text-[12.5px] font-semibold leading-tight">
+            <span className="mono max-w-full truncate font-semibold leading-tight">
               {sender}
             </span>
-            <span className="text-[12px] leading-[1.35] text-muted-foreground">
+            <span className="type-label text-muted-foreground">
               {count} message{count === 1 ? "" : "s"}
             </span>
             {status !== null ? (
               <span
-                className="text-[12px] font-semibold uppercase leading-[1.35] tracking-[0.08em]"
+                className="type-label font-semibold uppercase tracking-[0.08em]"
                 style={{ color: model.color }}
               >
                 {status}
@@ -202,13 +202,13 @@ function SwarmMessageDetail(props: { model: SwarmGraphModel }) {
   }
   const from = message.from ?? "unknown";
   return (
-    <div className="rounded-lg border border-border bg-surface-subtle p-3">
+    <div className="rounded-lg border border-border bg-surface-subtle p-4">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
         <Badge className="font-normal" variant={kindVariant(message.kind)}>
           {swarmKindLabel(message.kind)}
         </Badge>
-        <span className="mono text-[12.5px] font-semibold">{from}</span>
-        <span className="text-[13px] text-muted-foreground">
+        <span className="mono font-semibold">{from}</span>
+        <span className="type-meta text-muted-foreground">
           {recipientText(model.recipients.length)}
         </span>
         {message.repeatOf !== null ? (
@@ -224,11 +224,11 @@ function SwarmMessageDetail(props: { model: SwarmGraphModel }) {
         />
       </div>
       <MarkdownMath
-        className="mt-2 max-h-72 overflow-auto text-[15px] leading-[1.55] [&_p+p]:mt-2 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1.5 [&_.katex-display]:my-1.5"
+        className="mt-2 max-h-96 overflow-auto type-goal [&_p+p]:mt-2 [&_ul]:my-1.5 [&_ol]:my-1.5 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1.5 [&_.katex-display]:my-1.5"
         text={message.fullText}
         variant="block"
       />
-      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[13px] leading-5 text-muted-foreground">
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 type-meta text-muted-foreground">
         <span>
           id <span className="mono text-foreground">#{message.id}</span>
         </span>
@@ -390,7 +390,7 @@ export function SwarmMessagesCard(props: { taskId: string }) {
             <MessageSquareText className="h-4 w-4" />
           </span>
           <div>
-            <CardTitle className="text-[18px]">Swarm messages</CardTitle>
+            <CardTitle>Swarm messages</CardTitle>
             <CardDescription className="mt-0.5">
               Who broadcast what to whom, per run and round.
             </CardDescription>
@@ -429,7 +429,7 @@ export function SwarmMessagesCard(props: { taskId: string }) {
         ) : null}
 
         {messages !== null && messages.length === 0 ? (
-          <div className="rounded-lg border border-dashed border-border bg-surface-subtle px-4 py-7 text-center text-[13px] leading-5 text-muted-foreground">
+          <div className="rounded-lg border border-dashed border-border bg-surface-subtle px-4 py-7 text-center type-meta text-muted-foreground">
             No swarm messages recorded for this task.
           </div>
         ) : null}
@@ -453,7 +453,7 @@ export function SwarmMessagesCard(props: { taskId: string }) {
               <div className="space-y-2.5">
                 {runs.length > 1 ? (
                   <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[12px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+                    <span className="type-label font-semibold uppercase tracking-[0.08em] text-muted-foreground">
                       Run
                     </span>
                     {runs.map((run, index) => (
@@ -474,7 +474,7 @@ export function SwarmMessagesCard(props: { taskId: string }) {
 
                 {selectedRun.rounds.length > 1 ? (
                   <div className="flex flex-wrap items-center gap-1.5">
-                    <span className="text-[12px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+                    <span className="type-label font-semibold uppercase tracking-[0.08em] text-muted-foreground">
                       Round
                     </span>
                     {selectedRun.rounds.map((round, index) => (
@@ -504,7 +504,7 @@ export function SwarmMessagesCard(props: { taskId: string }) {
                           key={chip.id}
                           aria-pressed={chip.selected}
                           className={cn(
-                            "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[12px] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                            "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1.5 type-label transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
                             chip.selected
                               ? "border-accent-foreground/40 bg-accent text-accent-foreground"
                               : "border-border bg-card text-foreground hover:bg-surface-subtle",
@@ -529,7 +529,7 @@ export function SwarmMessagesCard(props: { taskId: string }) {
                           <span>{swarmKindLabel(chip.message.kind)}</span>
                           {chip.repeat ? (
                             <Badge
-                              className="px-1.5 py-0 text-[12px] font-normal"
+                              className="px-1.5 py-0 type-badge font-normal"
                               variant="muted"
                             >
                               repeat

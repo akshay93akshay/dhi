@@ -52,7 +52,7 @@ export function GeneralOverviewSection(props: {
               Web providers
             </span>
           </div>
-          <div className="mt-2 type-meta font-medium">
+          <div className="mt-2 type-body font-medium">
             {providersError !== null
               ? "Unavailable"
               : ready === null || total === null
@@ -85,7 +85,10 @@ function RoleOverview(props: {
           {label}
         </span>
       </div>
-      <div className="mt-2 truncate type-meta font-medium">
+      <div
+        className="mt-2 truncate type-body font-medium"
+        title={loading ? undefined : profile?.name ?? "Not set"}
+      >
         {loading ? "Loading…" : profile?.name ?? "Not set"}
       </div>
       <div className="mt-0.5 truncate type-mono text-muted-foreground">
