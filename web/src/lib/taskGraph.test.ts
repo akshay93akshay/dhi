@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  TASK_GRAPH_KIND_LABELS,
   TASK_GRAPH_LANE_GAP,
   TASK_GRAPH_MAX_LANE_GAP,
   TASK_GRAPH_MAX_ROW_BAND_GAP,
@@ -15,6 +16,13 @@ import {
   selectVisibleTaskId,
   type TaskGraphEdge,
 } from "./taskGraph.ts";
+import {
+  TASK_GRAPH_BACKWARD_EDGE_TYPE,
+  TASK_GRAPH_RELATION_LABELS,
+  buildTaskGraphFlow,
+  findTaskGraphFlowNode,
+  taskGraphNodeText,
+} from "./taskGraphFlow.ts";
 import type {
   Fact,
   Goal,
@@ -626,6 +634,197 @@ test("minHeight spreads row bands, then pads a single row", () => {
       padded.nodeHeights.get("fact:fact-origin")! / 2,
     padded.height / 2,
   );
+});
+
+test("buildTaskGraphFlow maps every node onto its fixed layout position", () => {
+  const work = taskGraphFixture();
+  const model = buildTaskGraph(work);
+  const layout = layoutTaskGraph(model.nodes);
+  const flow = buildTaskGraphFlow(model, layout);
+
+  assert.equal(flow.nodes.length, model.nodes.length);
+  assert.equal(flow.selected, null);
+  assert.deepEqual(
+    new Set(flow.nodes.map((node) => node.type)),
+    new Set(["origin", "goal", "intent", "fact", "result"]),
+  );
+
+  for (const [index, source] of model.nodes.entries()) {
+    const mapped = flow.nodes[index]!;
+    assert.equal(mapped.id, source.id);
+    assert.equal(mapped.type, source.kind);
+    assert.deepEqual(mapped.position, layout.positions.get(source.id));
+    assert.equal(mapped.data.kind, source.kind);
+    assert.equal(mapped.data.kindLabel, TASK_GRAPH_KIND_LABELS[source.kind]);
+    assert.equal(mapped.data.label, source.label);
+    assert.equal(mapped.data.state, source.state);
+    assert.equal(mapped.data.entityId, source.entityId);
+    assert.equal(mapped.data.nodeId, source.id);
+    assert.equal(mapped.draggable, false);
+    assert.equal(mapped.selectable, true);
+    // MiniMap needs the declared dimensions, not just the inline style.
+    assert.equal(mapped.width, layout.nodeWidth);
+    assert.equal(mapped.height, layout.nodeHeight);
+    assert.equal(mapped.style?.width, layout.nodeWidth);
+    assert.equal(mapped.style?.height, layout.nodeHeight);
+  }
+});
+
+test("buildTaskGraphFlow keeps edges as labelled smoothstep arrows", () => {
+  const work = taskGraphFixture();
+  const model = buildTaskGraph(work);
+  const layout = layoutTaskGraph(model.nodes);
+  const flow = buildTaskGraphFlow(model, layout);
+
+  assert.equal(flow.edges.length, model.edges.length);
+  assert.deepEqual(
+    new Set(flow.edges.map((edge) => edge.type)),
+    new Set(["smoothstep", TASK_GRAPH_BACKWARD_EDGE_TYPE]),
+  );
+  for (const [index, source] of model.edges.entries()) {
+    const mapped = flow.edges[index]!;
+    assert.equal(mapped.id, source.id);
+    assert.equal(mapped.source, source.from);
+    assert.equal(mapped.target, source.to);
+    assert.equal(mapped.label, TASK_GRAPH_RELATION_LABELS[source.relation]);
+    assert.equal(mapped.data?.relation, source.relation);
+    assert.equal(
+      mapped.data?.relationLabel,
+      TASK_GRAPH_RELATION_LABELS[source.relation],
+    );
+    const marker = mapped.markerEnd as { type?: string };
+    assert.equal(marker.type, "arrowclosed");
+  }
+
+  // Backward fact → origin uses the top corridor, above every node.
+  const backward = flow.edges.find(
+    (edge) => edge.id === "derived_from:fact:fact-proof->fact:fact-origin",
+  );
+  assert.ok(backward !== undefined);
+  assert.equal(backward.type, TASK_GRAPH_BACKWARD_EDGE_TYPE);
+  assert.match(backward.data?.path ?? "", /^M /);
+  assert.ok((backward.data?.labelY ?? Number.POSITIVE_INFINITY) < 80);
+  assert.equal(typeof backward.data?.labelX, "number");
+
+  // Wire names are spelled for the inspector/edge labels, without underscores.
+  assert.equal(TASK_GRAPH_RELATION_LABELS.has_goal, "has goal");
+  assert.equal(TASK_GRAPH_RELATION_LABELS.spawns, "spawns");
+  assert.equal(TASK_GRAPH_RELATION_LABELS.yields, "yields");
+  assert.equal(TASK_GRAPH_RELATION_LABELS.derived_from, "derived from");
+  assert.ok(
+    flow.edges.every(
+      (edge) => typeof edge.label === "string" && !edge.label.includes("_"),
+    ),
+  );
+});
+
+test("flow edges pick handles that route around the goal and fact columns", () => {
+  const work = taskGraphFixture();
+  work.facts.push({
+    ...work.facts[1]!,
+    id: "fact-derived",
+    claim: "A fact derived from the proof fact",
+    origin_of: "fact-proof",
+  });
+  const model = buildTaskGraph(work);
+  const flow = buildTaskGraphFlow(model, layoutTaskGraph(model.nodes));
+  const edge = (id: string) => flow.edges.find((entry) => entry.id === id);
+
+  // Ordinary forward edges connect right to left.
+  assert.deepEqual(
+    {
+      source: edge(
+        "has_goal:fact:fact-origin->goal:goal-1",
+      )?.sourceHandle,
+      target: edge(
+        "has_goal:fact:fact-origin->goal:goal-1",
+      )?.targetHandle,
+    },
+    { source: "out-right", target: "in-left" },
+  );
+  // A goal-less intent is fed from the origin bottom so the wire clears the
+  // goal card instead of disappearing behind it.
+  assert.deepEqual(
+    {
+      source: edge(
+        "spawns:fact:fact-origin->intent:intent-2",
+      )?.sourceHandle,
+      target: edge(
+        "spawns:fact:fact-origin->intent:intent-2",
+      )?.targetHandle,
+    },
+    { source: "out-bottom", target: "in-left" },
+  );
+  // Backward fact → origin ignores the handles and renders the top corridor;
+  // same-column fact → fact loops through the fact/result gap.
+  const backwardEdge = edge(
+    "derived_from:fact:fact-proof->fact:fact-origin",
+  );
+  assert.equal(backwardEdge?.type, TASK_GRAPH_BACKWARD_EDGE_TYPE);
+  assert.equal(backwardEdge?.data?.path?.includes("M ") ?? false, true);
+  assert.deepEqual(
+    {
+      source: edge(
+        "derived_from:fact:fact-derived->fact:fact-proof",
+      )?.sourceHandle,
+      target: edge(
+        "derived_from:fact:fact-derived->fact:fact-proof",
+      )?.targetHandle,
+    },
+    { source: "out-right", target: "in-right" },
+  );
+});
+
+test("selected task graph node lookup marks exactly one mapped node", () => {
+  const work = taskGraphFixture();
+  const model = buildTaskGraph(work);
+  const layout = layoutTaskGraph(model.nodes);
+  const selectedId = "fact:fact-proof";
+
+  const flow = buildTaskGraphFlow(model, layout, selectedId, work);
+  assert.equal(flow.selected?.id, selectedId);
+  assert.equal(flow.selected?.data.selected, true);
+  assert.equal(
+    flow.nodes.filter((node) => node.data.selected).length,
+    1,
+  );
+  assert.equal(
+    findTaskGraphFlowNode(flow.nodes, selectedId)?.id,
+    selectedId,
+  );
+  assert.equal(findTaskGraphFlowNode(flow.nodes, "fact:missing"), null);
+  assert.equal(findTaskGraphFlowNode(flow.nodes, null), null);
+
+  // A stale selection never smears selection flags onto another node.
+  const stale = buildTaskGraphFlow(model, layout, "fact:missing");
+  assert.equal(stale.selected, null);
+  assert.ok(stale.nodes.every((node) => !node.data.selected));
+});
+
+test("mapped fact nodes resolve shortened labels from the work snapshot", () => {
+  const work = taskGraphFixture();
+  const longClaim =
+    "The forcing line survives every legal king retreat, including the quiet waiting move and the long diagonal escape";
+  const sourceFact = work.facts.find((fact) => fact.id === "fact-proof")!;
+  sourceFact.claim = longClaim;
+
+  const model = buildTaskGraph(work);
+  const factNode = model.nodes.find((node) => node.id === "fact:fact-proof");
+  assert.ok(factNode !== undefined);
+
+  // A shortened card label must not leak into the inspector text.
+  factNode.label = "The forcing line…";
+  assert.equal(taskGraphNodeText(factNode, work), longClaim);
+  assert.equal(taskGraphNodeText(factNode, null), "The forcing line…");
+
+  const flow = buildTaskGraphFlow(
+    model,
+    layoutTaskGraph(model.nodes),
+    "fact:fact-proof",
+    work,
+  );
+  assert.equal(flow.selected?.data.label, longClaim);
+  assert.equal(flow.selected?.ariaLabel, `Fact: ${longClaim}`);
 });
 
 test("paginateTasks produces five-row pages with clamped bounds", () => {

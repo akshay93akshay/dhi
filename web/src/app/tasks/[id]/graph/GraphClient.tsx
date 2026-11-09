@@ -22,9 +22,11 @@ const POLL_INTERVAL_MS = 5000;
 
 /**
  * Fill the space left by the compact breadcrumb/header chrome. At 1440×900
- * this leaves a ~620px graph stage without forcing the page to scroll.
+ * this leaves a ~620px stage without forcing the page to scroll. On narrow
+ * screens the graph keeps a usable fixed height and the inspector flows below
+ * it, so the page scrolls instead of squeezing both into one viewport.
  */
-const GRAPH_PANEL_HEIGHT = "h-[calc(100svh-280px)] min-h-[520px]";
+const GRAPH_PANEL_HEIGHT = "min-h-[520px] lg:h-[calc(100svh-280px)]";
 
 /**
  * Four-stop trail. `crumbTrailSegments` supports only one leaf, so the Work
@@ -39,7 +41,7 @@ function graphCrumbs(taskId: string): CrumbSegment[] {
   ];
 }
 
-/** Task-scoped graph view: one task's work graph, with no picker or inspector. */
+/** Task-scoped graph view: one task's work graph with a click-to-inspect panel. */
 export function TaskGraphClient() {
   return <TaskGraphView />;
 }
