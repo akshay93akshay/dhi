@@ -166,6 +166,28 @@ export function renderProvenance(provenance: JsonObject): ProvenanceView {
   return { kind: "raw", lines: [pretty] };
 }
 
+/** Provenance labels whose values are model-authored detail (not ids/enums). */
+const PROVENANCE_DETAIL_LABELS = new Set(["Goal", "Detail", "Evidence"]);
+
+/**
+ * Copy text for the fact-detail block: the joined Goal/Detail/Evidence lines
+ * below the claim. Intent ids and Confidence stay out of the copied detail;
+ * raw JSON has no recognized detail convention and returns `null`.
+ */
+export function provenanceDetailText(view: ProvenanceView): string | null {
+  if (view.kind === "raw") {
+    return null;
+  }
+  const detail = view.lines.filter((line) => {
+    const separator = line.indexOf(": ");
+    return (
+      separator !== -1 &&
+      PROVENANCE_DETAIL_LABELS.has(line.slice(0, separator))
+    );
+  });
+  return detail.length === 0 ? null : detail.join("\n");
+}
+
 // ---------------------------------------------------------------------------
 // Create-task form logic
 // ---------------------------------------------------------------------------
@@ -198,6 +220,8 @@ export type CreateFormValues = {
   workerPin: string;
   /** Create-form topology value; omitted/blank means "let the planner decide". */
   topology?: string;
+  /** Create-form Workers value; blank means Auto (send `null`). */
+  swarmWorkers?: string;
 };
 
 /** Select options for the create-task topology picker, in display order. */
@@ -207,6 +231,44 @@ export const TOPOLOGY_OPTIONS = [
   { value: "manager_worker", label: "Multi agent" },
   { value: "swarm", label: "Swarm" },
 ] as const;
+
+/**
+ * Swarm-width options for the create-task form. The empty value is "Auto"
+ * (send `null` and let the planner decide); the server accepts 2 through 8.
+ */
+export const SWARM_WORKERS_OPTIONS = [
+  { value: "", label: "Auto (planner decides)" },
+  { value: "2", label: "2" },
+  { value: "3", label: "3" },
+  { value: "4", label: "4" },
+  { value: "5", label: "5" },
+  { value: "6", label: "6" },
+  { value: "7", label: "7" },
+  { value: "8", label: "8" },
+] as const;
+
+/** Human label for a stored swarm width, or `null` when the planner decides. */
+export function swarmWorkersLabel(
+  value: number | null | undefined,
+): string | null {
+  return value === null || value === undefined ? null : String(value);
+}
+
+/**
+ * Maps the create-form Workers `<select>` value onto a swarm width. Blank
+ * (and `auto`) means "the planner decides" → `null`; only whole numbers 2–8
+ * are accepted, everything else degrades to `null`.
+ */
+export function parseSwarmWorkers(
+  raw: string | null | undefined,
+): number | null {
+  const trimmed = (raw ?? "").trim().toLowerCase();
+  if (trimmed === "" || trimmed === "auto" || !/^\d+$/.test(trimmed)) {
+    return null;
+  }
+  const value = Number(trimmed);
+  return value >= 2 && value <= 8 ? value : null;
+}
 
 /** Human label for a task topology (or `null` for "planner decides"). */
 export function topologyLabel(topology: TaskTopology | null): string | null {
@@ -253,7 +315,9 @@ export type CreateFormResult =
  *   entirely so the server defaults apply (matching the "omits absent pin
  *   fields" behavior covered in api.test.ts);
  * - topology is ALWAYS sent: `null` for "let the planner decide", otherwise
- *   the selected enum value.
+ *   the selected enum value;
+ * - `swarm_workers` is ALWAYS sent: the selected 2–8 count only when the
+ *   topology is `swarm`, otherwise (and for Auto) `null`.
  */
 export function buildCreateTaskInput(
   values: CreateFormValues,
@@ -262,9 +326,12 @@ export function buildCreateTaskInput(
   if (goalError !== null) {
     return { ok: false, error: goalError };
   }
+  const topology = parseTopology(values.topology);
   const input: CreateTaskInput = {
     goal: values.goal.trim(),
-    topology: parseTopology(values.topology),
+    topology,
+    swarm_workers:
+      topology === "swarm" ? parseSwarmWorkers(values.swarmWorkers) : null,
   };
   const planner = parsePin(values.plannerPin);
   if (planner !== null) {

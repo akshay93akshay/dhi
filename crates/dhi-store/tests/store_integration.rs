@@ -204,17 +204,18 @@ async fn duplicate_exploration_is_rejected(pool: PgPool) {
 /// Migrations from an empty database create the full schema, idempotently.
 /// The schema includes tool control (`tool_catalog`, `tool_visibility`,
 /// `skill_usage`), web-provider settings (`web_provider_settings`), persisted
-/// DHI+ plans (`intent_plans`), and swarm audit messages (`swarm_messages`).
+/// DHI+ plans (`intent_plans`), swarm audit messages (`swarm_messages`), and
+/// planner-only instructions (`task_instructions`).
 #[sqlx::test(migrations = false)]
-async fn migration_creates_25_tables_and_is_idempotent_from_clean_database(pool: PgPool) {
+async fn migration_creates_26_tables_and_is_idempotent_from_clean_database(pool: PgPool) {
     assert_eq!(base_table_count(&pool).await, 0);
 
     let store = Store::new(pool);
     store.migrate().await.expect("first migrate succeeds");
-    assert_eq!(base_table_count(store.pool()).await, 25);
+    assert_eq!(base_table_count(store.pool()).await, 26);
 
     store.migrate().await.expect("second migrate succeeds");
-    assert_eq!(base_table_count(store.pool()).await, 25);
+    assert_eq!(base_table_count(store.pool()).await, 26);
 }
 
 /// A DHI+ plan round-trips through JSONB, an upsert replaces it, and an
@@ -549,10 +550,11 @@ async fn task_topology_round_trips_and_survives_capacity_and_reopen(pool: PgPool
     );
 
     let task = store
-        .create_task_with_pins("swarm task", None, None, Some(Topology::Swarm))
+        .create_task_with_pins("swarm task", None, None, Some(Topology::Swarm), Some(4))
         .await
         .unwrap();
     assert_eq!(task.topology, Some(Topology::Swarm));
+    assert_eq!(task.swarm_workers, Some(4));
     assert_eq!(
         store
             .get_task(task.id)
@@ -565,6 +567,16 @@ async fn task_topology_round_trips_and_survives_capacity_and_reopen(pool: PgPool
     );
     assert_eq!(
         store
+            .get_task(task.id)
+            .await
+            .unwrap()
+            .expect("task exists")
+            .swarm_workers,
+        Some(4),
+        "get_task keeps the swarm worker count"
+    );
+    assert_eq!(
+        store
             .list_tasks(10)
             .await
             .unwrap()
@@ -574,6 +586,18 @@ async fn task_topology_round_trips_and_survives_capacity_and_reopen(pool: PgPool
             .topology,
         Some(Topology::Swarm),
         "list_tasks keeps topology"
+    );
+    assert_eq!(
+        store
+            .list_tasks(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == task.id)
+            .expect("task is listed")
+            .swarm_workers,
+        Some(4),
+        "list_tasks keeps the swarm worker count"
     );
 
     let updated = store
@@ -609,6 +633,116 @@ async fn task_topology_round_trips_and_survives_capacity_and_reopen(pool: PgPool
         task.topology,
         Some(Topology::Swarm),
         "reopen keeps topology"
+    );
+    assert_eq!(
+        task.swarm_workers,
+        Some(4),
+        "reopen keeps the swarm worker count"
+    );
+}
+
+/// Instructions append oldest first, survive a round-trip, and only pending
+/// rows are marked delivered.
+#[sqlx::test]
+async fn task_instructions_round_trip_and_mark_only_pending(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store.create_task("receive instructions").await.unwrap();
+    assert!(store.list_instructions(task.id).await.unwrap().is_empty());
+
+    let first = store
+        .add_instruction(task.id, "focus on the endgame")
+        .await
+        .unwrap();
+    let second = store
+        .add_instruction(task.id, "name the exact move")
+        .await
+        .unwrap();
+    assert_eq!(first.task_id, task.id);
+    assert_eq!(first.text, "focus on the endgame");
+    assert_eq!(first.delivered_at, None);
+
+    let listed = store.list_instructions(task.id).await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].id, first.id, "list is oldest first");
+    assert_eq!(listed[1].id, second.id, "newest is last");
+
+    assert_eq!(store.mark_delivered(task.id).await.unwrap(), 2);
+    let delivered = store.list_instructions(task.id).await.unwrap();
+    assert!(delivered.iter().all(|row| row.delivered_at.is_some()));
+    assert_eq!(
+        store.mark_instructions_delivered(task.id).await.unwrap(),
+        0,
+        "already delivered rows are not touched again"
+    );
+
+    let third = store.add_instruction(task.id, "one more").await.unwrap();
+    assert_eq!(
+        store
+            .list_instructions(task.id)
+            .await
+            .unwrap()
+            .last()
+            .unwrap()
+            .id,
+        third.id
+    );
+    assert_eq!(third.delivered_at, None);
+}
+
+/// The by-id delivery write marks exactly the rows the planner read, so an
+/// instruction added during the planner call stays pending for the next round.
+#[sqlx::test]
+async fn instruction_delivery_marks_only_the_listed_ids(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store.create_task("deliver carefully").await.unwrap();
+    let first = store.add_instruction(task.id, "first").await.unwrap();
+    let second = store.add_instruction(task.id, "second").await.unwrap();
+
+    assert_eq!(
+        store
+            .mark_instructions_delivered_ids(task.id, &[first.id])
+            .await
+            .unwrap(),
+        1
+    );
+    let listed = store.list_instructions(task.id).await.unwrap();
+    assert!(
+        listed[0].delivered_at.is_some(),
+        "the read row is delivered"
+    );
+    assert!(
+        listed[1].delivered_at.is_none(),
+        "a row added after the read stays pending"
+    );
+    assert_eq!(
+        store
+            .mark_instructions_delivered_ids(task.id, &[first.id, Uuid::new_v4()])
+            .await
+            .unwrap(),
+        0,
+        "already delivered or unknown ids change nothing"
+    );
+    assert_eq!(
+        store
+            .mark_instructions_delivered_ids(task.id, &[])
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .mark_instructions_delivered_ids(task.id, &[second.id])
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(
+        store
+            .list_instructions(task.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|row| row.delivered_at.is_some())
     );
 }
 

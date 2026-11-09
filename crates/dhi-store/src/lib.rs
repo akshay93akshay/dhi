@@ -1,6 +1,6 @@
 //! PostgreSQL store for DHI.
 //!
-//! This crate owns the 25-table schema and the SQL used by the engine and API.
+//! This crate owns the 26-table schema and the SQL used by the engine and API.
 //! Every invariant that can be enforced by a constraint is enforced here.
 
 use chrono::{DateTime, Utc};
@@ -10,7 +10,7 @@ use dhi_core::{
     IntentId, IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord,
     ResultStatus, RunId, SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus,
     SideQuestionStatus, SideQuestionThread, SwarmMessageRecord, Task, TaskCapacity, TaskId,
-    TaskState, ToolCall, ToolCallId, Topology,
+    TaskInstruction, TaskState, ToolCall, ToolCallId, Topology,
 };
 use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
@@ -74,23 +74,27 @@ impl Store {
     }
 
     pub async fn create_task(&self, goal: &str) -> Result<Task, StoreError> {
-        self.create_task_with_pins(goal, None, None, None).await
+        self.create_task_with_pins(goal, None, None, None, None)
+            .await
     }
 
-    /// Pins and topology are validated by the caller (`profile_exists`);
-    /// the SQL foreign keys enforce the pin invariant.
+    /// Pins, topology, and the swarm worker count are validated by the caller
+    /// (`profile_exists` and the API range); the SQL foreign keys enforce the
+    /// pin invariant.
     pub async fn create_task_with_pins(
         &self,
         goal: &str,
         planner_pin: Option<i64>,
         worker_pin: Option<i64>,
         topology: Option<Topology>,
+        swarm_workers: Option<usize>,
     ) -> Result<Task, StoreError> {
         let mut task = Task::new(goal);
         // The returned task must describe the persisted row, pins included.
         task.pinned_planner_profile_id = planner_pin;
         task.pinned_worker_profile_id = worker_pin;
         task.topology = topology;
+        task.swarm_workers = swarm_workers;
         let origin = task.origin_fact();
         let capacity =
             serde_json::to_value(task.capacity).expect("task capacity is always serializable");
@@ -99,8 +103,8 @@ impl Store {
         sqlx::query(
             "INSERT INTO tasks (id, goal, state, exploration_id, origin_fact_id, \
              pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, \
-             created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             swarm_workers, created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(task.id)
         .bind(&task.goal)
@@ -111,6 +115,7 @@ impl Store {
         .bind(worker_pin)
         .bind(capacity)
         .bind(task.topology.map(Topology::as_str))
+        .bind(task.swarm_workers.map(|count| count as i32))
         .bind(task.created_at)
         .bind(task.updated_at)
         .execute(&mut *tx)
@@ -148,7 +153,7 @@ impl Store {
     pub async fn get_task(&self, id: Uuid) -> Result<Option<Task>, StoreError> {
         let row = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, state, exploration_id, origin_fact_id, \
-                    pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, \
+                    pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
                     created_at, updated_at
              FROM tasks WHERE id = $1",
         )
@@ -161,7 +166,7 @@ impl Store {
     pub async fn list_tasks(&self, limit: i64) -> Result<Vec<Task>, StoreError> {
         let rows = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, state, exploration_id, origin_fact_id, \
-                    pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, \
+                    pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
                     created_at, updated_at
              FROM tasks ORDER BY created_at DESC LIMIT $1",
         )
@@ -220,7 +225,7 @@ impl Store {
             "UPDATE tasks SET capacity = $2, updated_at = now()
              WHERE id = $1
              RETURNING id, goal, state, exploration_id, origin_fact_id, \
-                       pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, \
+                       pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
                        created_at, updated_at",
         )
         .bind(task_id)
@@ -357,7 +362,7 @@ impl Store {
 
         let row = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, state, exploration_id, origin_fact_id, \
-                    pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, \
+                    pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
                     created_at, updated_at
              FROM tasks WHERE id = $1 FOR UPDATE",
         )
@@ -409,7 +414,7 @@ impl Store {
             "UPDATE tasks SET state = 'running', updated_at = now()
              WHERE id = $1
              RETURNING id, goal, state, exploration_id, origin_fact_id, \
-                       pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, \
+                       pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
                        created_at, updated_at",
         )
         .bind(task_id)
@@ -1008,6 +1013,89 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Activity::from).collect())
+    }
+
+    /// Adds one planner-only instruction to a task.
+    pub async fn add_instruction(
+        &self,
+        task_id: Uuid,
+        text: impl Into<String>,
+    ) -> Result<TaskInstruction, StoreError> {
+        let id = Uuid::new_v4();
+        let created_at = Utc::now();
+        let row = sqlx::query_as::<_, TaskInstructionRow>(
+            "INSERT INTO task_instructions (id, task_id, text, created_at)
+             VALUES ($1, $2, $3, $4)
+             RETURNING id, task_id, text, created_at, delivered_at",
+        )
+        .bind(id)
+        .bind(task_id)
+        .bind(text.into())
+        .bind(created_at)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(TaskInstruction::from(row))
+    }
+
+    /// Every instruction of a task, oldest first (newest last).
+    pub async fn list_instructions(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Vec<TaskInstruction>, StoreError> {
+        let rows = sqlx::query_as::<_, TaskInstructionRow>(
+            "SELECT id, task_id, text, created_at, delivered_at
+             FROM task_instructions
+             WHERE task_id = $1
+             ORDER BY created_at, id",
+        )
+        .bind(task_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(TaskInstruction::from).collect())
+    }
+
+    /// Marks every pending instruction of a task delivered. Returns the
+    /// number of rows changed.
+    ///
+    /// `mark_delivered` is the short alias the store contract names.
+    pub async fn mark_delivered(&self, task_id: Uuid) -> Result<usize, StoreError> {
+        self.mark_instructions_delivered(task_id).await
+    }
+
+    /// Marks every pending instruction of a task delivered. Returns the
+    /// number of rows changed.
+    pub async fn mark_instructions_delivered(&self, task_id: Uuid) -> Result<usize, StoreError> {
+        let result = sqlx::query(
+            "UPDATE task_instructions
+             SET delivered_at = now()
+             WHERE task_id = $1 AND delivered_at IS NULL",
+        )
+        .bind(task_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() as usize)
+    }
+
+    /// Marks only the listed pending instructions of a task delivered.
+    /// Returns the number of rows changed.
+    pub async fn mark_instructions_delivered_ids(
+        &self,
+        task_id: Uuid,
+        instruction_ids: &[Uuid],
+    ) -> Result<usize, StoreError> {
+        if instruction_ids.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            "UPDATE task_instructions
+             SET delivered_at = now()
+             WHERE task_id = $1 AND delivered_at IS NULL AND id = ANY($2)",
+        )
+        .bind(task_id)
+        .bind(instruction_ids)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() as usize)
     }
 
     pub async fn record_tool_call(
@@ -1629,6 +1717,7 @@ struct TaskRow {
     pinned_worker_profile_id: Option<i64>,
     capacity: serde_json::Value,
     topology: Option<String>,
+    swarm_workers: Option<i32>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -1648,6 +1737,9 @@ impl TryFrom<TaskRow> for Task {
             // engine defaults instead of failing to load.
             capacity: serde_json::from_value(r.capacity).unwrap_or_default(),
             topology: r.topology.as_deref().map(parse_topology).transpose()?,
+            swarm_workers: r
+                .swarm_workers
+                .and_then(|count| usize::try_from(count).ok()),
             created_at: r.created_at,
             updated_at: r.updated_at,
         })
@@ -1781,6 +1873,27 @@ impl From<ActivityRow> for Activity {
             message: r.message,
             payload: r.payload,
             created_at: r.created_at,
+        }
+    }
+}
+
+#[derive(Debug, FromRow)]
+struct TaskInstructionRow {
+    id: Uuid,
+    task_id: Uuid,
+    text: String,
+    created_at: DateTime<Utc>,
+    delivered_at: Option<DateTime<Utc>>,
+}
+
+impl From<TaskInstructionRow> for TaskInstruction {
+    fn from(r: TaskInstructionRow) -> Self {
+        Self {
+            id: r.id,
+            task_id: r.task_id,
+            text: r.text,
+            created_at: r.created_at,
+            delivered_at: r.delivered_at,
         }
     }
 }

@@ -7,9 +7,11 @@ import { Plus } from "lucide-react";
 import { createTask, getHealth, listProfiles } from "@/lib/api";
 import type { Health, LlmProfile } from "@/lib/types";
 import {
+  SWARM_WORKERS_OPTIONS,
   TOPOLOGY_OPTIONS,
   buildCreateTaskInput,
   describeApiError,
+  parseTopology,
   serviceState,
 } from "@/lib/ui";
 import {
@@ -120,6 +122,7 @@ function CreateTaskCard(props: {
   const [plannerPin, setPlannerPin] = useState("");
   const [workerPin, setWorkerPin] = useState("");
   const [topology, setTopology] = useState("");
+  const [swarmWorkers, setSwarmWorkers] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const activityTimeoutRef = useRef<number | null>(null);
@@ -162,6 +165,7 @@ function CreateTaskCard(props: {
       plannerPin,
       workerPin,
       topology,
+      swarmWorkers,
     });
     if (!parsed.ok) {
       setFormError(parsed.error);
@@ -324,6 +328,38 @@ function CreateTaskCard(props: {
               Unset lets the planner choose the topology per intent.
             </p>
           </div>
+
+          {parseTopology(topology) === "swarm" ? (
+            <div className="space-y-1.5">
+              <label
+                className="text-xs font-semibold text-foreground"
+                htmlFor="create-swarm-workers"
+              >
+                Workers
+              </label>
+              <select
+                id="create-swarm-workers"
+                className="h-9 w-full rounded-md border-input bg-card text-[13px]"
+                value={swarmWorkers}
+                onChange={(event) => {
+                  setSwarmWorkers(event.target.value);
+                  if (formError !== null) {
+                    setFormError(null);
+                  }
+                }}
+              >
+                {SWARM_WORKERS_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[11px] leading-4 text-muted-foreground">
+                Auto lets the planner size the swarm; 2–8 pins the worker
+                count.
+              </p>
+            </div>
+          ) : null}
 
           {formError !== null ? (
             <div

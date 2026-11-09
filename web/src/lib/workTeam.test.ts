@@ -8,15 +8,15 @@ import {
   capacityPauseNotice,
   capacitySummary,
   EMPTY_CAPACITY_INPUTS,
-  groupSwarmMessages,
+  groupSwarmRuns,
   hasSwarmTopology,
+  isSwarmPayloadMalformed,
   latestCapacityExhausted,
   parseCapacityExhausted,
   parseSwarmMessage,
   parseSwarmMessages,
   resolveTaskTopology,
   swarmKindLabel,
-  swarmMessageCounts,
   swarmPayloadFullText,
   swarmPayloadSummary,
   taskUsesSwarm,
@@ -220,6 +220,8 @@ test("parseSwarmMessage renders a finding with sender, short intent, and subtask
     fullText: "the rook lift wins\n\nEvidence:\nRa8+",
     round: null,
     subtaskId: "s1",
+    repeatOf: null,
+    malformed: false,
   });
 });
 
@@ -306,10 +308,12 @@ test("parseSwarmMessage rejects rows without a usable id and degrades the rest",
     intentId: "",
     intentShort: "",
     createdAt: "",
-    summary: "{}",
-    fullText: "{}",
+    summary: "Unrecognized message",
+    fullText: "null",
     round: null,
     subtaskId: null,
+    repeatOf: null,
+    malformed: true,
   });
 });
 
@@ -378,63 +382,211 @@ test("swarm rounds come from payload.round or the react subtask id", () => {
   );
 });
 
-test("groupSwarmMessages groups by worker and round with counts", () => {
+test("swarmPayloadSummary and full text recognize done by persisted kind", () => {
+  assert.equal(swarmPayloadSummary({}, "done"), "done");
+  assert.equal(swarmPayloadSummary(null, "done"), "done");
+  assert.equal(swarmPayloadFullText({}, "done"), "Done");
+  assert.equal(swarmPayloadFullText(null, "done"), "Done");
+});
+
+test("isSwarmPayloadMalformed separates typed payloads from JSON fallbacks", () => {
+  assert.equal(isSwarmPayloadMalformed({ summary: "found" }, "finding"), false);
+  assert.equal(isSwarmPayloadMalformed({ text: "why?" }, "question"), false);
+  assert.equal(isSwarmPayloadMalformed({ message: "legacy" }, "challenge"), false);
+  assert.equal(isSwarmPayloadMalformed({}, "done"), false);
+  assert.equal(isSwarmPayloadMalformed({}, "finding"), true);
+  assert.equal(isSwarmPayloadMalformed({ answer: 42 }, "finding"), true);
+  assert.equal(isSwarmPayloadMalformed(null, "question"), true);
+});
+
+test("parseSwarmMessages marks repeated findings without touching other kinds", () => {
+  const views = parseSwarmMessages([
+    {
+      id: 1,
+      kind: "finding",
+      intent_id: INTENT_ID,
+      payload: { from: "alpha", summary: "same finding", evidence: "e" },
+    },
+    {
+      id: 2,
+      kind: "finding",
+      intent_id: INTENT_ID,
+      payload: {
+        from: "beta",
+        summary: "same finding",
+        evidence: "e",
+      },
+    },
+    {
+      id: 3,
+      kind: "finding",
+      intent_id: INTENT_ID,
+      payload: { from: "beta", summary: "same  finding", evidence: "e" },
+    },
+    {
+      id: 4,
+      kind: "finding",
+      intent_id: "99999999-9999-4999-8999-999999999999",
+      payload: { from: "alpha", summary: "same finding", evidence: "e" },
+    },
+    {
+      id: 5,
+      kind: "question",
+      intent_id: INTENT_ID,
+      payload: { from: "alpha", text: "same finding" },
+    },
+  ]);
+  assert.deepEqual(
+    views.map((view) => view.repeatOf),
+    [null, 1, 1, null, null],
+  );
+});
+
+test("groupSwarmRuns builds a single run with rounds then senders", () => {
   const views = parseSwarmMessages([
     {
       id: 4,
       kind: "question",
+      intent_id: INTENT_ID,
       payload: { from: "beta", text: "why?", subtask_id: "b:r2:question:a" },
       created_at: "2026-11-07T10:04:00Z",
     },
     {
       id: 1,
       kind: "finding",
+      intent_id: INTENT_ID,
       payload: { from: "alpha", summary: "first", subtask_id: "a" },
       created_at: "2026-11-07T10:01:00Z",
     },
     {
       id: 3,
       kind: "finding",
+      intent_id: INTENT_ID,
       payload: { from: "beta", summary: "second", subtask_id: "b" },
       created_at: "2026-11-07T10:03:00Z",
     },
     {
       id: 2,
       kind: "challenge",
+      intent_id: INTENT_ID,
       payload: { from: "alpha", text: "but", subtask_id: "a:r2:challenge:b" },
       created_at: "2026-11-07T10:02:00Z",
     },
   ]);
 
-  const groups = groupSwarmMessages(views);
+  const runs = groupSwarmRuns(views);
+  assert.equal(runs.length, 1);
+  const run = runs[0];
+  assert.ok(run);
+  assert.equal(run.label, "Swarm run");
+  assert.equal(run.runId, INTENT_ID);
+  assert.equal(run.runShort, "11111111");
+  assert.deepEqual(run.senders, ["alpha", "beta"]);
+  assert.equal(run.peerCount, 1);
   assert.deepEqual(
-    groups.map((group) => group.worker),
+    run.rounds.map((round) => round.round),
+    [2, null],
+  );
+
+  const firstRound = run.rounds[0];
+  assert.ok(firstRound);
+  assert.deepEqual(
+    firstRound.senders.map((sender) => sender.sender),
     ["alpha", "beta"],
   );
   assert.deepEqual(
-    groups[0]?.rounds.map((round) => round.round),
-    [2, null],
-  );
-  assert.deepEqual(
-    groups[0]?.rounds[0]?.messages.map((message) => message.id),
+    firstRound.senders[0]?.messages.map((message) => message.id),
     [2],
   );
   assert.deepEqual(
-    groups[1]?.rounds.map((round) => round.round),
-    [2, null],
+    firstRound.senders[1]?.messages.map((message) => message.id),
+    [4],
   );
-  assert.equal(groups[0]?.counts.total, 2);
-  assert.equal(groups[0]?.counts.byKind.finding, 1);
-  assert.equal(groups[0]?.counts.byKind.challenge, 1);
-  assert.equal(groups[1]?.rounds[0]?.counts.byKind.question, 1);
+  assert.equal(firstRound.counts.total, 2);
+  assert.equal(firstRound.counts.byKind.challenge, 1);
 
-  const counts = swarmMessageCounts(views);
-  assert.deepEqual(counts, {
-    total: 4,
-    workers: 2,
-    rounds: 1,
-    byKind: { question: 1, finding: 2, challenge: 1 },
+  const unknownRound = run.rounds[1];
+  assert.ok(unknownRound);
+  assert.deepEqual(
+    unknownRound.senders.map((sender) => sender.sender),
+    ["alpha", "beta"],
+  );
+  assert.deepEqual(
+    unknownRound.senders.map((sender) => sender.messages[0]?.id),
+    [1, 3],
+  );
+
+  assert.equal(run.counts.total, 4);
+  assert.equal(run.counts.workers, 2);
+  assert.equal(run.counts.rounds, 1);
+  assert.deepEqual(run.counts.byKind, {
+    question: 1,
+    finding: 2,
+    challenge: 1,
   });
+});
+
+test("groupSwarmRuns numbers multiple runs by first message id", () => {
+  const runA = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+  const runB = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+  const views = parseSwarmMessages([
+    {
+      id: 10,
+      kind: "done",
+      intent_id: runB,
+      payload: { type: "done", from: "beta" },
+    },
+    {
+      id: 2,
+      kind: "finding",
+      intent_id: runA,
+      payload: { from: "alpha", summary: "run a", subtask_id: "a:r1:seed" },
+    },
+    {
+      id: 11,
+      kind: "finding",
+      intent_id: runB,
+      payload: { from: "beta", summary: "run b", subtask_id: "b:r1:seed" },
+    },
+    {
+      id: 3,
+      kind: "done",
+      intent_id: runA,
+      payload: { type: "done", from: "alpha" },
+    },
+  ]);
+
+  const runs = groupSwarmRuns(views);
+  assert.deepEqual(
+    runs.map((run) => [run.label, run.runId, run.counts.total]),
+    [
+      ["Run 1", runA, 2],
+      ["Run 2", runB, 2],
+    ],
+  );
+  assert.equal(runs[0]?.peerCount, 0);
+  assert.equal(runs[1]?.rounds[0]?.round, 1);
+});
+
+test("groupSwarmRuns keeps messages without an intent id in one fallback run", () => {
+  const views = parseSwarmMessages([
+    {
+      id: 1,
+      kind: "question",
+      payload: { from: "alpha", text: "why?" },
+    },
+    {
+      id: 2,
+      kind: "question",
+      payload: { from: "beta", text: "when?" },
+    },
+  ]);
+  const runs = groupSwarmRuns(views);
+  assert.equal(runs.length, 1);
+  assert.equal(runs[0]?.label, "Swarm run");
+  assert.equal(runs[0]?.runId, "");
+  assert.equal(runs[0]?.runShort, "");
+  assert.equal(runs[0]?.peerCount, 1);
 });
 
 const CAPACITY_ACTIVITY: Activity = {

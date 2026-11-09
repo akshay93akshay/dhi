@@ -30,8 +30,8 @@ Worker: you never create intents. Write one fact draft through `record_fact`; do
 Use only the output mechanism this role is given. Never answer in JSON text.\n";
 
 /// The only variables this crate defines: `goal`, `goals`, `facts`,
-/// `open_intents`, `failures`, `required_topology`, `intent`, `context`.
-/// Nothing else is renderable.
+/// `open_intents`, `failures`, `required_topology`, `swarm_workers`,
+/// `instructions`, `intent`, `context`. Nothing else is renderable.
 pub const DECLARED_VARIABLES: &[&str] = &[
     "goal",
     "goals",
@@ -39,6 +39,8 @@ pub const DECLARED_VARIABLES: &[&str] = &[
     "open_intents",
     "failures",
     "required_topology",
+    "swarm_workers",
+    "instructions",
     "intent",
     "context",
 ];
@@ -55,6 +57,11 @@ pub struct PlannerVars {
     /// The selector-required topology as a display value, `none` when the
     /// plan stays optional.
     pub required_topology: String,
+    /// The selector-required swarm worker count as a display value, `none`
+    /// when the count stays with the planner.
+    pub swarm_workers: String,
+    /// Pending human instructions, one bullet each, or `none`.
+    pub instructions: String,
 }
 
 /// Variables of one worker render. The intent text goes in the system prompt.
@@ -74,10 +81,12 @@ impl PlannerVars {
             "open_intents": self.open_intents,
             "failures": self.failures,
             "required_topology": self.required_topology,
+            "swarm_workers": self.swarm_workers,
+            "instructions": self.instructions,
         })
     }
 
-    fn pairs(&self) -> [(&'static str, String); 6] {
+    fn pairs(&self) -> [(&'static str, String); 8] {
         [
             ("goal", self.goal.clone()),
             ("goals", self.goals.clone()),
@@ -85,6 +94,8 @@ impl PlannerVars {
             ("open_intents", self.open_intents.to_string()),
             ("failures", self.failures.clone()),
             ("required_topology", self.required_topology.clone()),
+            ("swarm_workers", self.swarm_workers.clone()),
+            ("instructions", self.instructions.clone()),
         ]
     }
 }
@@ -347,6 +358,8 @@ mod tests {
             open_intents: 2,
             failures: "- DHI+ swarm team produced no successful worker result".to_string(),
             required_topology: "none".to_string(),
+            swarm_workers: "none".to_string(),
+            instructions: "- focus on the endgame first".to_string(),
         }
     }
 

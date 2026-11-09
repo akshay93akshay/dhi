@@ -8,7 +8,7 @@ use dhi_core::{
     GraphStore, GuardDecision, GuardDecisionId, GuardStore, GuardVerdict, Intent, IntentId,
     IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus,
     SideQuestionRequest, SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task,
-    TaskCapacity, TaskId, TaskState, ToolCall, ToolCallId,
+    TaskCapacity, TaskId, TaskInstruction, TaskState, ToolCall, ToolCallId,
 };
 use uuid::Uuid;
 
@@ -26,8 +26,17 @@ impl GraphStore for Store {
         planner_pin: Option<i64>,
         worker_pin: Option<i64>,
         topology: Option<dhi_core::Topology>,
+        swarm_workers: Option<usize>,
     ) -> anyhow::Result<Task> {
-        Ok(Store::create_task_with_pins(self, &goal, planner_pin, worker_pin, topology).await?)
+        Ok(Store::create_task_with_pins(
+            self,
+            &goal,
+            planner_pin,
+            worker_pin,
+            topology,
+            swarm_workers,
+        )
+        .await?)
     }
 
     async fn get_task(&self, id: TaskId) -> anyhow::Result<Option<Task>> {
@@ -215,6 +224,30 @@ impl GraphStore for Store {
         kind: Option<&str>,
     ) -> anyhow::Result<Vec<Activity>> {
         Ok(Store::list_activity(self, task_id, kind).await?)
+    }
+
+    async fn add_instruction(
+        &self,
+        task_id: TaskId,
+        text: String,
+    ) -> anyhow::Result<TaskInstruction> {
+        Ok(Store::add_instruction(self, task_id, text).await?)
+    }
+
+    async fn list_instructions(&self, task_id: TaskId) -> anyhow::Result<Vec<TaskInstruction>> {
+        Ok(Store::list_instructions(self, task_id).await?)
+    }
+
+    async fn mark_instructions_delivered(&self, task_id: TaskId) -> anyhow::Result<usize> {
+        Ok(Store::mark_instructions_delivered(self, task_id).await?)
+    }
+
+    async fn mark_instructions_delivered_ids(
+        &self,
+        task_id: TaskId,
+        instruction_ids: &[Uuid],
+    ) -> anyhow::Result<usize> {
+        Ok(Store::mark_instructions_delivered_ids(self, task_id, instruction_ids).await?)
     }
 
     fn save_agent_run<'a>(

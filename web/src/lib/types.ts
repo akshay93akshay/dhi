@@ -181,6 +181,12 @@ export type Task = {
    * the field; the latest `team_run` activity is the fallback signal.
    */
   topology?: TaskTopology | null;
+  /**
+   * Swarm worker count pinned at creation (`2..=8`), or `null`/omitted when
+   * the planner decides. Only meaningful with `topology: "swarm"`; older
+   * servers omit the field.
+   */
+  swarm_workers?: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -273,6 +279,19 @@ export type SwarmMessageRecord = {
   kind: string;
   payload: JsonObject;
   created_at: string;
+};
+
+/**
+ * One planner instruction (`POST`/`GET /api/tasks/{id}/instructions`).
+ * `delivered_at` is `null` while the instruction is still queued; the planner
+ * only sees instructions, they never enter a worker prompt.
+ */
+export type Instruction = {
+  id: string;
+  task_id: string;
+  text: string;
+  created_at: string;
+  delivered_at: string | null;
 };
 
 /** The durable approval row (`dhi_core::Approval`), unenriched. */
@@ -794,6 +813,11 @@ export type SwarmMessagesResponse = {
   messages: SwarmMessageRecord[];
 };
 
+/** `GET /api/tasks/{id}/instructions` — instruction history. */
+export type InstructionsResponse = {
+  instructions: Instruction[];
+};
+
 /** `GET /api/tasks/{id}/usage` — completion calls ordered by `(created_at, call_index)`. */
 export type TaskUsageResponse = {
   runs: AgentRun[];
@@ -887,6 +911,11 @@ export type CreateTaskInput = {
    * one execution topology.
    */
   topology?: TaskTopology | null;
+  /**
+   * `null`/omitted lets the planner decide the swarm width; otherwise `2..=8`.
+   * The server accepts this only together with `topology: "swarm"`.
+   */
+  swarm_workers?: number | null;
 };
 
 /**

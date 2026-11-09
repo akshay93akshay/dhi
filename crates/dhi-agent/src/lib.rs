@@ -81,6 +81,15 @@ pub struct PlanInput {
     /// guard enforces before the engine sees the plan.
     #[serde(default)]
     pub required_topology: Option<dhi_core::Topology>,
+    /// The exact swarm worker count the user required at task creation.
+    /// `None` leaves the count to the planner. The planner tool guard and the
+    /// engine both enforce a present value on a swarm plan.
+    #[serde(default)]
+    pub swarm_workers: Option<usize>,
+    /// Pending human instructions, oldest first. They are planner-only: the
+    /// engine never injects them into a worker prompt.
+    #[serde(default)]
+    pub instructions: Vec<String>,
 }
 
 /// What one planner call decided.
@@ -990,6 +999,10 @@ impl RigAgentRuntime {
             required_topology: input
                 .required_topology
                 .map_or_else(|| "none".to_string(), |topology| topology.to_string()),
+            swarm_workers: input
+                .swarm_workers
+                .map_or_else(|| "none".to_string(), |count| count.to_string()),
+            instructions: instruction_lines(&input.instructions),
         };
         let (system, user) = self.prompts.render_planner(&vars)?;
         Ok(self.rendered(Role::Planner, system, user))
@@ -1374,6 +1387,16 @@ fn failure_lines(failures: &[String]) -> String {
     }
 }
 
+/// One line per pending human instruction. `none` keeps the section explicit
+/// when the planner has no instruction to apply.
+fn instruction_lines(instructions: &[String]) -> String {
+    if instructions.is_empty() {
+        "none".to_string()
+    } else {
+        bullet_list(instructions)
+    }
+}
+
 /// Minimal templates for [`RigAgentRuntime::new`], which resolves no file. A
 /// bad constant is a bug in this crate, not configuration.
 fn fallback_prompts() -> PromptSet {
@@ -1417,13 +1440,20 @@ struct PlannerSink {
     /// Enforced inside the `add_intent` tool closure so a plan-less or
     /// mismatched call is a tool error the model can retry in the same run.
     required_topology: Option<dhi_core::Topology>,
+    /// The user-required swarm worker count. When present, a swarm plan must
+    /// declare exactly this many workers and this many subtasks.
+    swarm_workers: Option<usize>,
 }
 
 impl PlannerSink {
-    fn with_required_topology(required_topology: Option<dhi_core::Topology>) -> Self {
+    fn with_requirements(
+        required_topology: Option<dhi_core::Topology>,
+        swarm_workers: Option<usize>,
+    ) -> Self {
         Self {
             outcome: Arc::default(),
             required_topology,
+            swarm_workers,
         }
     }
 
@@ -1446,6 +1476,7 @@ impl PlannerSink {
 
     fn tools(&self) -> anyhow::Result<Vec<DynamicTool>> {
         let required_topology = self.required_topology;
+        let swarm_workers = self.swarm_workers;
         let add_name = ToolName::new("add_intent")
             .map_err(|err| anyhow::anyhow!("invalid planner tool name: {err}"))?;
         let prove_name = ToolName::new("prove_goal")
@@ -1556,7 +1587,8 @@ impl PlannerSink {
                         None
                     } else {
                         let plan = parse_plan_arg(&args, description)?;
-                        enforce_required_topology(required_topology, plan)?
+                        let plan = enforce_required_topology(required_topology, plan)?;
+                        enforce_swarm_worker_count(swarm_workers, plan)?
                     };
                     record_plan(
                         &sink,
@@ -1715,6 +1747,35 @@ fn enforce_required_topology(
             ))),
         },
     }
+}
+
+/// Enforce the user's required swarm worker count on an `add_intent` plan.
+///
+/// A swarm seeds exactly one subtask per worker, so both counts must equal the
+/// required value. A mismatch is an invalid-args tool error: the model can
+/// retry with the right shape in the same run.
+fn enforce_swarm_worker_count(
+    required: Option<usize>,
+    plan: Option<dhi_core::IntentPlan>,
+) -> Result<Option<dhi_core::IntentPlan>, ToolExecutionError> {
+    let Some(required) = required else {
+        return Ok(plan);
+    };
+    let Some(plan) = plan else {
+        return Ok(None);
+    };
+    if plan.topology != dhi_core::Topology::Swarm {
+        return Ok(Some(plan));
+    }
+    if plan.workers.len() != required || plan.subtasks.len() != required {
+        return Err(ToolExecutionError::invalid_args(format!(
+            "required swarm worker count {required}, but the plan declares {} workers and {} \
+             subtasks; retry with exactly {required} workers and {required} subtasks",
+            plan.workers.len(),
+            plan.subtasks.len()
+        )));
+    }
+    Ok(Some(plan))
 }
 
 /// Parse and validate the optional planner plan.
@@ -1902,6 +1963,7 @@ impl AgentRuntime for RigAgentRuntime {
     async fn plan(&self, input: PlanInput) -> anyhow::Result<AgentCall<PlanOutcome>> {
         let call = self.render_plan(&input)?;
         let required_topology = input.required_topology;
+        let swarm_workers = input.swarm_workers;
         // The planner runs no guarded tools: no scope, no registry churn.
         let (text, response, latency, candidate, sink) = self
             .complete_via_pool(
@@ -1910,7 +1972,7 @@ impl AgentRuntime for RigAgentRuntime {
                 &call,
                 ToolSetup::default(),
                 || {
-                    let sink = PlannerSink::with_required_topology(required_topology);
+                    let sink = PlannerSink::with_requirements(required_topology, swarm_workers);
                     let tools = sink.tools()?;
                     Ok((sink, tools))
                 },
@@ -2192,6 +2254,8 @@ mod tests {
             failures: vec![],
             planner_profile_id: None,
             required_topology: None,
+            swarm_workers: None,
+            instructions: vec![],
         }
     }
 
@@ -2255,8 +2319,10 @@ mod tests {
             call.user
         );
         assert!(
-            !call.user.lines().any(|line| line.trim() == "none"),
-            "{}",
+            !call
+                .user
+                .contains("Recent failed intents, oldest first:\n\nnone"),
+            "a non-empty failure list must not render as none: {}",
             call.user
         );
     }
@@ -2556,7 +2622,7 @@ mod tests {
     #[tokio::test]
     async fn add_intent_requires_a_matching_plan_when_topology_is_required() {
         for required in [dhi_core::Topology::ManagerWorker, dhi_core::Topology::Swarm] {
-            let sink = PlannerSink::with_required_topology(Some(required));
+            let sink = PlannerSink::with_requirements(Some(required), None);
             let tools = sink.tools().expect("planner tools build");
             let err = tools[0]
                 .run(serde_json::json!({"description": "do it"}))
@@ -2568,7 +2634,7 @@ mod tests {
             );
         }
 
-        let sink = PlannerSink::with_required_topology(Some(dhi_core::Topology::Swarm));
+        let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::Swarm), None);
         let tools = sink.tools().expect("planner tools build");
         let err = tools[0]
             .run(serde_json::json!({
@@ -2598,7 +2664,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_intent_accepts_a_matching_plan_when_topology_is_required() {
-        let sink = PlannerSink::with_required_topology(Some(dhi_core::Topology::ManagerWorker));
+        let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::ManagerWorker), None);
         let tools = sink.tools().expect("planner tools build");
         tools[0]
             .run(serde_json::json!({
@@ -2632,7 +2698,7 @@ mod tests {
 
     #[tokio::test]
     async fn add_intent_ignores_a_plan_when_single_is_required() {
-        let sink = PlannerSink::with_required_topology(Some(dhi_core::Topology::Single));
+        let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::Single), None);
         let tools = sink.tools().expect("planner tools build");
         tools[0]
             .run(serde_json::json!({
@@ -2664,7 +2730,7 @@ mod tests {
             "single must ignore the supplied plan"
         );
 
-        let sink = PlannerSink::with_required_topology(Some(dhi_core::Topology::Single));
+        let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::Single), None);
         let tools = sink.tools().expect("planner tools build");
         tools[0]
             .run(serde_json::json!({
@@ -2700,6 +2766,117 @@ mod tests {
             "the protocol explains the requirement: {}",
             call.system
         );
+    }
+
+    #[test]
+    fn render_plan_states_the_swarm_worker_count_and_user_instructions() {
+        let runtime = runtime_with("planner-x", "worker-y");
+        let mut input = plan_input();
+        input.required_topology = Some(dhi_core::Topology::Swarm);
+        input.swarm_workers = Some(4);
+        input.instructions = vec![
+            "focus on the endgame".to_string(),
+            "name the exact move".to_string(),
+        ];
+
+        let call = runtime.render_plan(&input).expect("renders");
+
+        assert!(
+            call.user.contains("Required swarm worker count: 4"),
+            "the user turn states the required count: {}",
+            call.user
+        );
+        assert!(
+            call.user.contains("## User instructions"),
+            "the user instructions section is rendered: {}",
+            call.user
+        );
+        assert!(
+            call.user.contains("- focus on the endgame")
+                && call.user.contains("- name the exact move"),
+            "instructions are rendered oldest first: {}",
+            call.user
+        );
+        assert!(
+            call.system.contains("required swarm worker count"),
+            "the protocol explains the count rule: {}",
+            call.system
+        );
+
+        input.swarm_workers = None;
+        input.instructions.clear();
+        let call = runtime.render_plan(&input).expect("renders");
+        assert!(call.user.contains("Required swarm worker count: none"));
+        assert!(
+            call.user.lines().any(|line| line.trim() == "none"),
+            "an empty instruction list renders as none: {}",
+            call.user
+        );
+    }
+
+    #[tokio::test]
+    async fn add_intent_rejects_a_swarm_plan_with_the_wrong_worker_count() {
+        let plan_args = |workers: usize, subtasks: usize| {
+            let workers: Vec<serde_json::Value> = (0..workers)
+                .map(|n| {
+                    serde_json::json!({
+                        "key": format!("worker-{n}"),
+                        "role": "researcher",
+                        "prompt": "do the work",
+                        "max_turns": 4
+                    })
+                })
+                .collect();
+            let subtasks: Vec<serde_json::Value> = (0..subtasks)
+                .map(|n| {
+                    serde_json::json!({
+                        "id": format!("sub-{n}"),
+                        "description": "do the work",
+                        "worker_key": format!("worker-{n}")
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "description": "split the research",
+                "plan": {
+                    "topology": "swarm",
+                    "workers": workers,
+                    "subtasks": subtasks
+                }
+            })
+        };
+
+        for (workers, subtasks) in [(2, 2), (4, 3), (3, 2)] {
+            let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::Swarm), Some(3));
+            let tools = sink.tools().expect("planner tools build");
+            let err = tools[0]
+                .run(plan_args(workers, subtasks))
+                .await
+                .expect_err("a mismatched swarm count must be a tool error");
+            assert!(
+                format!("{err}").contains("required swarm worker count 3"),
+                "{workers}/{subtasks}: {err}"
+            );
+            assert!(
+                format!("{err}").contains("retry with exactly 3 workers and 3 subtasks"),
+                "{workers}/{subtasks}: {err}"
+            );
+        }
+
+        let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::Swarm), Some(3));
+        let tools = sink.tools().expect("planner tools build");
+        tools[0]
+            .run(plan_args(3, 3))
+            .await
+            .expect("a plan with the exact count is accepted on retry");
+        let PlanOutcome::AddIntent {
+            plan: Some(plan), ..
+        } = sink.finish("ignored after a tool call")
+        else {
+            panic!("expected a plan");
+        };
+        assert_eq!(plan.workers.len(), 3);
+        assert_eq!(plan.subtasks.len(), 3);
     }
 
     #[tokio::test]

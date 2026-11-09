@@ -25,6 +25,7 @@ import {
 import {
   describeApiError,
   shortenId,
+  swarmWorkersLabel,
   taskIdFromPathname,
   topologyLabel,
   type ServiceState,
@@ -287,6 +288,7 @@ function TaskDetail() {
   // the latest team_run's choice (when one has run).
   const topology = resolveTaskTopology(task.topology, activityRows ?? []);
   const topologyName = topologyLabel(topology);
+  const workersLabel = swarmWorkersLabel(task.swarm_workers);
 
   const visualState =
     task.state === "done"
@@ -356,6 +358,14 @@ function TaskDetail() {
               <span aria-hidden="true">·</span>
               <Badge variant="outline" title="Task topology">
                 Topology: {topologyName}
+              </Badge>
+            </>
+          ) : null}
+          {workersLabel !== null ? (
+            <>
+              <span aria-hidden="true">·</span>
+              <Badge variant="outline" title="Swarm workers">
+                Workers: {workersLabel}
               </Badge>
             </>
           ) : null}
@@ -559,6 +569,17 @@ function TaskDetail() {
           <dd className="m-0 text-xs leading-5 text-muted-foreground">
             {topologyName ?? "Planner decides"}
           </dd>
+
+          {workersLabel !== null ? (
+            <>
+              <dt className="text-xs leading-5 text-muted-foreground">
+                Workers
+              </dt>
+              <dd className="m-0 text-xs leading-5 text-muted-foreground">
+                {workersLabel}
+              </dd>
+            </>
+          ) : null}
 
           <dt className="text-xs leading-5 text-muted-foreground">Created</dt>
           <dd className="m-0 text-xs leading-5 text-muted-foreground">

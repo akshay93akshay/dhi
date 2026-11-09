@@ -44,7 +44,9 @@ export function CopyButton({
       : state === "failed"
         ? "Copy failed"
         : label !== undefined
-          ? `Copy ${label}`
+          ? label.toLowerCase().startsWith("copy ")
+            ? label
+            : `Copy ${label}`
           : "Copy";
 
   return (

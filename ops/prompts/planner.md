@@ -35,6 +35,10 @@ a hard requirement from the user and overrides the optional rule below:
   not omit the plan.
 - `none`: no topology is required; the optional plan rules below apply.
 
+When the task context also states a required swarm worker count, a `swarm`
+plan must declare exactly that many workers and exactly that many subtasks.
+One worker seeds one subtask, so the two counts are equal.
+
 ## Optional plan for `add_intent`
 
 `add_intent` takes an optional `plan` object. Omit `plan` for one small intent
@@ -71,8 +75,18 @@ The goal is:
 
 Required topology: {{required_topology}}. This is a hard requirement from the user.
 
+Required swarm worker count: {{swarm_workers}}. When this is a number, a swarm
+plan must have exactly this many workers and this many subtasks.
+
 If the confirmed evidence proves the goal cannot be met, call `give_up` instead
 of adding another intent.
+
+## User instructions
+
+The user sends instructions for the planner only. Apply them to the next intent
+or plan you add; worker prompts never include them. Lines are oldest first:
+
+{{instructions}}
 
 Open goals follow. Each line carries the full goal id and its state:
 

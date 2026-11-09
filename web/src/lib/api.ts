@@ -14,6 +14,8 @@ import type {
   GuardRule,
   GuardRuleInput,
   Health,
+  Instruction,
+  InstructionsResponse,
   LlmProfile,
   McpReloadReport,
   McpReloadResponse,
@@ -260,6 +262,27 @@ export function getSwarmMessages(
   return request<SwarmMessagesResponse>(
     `/tasks/${taskId}/swarm-messages?limit=${limit}`,
   ).then((response) => response.messages);
+}
+
+/**
+ * Unwraps the `{ instructions: [...] }` envelope. Instructions are
+ * planner-only notes; the worker prompts never receive them.
+ */
+export function listInstructions(taskId: string): Promise<Instruction[]> {
+  return request<InstructionsResponse>(
+    `/tasks/${taskId}/instructions`,
+  ).then((response) => response.instructions);
+}
+
+/** Queues one planner instruction and returns the created row. */
+export function sendInstruction(
+  taskId: string,
+  text: string,
+): Promise<Instruction> {
+  return request<Instruction>(`/tasks/${taskId}/instructions`, {
+    method: "POST",
+    body: JSON.stringify({ text }),
+  });
 }
 
 /** Unwraps the `{ runs: [...] }` envelope. */

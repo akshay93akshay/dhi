@@ -13,7 +13,7 @@ use dhi_core::{
     GuardVerdict, Intent, IntentId, IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome,
     ResultRecord, ResultStatus, RunId, SideQuestionRequest, SideQuestionSession,
     SideQuestionSessionStatus, SideQuestionStatus, SideQuestionThread, SwarmMessageRecord, Task,
-    TaskCapacity, TaskId, TaskState, ToolCall, ToolCallId,
+    TaskCapacity, TaskId, TaskInstruction, TaskState, ToolCall, ToolCallId,
 };
 use uuid::Uuid;
 
@@ -40,6 +40,8 @@ struct Inner {
     side_requests: Vec<SideQuestionRequest>,
     /// Typed messages broadcast by swarm runs, append-only.
     swarm_messages: Vec<SwarmMessageRecord>,
+    /// Planner-only human instructions, oldest first.
+    instructions: Vec<TaskInstruction>,
     next_activity: i64,
     next_swarm_message: i64,
 }
@@ -146,6 +148,17 @@ impl MemoryStore {
         messages
     }
 
+    /// Every planner instruction of `task_id`, oldest first.
+    pub fn instructions(&self, task_id: TaskId) -> Vec<TaskInstruction> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.task_id == task_id)
+            .cloned()
+            .collect()
+    }
+
     /// Every recorded `agent_runs` row of `task_id`, oldest first. Tests read
     /// usage from here; there is no other in-memory accessor.
     pub fn agent_runs(&self, task_id: TaskId) -> Vec<AgentRun> {
@@ -214,6 +227,7 @@ impl GraphStore for MemoryStore {
         planner_pin: Option<i64>,
         worker_pin: Option<i64>,
         topology: Option<dhi_core::Topology>,
+        swarm_workers: Option<usize>,
     ) -> anyhow::Result<Task> {
         let task = self.create_task(goal).await?;
         let mut inner = self.inner.lock().unwrap();
@@ -224,11 +238,13 @@ impl GraphStore for MemoryStore {
         stored.pinned_planner_profile_id = planner_pin;
         stored.pinned_worker_profile_id = worker_pin;
         stored.topology = topology;
+        stored.swarm_workers = swarm_workers;
         drop(inner);
         let mut task = task;
         task.pinned_planner_profile_id = planner_pin;
         task.pinned_worker_profile_id = worker_pin;
         task.topology = topology;
+        task.swarm_workers = swarm_workers;
         Ok(task)
     }
 
@@ -796,6 +812,69 @@ impl GraphStore for MemoryStore {
             .filter(|a| a.task_id == task_id && kind.is_none_or(|kind| a.kind == kind))
             .cloned()
             .collect())
+    }
+
+    async fn add_instruction(
+        &self,
+        task_id: TaskId,
+        text: String,
+    ) -> anyhow::Result<TaskInstruction> {
+        let mut inner = self.inner.lock().unwrap();
+        if !inner.tasks.contains_key(&task_id) {
+            anyhow::bail!("instruction references missing task {task_id}");
+        }
+        let instruction = TaskInstruction {
+            id: Uuid::new_v4(),
+            task_id,
+            text,
+            created_at: Utc::now(),
+            delivered_at: None,
+        };
+        inner.instructions.push(instruction.clone());
+        Ok(instruction)
+    }
+
+    async fn list_instructions(&self, task_id: TaskId) -> anyhow::Result<Vec<TaskInstruction>> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner
+            .instructions
+            .iter()
+            .filter(|instruction| instruction.task_id == task_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn mark_instructions_delivered(&self, task_id: TaskId) -> anyhow::Result<usize> {
+        let now = Utc::now();
+        let mut inner = self.inner.lock().unwrap();
+        let mut changed = 0;
+        for instruction in &mut inner.instructions {
+            if instruction.task_id == task_id && instruction.delivered_at.is_none() {
+                instruction.delivered_at = Some(now);
+                changed += 1;
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn mark_instructions_delivered_ids(
+        &self,
+        task_id: TaskId,
+        instruction_ids: &[Uuid],
+    ) -> anyhow::Result<usize> {
+        let now = Utc::now();
+        let mut inner = self.inner.lock().unwrap();
+        let mut changed = 0;
+        for instruction in &mut inner.instructions {
+            if instruction.task_id == task_id
+                && instruction.delivered_at.is_none()
+                && instruction_ids.contains(&instruction.id)
+            {
+                instruction.delivered_at = Some(now);
+                changed += 1;
+            }
+        }
+        Ok(changed)
     }
 
     fn save_agent_run<'a>(

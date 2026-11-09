@@ -414,7 +414,7 @@ async fn profile_delete_guards_404_conflict(pool: PgPool) {
     ));
     // A task pin also protects a non-active profile.
     let task = store
-        .create_task_with_pins("pinned", Some(spare), None, None)
+        .create_task_with_pins("pinned", Some(spare), None, None, None)
         .await
         .unwrap();
     assert!(matches!(
@@ -450,6 +450,7 @@ async fn task_pins_persist_and_resolve_through_pool(pool: PgPool) {
             "mate in two",
             Some(boxed),
             Some(settings.worker_profile_id),
+            None,
             None,
         )
         .await

@@ -22,6 +22,7 @@ import {
   getTaskWork,
   getWebProviders,
   listApprovals,
+  listInstructions,
   listModels,
   listProfiles,
   listRules,
@@ -31,6 +32,7 @@ import {
   resetPool,
   saveProfile,
   saveWebProvider,
+  sendInstruction,
   stopTask,
   stopTasks,
   testWebProvider,
@@ -94,6 +96,7 @@ const sampleTask: Task = {
     max_parallel_workers: 4,
   },
   topology: "manager_worker",
+  swarm_workers: null,
   created_at: "2026-10-30T00:00:00Z",
   updated_at: "2026-10-30T00:00:00Z",
 };
@@ -213,17 +216,21 @@ test("createTask omits absent pin fields (server defaults apply)", async () => {
   assert.equal(recorder.calls[0]?.init?.body, JSON.stringify({ goal: "solo" }));
 });
 
-test("createTask forwards topology, including an explicit null", async () => {
+test("createTask forwards topology and swarm_workers, including explicit nulls", async () => {
   const recorder = stubFetch(() => jsonResponse(sampleTask, 201));
 
-  await createTask({ goal: "swarm task", topology: "swarm" });
-  await createTask({ goal: "planner task", topology: null });
+  await createTask({ goal: "swarm task", topology: "swarm", swarm_workers: 4 });
+  await createTask({
+    goal: "planner task",
+    topology: null,
+    swarm_workers: null,
+  });
 
   assert.deepEqual(
     recorder.calls.map((call) => JSON.parse(String(call.init?.body))),
     [
-      { goal: "swarm task", topology: "swarm" },
-      { goal: "planner task", topology: null },
+      { goal: "swarm task", topology: "swarm", swarm_workers: 4 },
+      { goal: "planner task", topology: null, swarm_workers: null },
     ],
   );
 });
@@ -475,6 +482,67 @@ test("getSwarmMessages unwraps { messages } and forwards the limit", async () =>
   assert.equal(recorder.calls[0]?.init?.method, undefined);
   assert.deepEqual(defaulted, [record]);
   assert.deepEqual(explicit, [record]);
+});
+
+const sampleInstruction = {
+  id: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+  task_id: sampleTask.id,
+  text: "focus on the rook line",
+  created_at: "2026-11-09T10:00:00Z",
+  delivered_at: null as string | null,
+};
+
+test("listInstructions unwraps the { instructions } envelope", async () => {
+  const recorder = stubFetch(() =>
+    jsonResponse({ instructions: [sampleInstruction] }),
+  );
+
+  const instructions = await listInstructions(sampleTask.id);
+  assert.equal(recorder.urls[0], `/api/tasks/${sampleTask.id}/instructions`);
+  assert.equal(recorder.calls[0]?.init?.method, undefined);
+  assert.deepEqual(instructions, [sampleInstruction]);
+});
+
+test("sendInstruction posts { text } and returns the created row", async () => {
+  const delivered = {
+    ...sampleInstruction,
+    delivered_at: "2026-11-09T10:00:05Z",
+  };
+  const recorder = stubFetch((_url, init) => {
+    assert.equal(init?.method, "POST");
+    assert.equal(
+      init?.body,
+      JSON.stringify({ text: "focus on the rook line" }),
+    );
+    return jsonResponse(delivered, 201);
+  });
+
+  const instruction = await sendInstruction(
+    sampleTask.id,
+    "focus on the rook line",
+  );
+  assert.equal(recorder.urls[0], `/api/tasks/${sampleTask.id}/instructions`);
+  assert.deepEqual(instruction, delivered);
+});
+
+test("sendInstruction maps the terminal-task 409 to a conflict", async () => {
+  stubFetch(() =>
+    jsonResponse(
+      {
+        error: `task ${sampleTask.id} is done; instructions cannot be added to a terminal task`,
+      },
+      409,
+    ),
+  );
+
+  const error = await sendInstruction(sampleTask.id, "too late").then(
+    () => null,
+    (thrown: unknown) => thrown,
+  );
+  assert.ok(error instanceof ApiError);
+  assert.equal(error.status, 409);
+  assert.equal(error.isConflict(), true);
+  assert.match(error.message, /instructions cannot be added/);
 });
 
 test("getTaskActivity unwraps the { activity } envelope", async () => {

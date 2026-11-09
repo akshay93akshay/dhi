@@ -18,8 +18,10 @@ import type { Activity, Fact, ResultRecord, TaskWork } from "@/lib/types";
 import { FEED_GRAPH_REFRESH_DEBOUNCE_MS, type FeedSignal } from "@/lib/feed";
 import {
   describeApiError,
+  provenanceDetailText,
   renderProvenance,
   shortenId,
+  swarmWorkersLabel,
   taskIdFromPathname,
   topologyLabel,
 } from "@/lib/ui";
@@ -48,6 +50,7 @@ import { PageHeader } from "@/components/ui/page-header";
 import { Skeleton } from "@/components/ui/skeleton";
 import { StateBadge } from "@/components/ui/state-badge";
 import { CapacityCard } from "./CapacityCard";
+import { InstructionsCard } from "./InstructionsCard";
 import { SwarmMessagesCard } from "./SwarmMessagesCard";
 
 /** Poll cadence for the work view; suspended while the SSE stream is live. */
@@ -277,6 +280,7 @@ function TaskWorkView() {
     activityRows,
   );
   const topologyName = topologyLabel(effectiveTopology);
+  const workersLabel = swarmWorkersLabel(work.task.swarm_workers);
   const swarmAvailable = taskUsesSwarm(work.task.topology, activityRows);
   const capacityNotice = capacityPauseNotice(work.task, activityRows);
   const shownTab: WorkTab =
@@ -313,6 +317,11 @@ function TaskWorkView() {
             {topologyName !== null ? (
               <Badge variant="outline" title="Task topology">
                 Topology: {topologyName}
+              </Badge>
+            ) : null}
+            {workersLabel !== null ? (
+              <Badge variant="outline" title="Swarm workers">
+                Workers: {workersLabel}
               </Badge>
             ) : null}
             <span className="mono" title={work.task.id}>
@@ -366,6 +375,8 @@ function TaskWorkView() {
           )
         }
       />
+
+      <InstructionsCard taskId={work.task.id} taskState={work.task.state} />
 
       <WorkTabBar
         active={shownTab}
@@ -630,6 +641,7 @@ function WorkTabBar(props: {
 function FactLine(props: { fact: Fact; proofOf?: string }) {
   const { fact, proofOf } = props;
   const provenance = renderProvenance(fact.provenance);
+  const detailText = provenanceDetailText(provenance);
 
   return (
     <div
@@ -665,15 +677,24 @@ function FactLine(props: { fact: Fact; proofOf?: string }) {
       {provenance.kind === "raw" ? (
         <pre className="pre">{provenance.lines.join("\n")}</pre>
       ) : (
-        <p className="mt-1.5 flex flex-wrap gap-x-2 gap-y-1 text-[11px] leading-4 text-muted-foreground">
-          {provenance.lines.map((line, index) => (
-            <ProvenanceLine
-              key={index}
-              line={line}
-              last={index === provenance.lines.length - 1}
+        <div className="mt-1.5 flex flex-wrap items-start justify-between gap-2">
+          <p className="min-w-0 flex flex-wrap gap-x-2 gap-y-1 text-[11px] leading-4 text-muted-foreground">
+            {provenance.lines.map((line, index) => (
+              <ProvenanceLine
+                key={index}
+                line={line}
+                last={index === provenance.lines.length - 1}
+              />
+            ))}
+          </p>
+          {detailText !== null ? (
+            <CopyButton
+              className="h-7 px-2 text-[11px]"
+              text={detailText}
+              label="Copy detail"
             />
-          ))}
-        </p>
+          ) : null}
+        </div>
       )}
     </div>
   );

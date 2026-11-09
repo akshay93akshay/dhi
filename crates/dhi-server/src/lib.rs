@@ -33,7 +33,7 @@ use axum::{Json, Router};
 use dhi_agent::{AgentRuntime, LlmPool, PoolSnapshot, RawProfile, ResolvedProfile};
 use dhi_core::{
     AgentRole, AgentRun, Approval, ApprovalDecision, ApprovalStatus, GraphStore, GuardStore,
-    GuardVerdict, ReopenOutcome, Task, TaskCapacity, TaskId, TaskState, Topology,
+    GuardVerdict, ReopenOutcome, Task, TaskCapacity, TaskId, TaskInstruction, TaskState, Topology,
 };
 use dhi_engine::Engine;
 use dhi_guard::ToolBackend;
@@ -131,6 +131,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}/stop", post(stop_task))
         .route("/api/tasks/{id}/goals", post(add_goal_route))
         .route("/api/tasks/{id}/capacity", post(set_task_capacity_route))
+        .route(
+            "/api/tasks/{id}/instructions",
+            get(list_instructions_route).post(add_instruction_route),
+        )
         .route("/api/tasks/{id}/work", get(get_task_work))
         .route("/api/tasks/{id}/activity", get(get_task_activity))
         .route("/api/tasks/{id}/usage", get(get_task_usage))
@@ -325,6 +329,9 @@ impl IntoResponse for ApiError {
 ///
 /// An optional `topology` pins the task's execution shape for its whole life;
 /// it can only be set here, never changed through the capacity route.
+///
+/// An optional `swarm_workers` count is valid only with `topology = "swarm"`
+/// and must be 2 to 8. It pins the exact team size for every swarm plan.
 #[derive(Debug, Deserialize)]
 struct CreateTaskRequest {
     goal: String,
@@ -335,6 +342,8 @@ struct CreateTaskRequest {
     capacity: Option<TaskCapacity>,
     #[serde(default)]
     topology: Option<Topology>,
+    #[serde(default)]
+    swarm_workers: Option<usize>,
 }
 
 /// `POST /api/tasks/{id}/goals` input.
@@ -348,6 +357,18 @@ struct AddGoalRequest {
 struct AddGoalResponse {
     task: Task,
     goal: dhi_core::Goal,
+}
+
+/// `POST /api/tasks/{id}/instructions` input.
+#[derive(Debug, Deserialize)]
+struct AddInstructionRequest {
+    text: String,
+}
+
+/// `GET /api/tasks/{id}/instructions` output.
+#[derive(Debug, Serialize)]
+struct InstructionsResponse {
+    instructions: Vec<TaskInstruction>,
 }
 
 /// `POST /api/tasks/{id}/capacity` input.
@@ -488,6 +509,7 @@ async fn create_task(
         return Err(ApiError::bad_request("goal must not be empty"));
     }
     let capacity = body.capacity.map(validate_create_capacity).transpose()?;
+    let swarm_workers = validate_swarm_workers(body.topology, body.swarm_workers)?;
     // Pin validation needs the management tables; a pin-less create stays
     // available wherever the core store is wired.
     if body.planner_profile_id.is_some() || body.worker_profile_id.is_some() {
@@ -503,6 +525,7 @@ async fn create_task(
             body.planner_profile_id,
             body.worker_profile_id,
             body.topology,
+            swarm_workers,
         )
         .await
         .map_err(ApiError::internal)?;
@@ -541,6 +564,31 @@ fn validate_create_capacity(capacity: TaskCapacity) -> Result<TaskCapacity, ApiE
         }
     }
     Ok(capacity)
+}
+
+/// Validates the create-time swarm worker count.
+///
+/// The count is meaningless without a pinned swarm topology, so a count on any
+/// other task shape is a `400` instead of being silently ignored. The user
+/// contract fixes the range at 2 to 8.
+fn validate_swarm_workers(
+    topology: Option<Topology>,
+    swarm_workers: Option<usize>,
+) -> Result<Option<usize>, ApiError> {
+    let Some(count) = swarm_workers else {
+        return Ok(None);
+    };
+    if topology != Some(Topology::Swarm) {
+        return Err(ApiError::bad_request(
+            "swarm_workers is only valid with topology \"swarm\"",
+        ));
+    }
+    if !(2..=8).contains(&count) {
+        return Err(ApiError::bad_request(
+            "swarm_workers must be between 2 and 8",
+        ));
+    }
+    Ok(Some(count))
 }
 
 /// Records an unrecoverable background run error as a visible terminal
@@ -718,6 +766,64 @@ async fn set_task_capacity_route(
     }
 
     Ok(Json(updated))
+}
+
+/// `POST /api/tasks/{id}/instructions`.
+///
+/// Adds one planner-only instruction. A terminal task is refused: no planner
+/// round can ever read it, so the row would be dead audit data. The insert and
+/// the `instruction_received` activity are appended before the response.
+async fn add_instruction_route(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    payload: Result<Json<AddInstructionRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<TaskInstruction>), ApiError> {
+    let Json(body) = payload.map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
+    let text = body.text.trim();
+    if text.is_empty() {
+        return Err(ApiError::bad_request("text must not be empty"));
+    }
+
+    let task = require_task(state.store.as_ref(), id).await?;
+    if task.state.is_terminal() {
+        return Err(ApiError::conflict(format!(
+            "task {id} is {}; instructions cannot be added to a terminal task",
+            task.state
+        )));
+    }
+
+    let instruction = state
+        .store
+        .add_instruction(id, text.to_string())
+        .await
+        .map_err(ApiError::internal)?;
+    state
+        .store
+        .append_activity(
+            id,
+            "instruction_received",
+            format!("human instruction: {text}"),
+            json!({"instruction_id": instruction.id}),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+
+    Ok((StatusCode::CREATED, Json(instruction)))
+}
+
+/// `GET /api/tasks/{id}/instructions`: every instruction, oldest first
+/// (newest last), with `delivered_at` once a planner round consumed it.
+async fn list_instructions_route(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<InstructionsResponse>, ApiError> {
+    require_task(state.store.as_ref(), id).await?;
+    let instructions = state
+        .store
+        .list_instructions(id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(InstructionsResponse { instructions }))
 }
 
 fn positive_capacity(name: &str, value: Option<i64>) -> Result<Option<usize>, ApiError> {
@@ -3371,6 +3477,17 @@ mod tests {
         post_json(&format!("/api/tasks/{task_id}/capacity"), body)
     }
 
+    fn post_instruction(task_id: TaskId, text: &str) -> Request<Body> {
+        post_json(
+            &format!("/api/tasks/{task_id}/instructions"),
+            json!({ "text": text }),
+        )
+    }
+
+    fn get_instructions(task_id: TaskId) -> Request<Body> {
+        get_uri(&format!("/api/tasks/{task_id}/instructions"))
+    }
+
     /// Moves a freshly seeded task to one terminal state through the public
     /// guard, exactly as an engine run would.
     async fn make_terminal(store: &MemoryStore, task: &Task, state: TaskState) {
@@ -3813,8 +3930,13 @@ mod tests {
 
         assert_eq!(status, StatusCode::CREATED, "{json}");
         assert!(json["topology"].is_null(), "{json}");
+        assert!(json["swarm_workers"].is_null(), "{json}");
         let id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
         assert_eq!(store.get_task(id).await.unwrap().unwrap().topology, None);
+        assert_eq!(
+            store.get_task(id).await.unwrap().unwrap().swarm_workers,
+            None
+        );
     }
 
     #[tokio::test]
@@ -3841,6 +3963,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_task_accepts_the_full_swarm_worker_range() {
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store.clone()));
+
+        for count in [2, 4, 8] {
+            let (status, json) = send(
+                app.clone(),
+                post_json(
+                    "/api/tasks",
+                    json!({
+                        "goal": "split the research",
+                        "topology": "swarm",
+                        "swarm_workers": count,
+                    }),
+                ),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::CREATED, "{json}");
+            assert_eq!(json["swarm_workers"], count, "{json}");
+            let id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
+            assert_eq!(
+                store.get_task(id).await.unwrap().unwrap().swarm_workers,
+                Some(count as usize)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_invalid_swarm_worker_counts() {
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store.clone()));
+
+        for body in [
+            json!({"goal": "no topology", "swarm_workers": 4}),
+            json!({"goal": "not a swarm", "topology": "manager_worker", "swarm_workers": 4}),
+            json!({"goal": "too small", "topology": "swarm", "swarm_workers": 1}),
+            json!({"goal": "too small", "topology": "swarm", "swarm_workers": 0}),
+            json!({"goal": "too big", "topology": "swarm", "swarm_workers": 9}),
+            json!({"goal": "negative", "topology": "swarm", "swarm_workers": -2}),
+        ] {
+            let (status, json) = send(app.clone(), post_json("/api/tasks", body.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body} -> {json}");
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("swarm_workers"),
+                "{body} -> {json}"
+            );
+        }
+
+        assert!(
+            store.list_tasks(10).await.unwrap().is_empty(),
+            "no invalid create may persist a task"
+        );
+    }
+
+    #[tokio::test]
     async fn capacity_extension_never_changes_topology() {
         let store = Arc::new(MemoryStore::new());
         let task = store
@@ -3849,6 +4030,7 @@ mod tests {
                 None,
                 None,
                 Some(Topology::Single),
+                None,
             )
             .await
             .unwrap();
@@ -4470,6 +4652,104 @@ mod tests {
                 "{state}: a refused extension must not write the ledger"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Planner instructions
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn instruction_add_and_list_round_trip() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("follow the new instruction");
+        let app = router(test_state_with_store(store.clone()));
+
+        let (status, json) = send(
+            app.clone(),
+            post_instruction(task.id, "focus on the endgame"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert_eq!(json["task_id"], task.id.to_string(), "{json}");
+        assert_eq!(json["text"], "focus on the endgame", "{json}");
+        assert!(json["id"].is_string(), "{json}");
+        assert!(json["created_at"].is_string(), "{json}");
+        assert!(json["delivered_at"].is_null(), "{json}");
+        let first_id = json["id"].as_str().unwrap().to_string();
+
+        let (status, json) = send(
+            app.clone(),
+            post_instruction(task.id, "name the exact move"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        let second_id = json["id"].as_str().unwrap().to_string();
+
+        let (status, json) = send(app, get_instructions(task.id)).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let instructions = json["instructions"].as_array().unwrap();
+        assert_eq!(instructions.len(), 2, "{json}");
+        assert_eq!(instructions[0]["id"], first_id, "oldest first: {json}");
+        assert_eq!(instructions[1]["id"], second_id, "newest last: {json}");
+        assert_eq!(instructions[1]["text"], "name the exact move", "{json}");
+        assert!(instructions[1]["delivered_at"].is_null(), "{json}");
+
+        let activities = store.activities(task.id);
+        assert_eq!(
+            activities
+                .iter()
+                .filter(|activity| activity.kind == "instruction_received")
+                .count(),
+            2,
+            "each accepted instruction appends its activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn instruction_rejects_terminal_tasks() {
+        for state in [
+            TaskState::Done,
+            TaskState::Failed,
+            TaskState::Timeout,
+            TaskState::Cancelled,
+        ] {
+            let store = Arc::new(MemoryStore::new());
+            let task = store.seed_task("terminal instruction");
+            make_terminal(&store, &task, state).await;
+            let app = router(test_state_with_store(store.clone()));
+
+            let (status, json) = send(app, post_instruction(task.id, "too late")).await;
+
+            assert_eq!(status, StatusCode::CONFLICT, "{state}: {json}");
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("terminal"),
+                "{state}: {json}"
+            );
+            assert!(
+                store.instructions(task.id).is_empty(),
+                "{state}: a refused instruction must not be stored"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn instruction_rejects_empty_text_and_unknown_task() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("instruction validation");
+        let app = router(test_state_with_store(store.clone()));
+
+        let (status, json) = send(app.clone(), post_instruction(task.id, "   ")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert!(
+            json["error"].as_str().unwrap_or_default().contains("text"),
+            "{json}"
+        );
+
+        let (status, json) = send(app, post_instruction(Uuid::new_v4(), "who am i")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
     }
 
     #[tokio::test]

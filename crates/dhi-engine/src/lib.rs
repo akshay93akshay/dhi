@@ -108,6 +108,30 @@ fn enforce_required_topology(
     }
 }
 
+/// Enforce a user-required swarm worker count on a plan about to execute.
+///
+/// The planner tool guard already rejects a mismatched `add_intent` plan; this
+/// second check protects every other `AgentRuntime`, a restarted engine that
+/// loaded a persisted plan, and a plan that bypassed the tool. A swarm seeds
+/// one subtask per worker, so both counts must equal the required value.
+fn enforce_swarm_worker_count(required: Option<usize>, plan: &IntentPlan) -> Result<(), String> {
+    let Some(required) = required else {
+        return Ok(());
+    };
+    if plan.topology != Topology::Swarm {
+        return Ok(());
+    }
+    if plan.workers.len() != required || plan.subtasks.len() != required {
+        return Err(format!(
+            "required swarm worker count {required}, but the plan declares {} workers and {} \
+             subtasks; refusing to run the swarm",
+            plan.workers.len(),
+            plan.subtasks.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Fact context for one DHI+ subworker.
 ///
 /// The origin fact is the task's full goal text and names every worker and
@@ -1056,6 +1080,23 @@ impl Engine {
                         )
                         .await;
                 }
+                // Pending human instructions are planner-only input. They are
+                // re-read every round; delivered rows never come back.
+                let pending_instructions: Vec<dhi_core::TaskInstruction> = self
+                    .store
+                    .list_instructions(task_id)
+                    .await?
+                    .into_iter()
+                    .filter(|instruction| instruction.delivered_at.is_none())
+                    .collect();
+                let instruction_texts: Vec<String> = pending_instructions
+                    .iter()
+                    .map(|instruction| instruction.text.clone())
+                    .collect();
+                let pending_instruction_ids: Vec<Uuid> = pending_instructions
+                    .iter()
+                    .map(|instruction| instruction.id)
+                    .collect();
                 let plan = match self
                     .agent
                     .plan(PlanInput {
@@ -1067,6 +1108,8 @@ impl Engine {
                         failures,
                         planner_profile_id: task.pinned_planner_profile_id,
                         required_topology: task.topology,
+                        swarm_workers: task.swarm_workers,
+                        instructions: instruction_texts,
                     })
                     .await
                 {
@@ -1100,6 +1143,29 @@ impl Engine {
                 self.record_agent_calls(task_id, None, None, &plan).await;
                 model_calls += planner_calls;
                 let plan = plan.output;
+
+                // The planner round consumed every pending instruction it was
+                // given, no matter whether it produced a plan. Marking only
+                // those ids after the call keeps a restart from re-injecting
+                // old text while leaving an instruction added mid-call pending
+                // for the next round.
+                if !pending_instructions.is_empty() {
+                    let delivered = self
+                        .store
+                        .mark_instructions_delivered_ids(task_id, &pending_instruction_ids)
+                        .await?;
+                    self.log_activity(
+                        task_id,
+                        "instruction_delivered",
+                        format!("planner received {delivered} instruction(s)"),
+                        serde_json::json!({
+                            "count": delivered,
+                            "instruction_ids": pending_instruction_ids,
+                            "round": rounds,
+                        }),
+                    )
+                    .await?;
+                }
 
                 if stop_requested(stop.as_ref()) {
                     return self
@@ -1403,6 +1469,18 @@ impl Engine {
             };
 
             if let Some(plan) = plan.filter(|plan| plan.topology != Topology::Single) {
+                // A required count is enforced once more before any worker
+                // starts: a persisted or runtime-supplied plan that bypassed
+                // the planner tool guard still must match the user's shape.
+                if let Err(reason) = enforce_swarm_worker_count(task.swarm_workers, &plan) {
+                    self.store
+                        .finish_intent(claimed.id, IntentState::Stopped)
+                        .await?;
+                    self.forget_plan(claimed.id);
+                    self.fail_task(task_id, &mut task, reason.clone(), "swarm_workers")
+                        .await?;
+                    anyhow::bail!("{reason}");
+                }
                 let (result, team_plan, manager_model_calls) = match self
                     .run_team_plan(task_id, &task, &claimed, &plan, &facts)
                     .await
@@ -2089,6 +2167,50 @@ mod tests {
         }
     }
 
+    /// Wraps a scripted planner and adds a new instruction during its first
+    /// planner call, simulating a human typing while the model is thinking.
+    struct MidPlanInstructionAgent {
+        inner: ScriptedAgent,
+        store: Arc<MemoryStore>,
+        task_id: TaskId,
+        added: Mutex<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRuntime for MidPlanInstructionAgent {
+        async fn plan(
+            &self,
+            input: PlanInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<PlanOutcome>> {
+            let add = {
+                let mut added = self.added.lock().unwrap();
+                let add = !*added;
+                *added = true;
+                add
+            };
+            if add {
+                GraphStore::add_instruction(
+                    self.store.as_ref(),
+                    self.task_id,
+                    "late instruction".to_string(),
+                )
+                .await?;
+            }
+            self.inner.plan(input).await
+        }
+
+        async fn execute(
+            &self,
+            input: ExecuteInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<dhi_agent::ExecuteOutput>> {
+            self.inner.execute(input).await
+        }
+
+        fn name(&self) -> &str {
+            "mid-plan-instruction"
+        }
+    }
+
     /// What one subtask's worker turn should do.
     #[derive(Clone)]
     enum TeamWorker {
@@ -2763,6 +2885,7 @@ mod tests {
             None,
             None,
             Some(Topology::Swarm),
+            None,
         )
         .await
         .unwrap();
@@ -2811,6 +2934,7 @@ mod tests {
             None,
             None,
             Some(Topology::Single),
+            None,
         )
         .await
         .unwrap();
@@ -2849,6 +2973,7 @@ mod tests {
             None,
             None,
             Some(Topology::Swarm),
+            None,
         )
         .await
         .unwrap();
@@ -2864,6 +2989,160 @@ mod tests {
         assert_eq!(
             agent.plan_inputs()[0].required_topology,
             Some(Topology::Swarm)
+        );
+    }
+
+    #[tokio::test]
+    async fn planner_receives_pending_instructions_and_delivered_ones_are_not_resent() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("apply the human instruction");
+        GraphStore::add_instruction(
+            store.as_ref(),
+            task.id,
+            "focus on the endgame first".to_string(),
+        )
+        .await
+        .unwrap();
+        let agent = Arc::new(ScriptedAgent::new(vec![idle_plan(), idle_plan()], vec![]));
+        let engine = Engine::new(store.clone(), Arc::clone(&agent) as Arc<dyn AgentRuntime>)
+            .with_heartbeat(Duration::from_millis(1))
+            .with_max_idle_ticks(2);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Timeout);
+        let inputs = agent.plan_inputs();
+        assert_eq!(inputs.len(), 2, "two planner rounds ran");
+        assert_eq!(
+            inputs[0].instructions,
+            vec!["focus on the endgame first".to_string()],
+            "the first planner round sees the pending instruction"
+        );
+        assert!(
+            inputs[1].instructions.is_empty(),
+            "a delivered instruction is never re-sent"
+        );
+        let stored = store.instructions(task.id);
+        assert_eq!(stored.len(), 1);
+        assert!(
+            stored[0].delivered_at.is_some(),
+            "the planner round marked the instruction delivered"
+        );
+        assert_eq!(
+            store
+                .activities(task.id)
+                .into_iter()
+                .filter(|activity| activity.kind == "instruction_delivered")
+                .count(),
+            1,
+            "one planner round appends one delivery activity"
+        );
+    }
+
+    #[tokio::test]
+    async fn instruction_added_during_the_planner_call_waits_for_the_next_round() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("apply both instructions");
+        GraphStore::add_instruction(store.as_ref(), task.id, "first".to_string())
+            .await
+            .unwrap();
+        let agent = Arc::new(MidPlanInstructionAgent {
+            inner: ScriptedAgent::new(vec![idle_plan(), idle_plan()], vec![]),
+            store: store.clone(),
+            task_id: task.id,
+            added: Mutex::new(false),
+        });
+        let engine = Engine::new(store.clone(), Arc::clone(&agent) as Arc<dyn AgentRuntime>)
+            .with_heartbeat(Duration::from_millis(1))
+            .with_max_idle_ticks(2);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Timeout);
+        let inputs = agent.inner.plan_inputs();
+        assert_eq!(inputs.len(), 2, "two planner rounds ran");
+        assert_eq!(
+            inputs[0].instructions,
+            vec!["first".to_string()],
+            "the first planner round sees the first instruction"
+        );
+        assert_eq!(
+            inputs[1].instructions,
+            vec!["late instruction".to_string()],
+            "an instruction added mid-call waits for the next round instead of being marked delivered unseen"
+        );
+        let stored = store.instructions(task.id);
+        assert_eq!(stored.len(), 2);
+        assert!(
+            stored.iter().all(|row| row.delivered_at.is_some()),
+            "both instructions were delivered once their planner rounds read them"
+        );
+    }
+
+    #[tokio::test]
+    async fn engine_refuses_a_swarm_plan_with_the_wrong_worker_count() {
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            "split the research".to_string(),
+            None,
+            None,
+            Some(Topology::Swarm),
+            Some(3),
+        )
+        .await
+        .unwrap();
+        let agent = Arc::new(ScriptedAgent::new(
+            vec![planned_intent(
+                "split the research",
+                two_worker_plan("split the research", Topology::Swarm),
+            )],
+            vec![],
+        ));
+        let engine = Engine::new(store.clone(), Arc::clone(&agent) as Arc<dyn AgentRuntime>);
+
+        let err = engine
+            .run_task(task.id)
+            .await
+            .expect_err("a mismatched swarm count fails the task");
+        assert!(
+            err.to_string().contains("required swarm worker count 3"),
+            "{err}"
+        );
+
+        assert_eq!(
+            agent.plan_inputs()[0].swarm_workers,
+            Some(3),
+            "the planner input carries the user's required count"
+        );
+        let row = store.get_task(task.id).await.unwrap().unwrap();
+        assert_eq!(row.state, TaskState::Failed);
+        let failed = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "task_failed")
+            .expect("task_failed activity");
+        assert_eq!(failed.payload["source"], "swarm_workers");
+        assert!(
+            failed.payload["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("2 workers and 2 subtasks"),
+            "{failed:?}"
+        );
+        let intents = store.intents(task.id);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(
+            intents[0].state,
+            IntentState::Stopped,
+            "the refused intent must not stay running"
+        );
+        assert!(
+            !store
+                .activities(task.id)
+                .iter()
+                .any(|activity| activity.kind == "team_run"),
+            "no worker may start on a refused swarm"
         );
     }
 
@@ -4360,9 +4639,10 @@ mod tests {
             planner_pin: Option<i64>,
             worker_pin: Option<i64>,
             topology: Option<dhi_core::Topology>,
+            swarm_workers: Option<usize>,
         ) -> anyhow::Result<Task> {
             self.inner
-                .create_task_with_pins(goal, planner_pin, worker_pin, topology)
+                .create_task_with_pins(goal, planner_pin, worker_pin, topology, swarm_workers)
                 .await
         }
 

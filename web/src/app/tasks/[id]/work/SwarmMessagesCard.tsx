@@ -7,13 +7,14 @@ import { getSwarmMessages } from "@/lib/api";
 import { formatLocalClock, formatLocalTimestamp } from "@/lib/localTime";
 import { describeApiError } from "@/lib/ui";
 import {
-  groupSwarmMessages,
+  groupSwarmRuns,
   parseSwarmMessages,
   swarmKindLabel,
   swarmMessageCounts,
   type SwarmMessageView,
   type SwarmRoundGroup,
-  type SwarmWorkerGroup,
+  type SwarmRunGroup,
+  type SwarmSenderGroup,
 } from "@/lib/workTeam";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -41,23 +42,6 @@ function kindVariant(kind: string): "success" | "info" | "warning" | "muted" {
   }
 }
 
-/**
- * `lib/workTeam` falls back to compact/pretty JSON for payload shapes it does
- * not recognize. Those fallbacks must stay plain text — only model-authored
- * prose is Markdown. Truncated compact JSON ends with an ellipsis, so accept
- * that as a JSON marker too.
- */
-function isSerializedJson(text: string): boolean {
-  const trimmed = text.trim();
-  if (trimmed.startsWith("{")) {
-    return trimmed.endsWith("}") || trimmed.endsWith("…");
-  }
-  if (trimmed.startsWith("[")) {
-    return trimmed.endsWith("]") || trimmed.endsWith("…");
-  }
-  return false;
-}
-
 function KindCounts(props: { counts: Record<string, number> }) {
   const entries = Object.entries(props.counts).sort(([a], [b]) =>
     a < b ? -1 : a > b ? 1 : 0,
@@ -73,8 +57,18 @@ function KindCounts(props: { counts: Record<string, number> }) {
   );
 }
 
-function SwarmMessageRow(props: { message: SwarmMessageView }) {
-  const { message } = props;
+function recipientText(peerCount: number): string {
+  return `broadcast to ${peerCount} peer${peerCount === 1 ? "" : "s"}`;
+}
+
+/**
+ * One message card: type badge, sender, recipients, short summary, and an
+ * expandable body. Repeated findings collapse to a `repeat` marker instead of
+ * duplicating their text; only malformed payloads show plain JSON.
+ */
+function SwarmMessageRow(props: { message: SwarmMessageView; peerCount: number }) {
+  const { message, peerCount } = props;
+  const repeat = message.repeatOf !== null;
   return (
     <li>
       <details className="group rounded-md border border-border bg-card">
@@ -82,15 +76,27 @@ function SwarmMessageRow(props: { message: SwarmMessageView }) {
           <Badge className="font-normal" variant={kindVariant(message.kind)}>
             {swarmKindLabel(message.kind)}
           </Badge>
+          {repeat ? (
+            <Badge className="font-normal" variant="muted">
+              repeat
+            </Badge>
+          ) : null}
           <span className="text-[11px] text-muted-foreground">
             from{" "}
             <span className="mono font-medium text-foreground">
               {message.from ?? "unknown"}
             </span>
           </span>
-          {isSerializedJson(message.summary) ? (
+          <span className="text-[10.5px] text-muted-foreground">
+            {recipientText(peerCount)}
+          </span>
+          {repeat ? (
             <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground">
-              {message.summary}
+              repeat of #{message.repeatOf}
+            </span>
+          ) : message.malformed ? (
+            <span className="min-w-0 flex-1 truncate text-[11.5px] text-muted-foreground">
+              Unknown message payload
             </span>
           ) : (
             <MarkdownMath
@@ -114,7 +120,12 @@ function SwarmMessageRow(props: { message: SwarmMessageView }) {
           <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
         </summary>
         <div className="border-t border-border px-3 py-2">
-          {isSerializedJson(message.fullText) ? (
+          {repeat ? (
+            <p className="text-[12px] text-muted-foreground">
+              Same finding text as message #{message.repeatOf}; not repeated
+              here.
+            </p>
+          ) : message.malformed ? (
             <pre className="pre mt-0 max-h-80 overflow-auto">
               {message.fullText}
             </pre>
@@ -150,10 +161,40 @@ function SwarmMessageRow(props: { message: SwarmMessageView }) {
   );
 }
 
-function SwarmRoundSection(props: { group: SwarmRoundGroup }) {
-  const { group } = props;
+function SwarmSenderSection(props: {
+  group: SwarmSenderGroup;
+  peerCount: number;
+}) {
+  const { group, peerCount } = props;
   return (
     <div className="mt-2">
+      <div className="flex flex-wrap items-center gap-1.5 px-0.5">
+        <span className="mono text-[11.5px] font-semibold">{group.sender}</span>
+        <Badge variant="outline" className="font-mono font-normal">
+          {group.counts.total}
+        </Badge>
+        <KindCounts counts={group.counts.byKind} />
+      </div>
+      <ul className="mt-1 space-y-1.5">
+        {group.messages.map((message) => (
+          <SwarmMessageRow
+            key={message.id}
+            message={message}
+            peerCount={peerCount}
+          />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function SwarmRoundSection(props: {
+  group: SwarmRoundGroup;
+  peerCount: number;
+}) {
+  const { group, peerCount } = props;
+  return (
+    <div className="mt-2.5">
       <div className="flex flex-wrap items-center gap-1.5 px-0.5">
         <span className="text-[10.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
           {group.round === null ? "Round ?" : `Round ${group.round}`}
@@ -163,33 +204,42 @@ function SwarmRoundSection(props: { group: SwarmRoundGroup }) {
         </Badge>
         <KindCounts counts={group.counts.byKind} />
       </div>
-      <ul className="mt-1.5 space-y-1.5">
-        {group.messages.map((message) => (
-          <SwarmMessageRow key={message.id} message={message} />
-        ))}
-      </ul>
+      {group.senders.map((sender) => (
+        <SwarmSenderSection
+          key={`${sender.sender}:${group.round ?? "unknown"}`}
+          group={sender}
+          peerCount={peerCount}
+        />
+      ))}
     </div>
   );
 }
 
-function SwarmWorkerSection(props: { group: SwarmWorkerGroup }) {
+function SwarmRunSection(props: { group: SwarmRunGroup }) {
   const { group } = props;
   return (
     <section className="rounded-lg border border-border bg-surface-subtle px-2.5 py-2.5">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="mono text-[12px] font-semibold">{group.worker}</span>
+        <span className="text-[12px] font-semibold">{group.label}</span>
+        {group.runShort !== "" ? (
+          <span className="mono text-[10.5px] text-muted-foreground">
+            #{group.runShort}
+          </span>
+        ) : null}
         <Badge variant="outline" className="font-normal">
           {group.counts.total} message{group.counts.total === 1 ? "" : "s"}
         </Badge>
         <span className="text-[10.5px] text-muted-foreground">
-          {group.rounds.length} round{group.rounds.length === 1 ? "" : "s"}
+          {group.senders.length} sender{group.senders.length === 1 ? "" : "s"}{" "}
+          · {group.rounds.length} round{group.rounds.length === 1 ? "" : "s"}
         </span>
         <KindCounts counts={group.counts.byKind} />
       </div>
       {group.rounds.map((round) => (
         <SwarmRoundSection
-          key={`${group.worker}:${round.round ?? "unknown"}`}
+          key={`${group.runId}:${round.round ?? "unknown"}`}
           group={round}
+          peerCount={group.peerCount}
         />
       ))}
     </section>
@@ -197,11 +247,10 @@ function SwarmWorkerSection(props: { group: SwarmWorkerGroup }) {
 }
 
 /**
- * Grouped audit view of a task's DHI+ swarm broadcasts.
- *
- * Messages are grouped by worker and then by swarm round; each row shows the
- * type, sender, and a short summary, and expands to the untruncated text.
- * There is no polling: the tab fetch runs on mount and refresh is manual.
+ * Audit view of a task's DHI+ swarm broadcasts, laid out as run → round →
+ * sender. A task with one swarm run shows one run; multiple runs are
+ * numbered in message order. There is no polling: the tab fetch runs on
+ * mount and refresh is manual.
  */
 export function SwarmMessagesCard(props: { taskId: string }) {
   const { taskId } = props;
@@ -254,7 +303,7 @@ export function SwarmMessagesCard(props: { taskId: string }) {
     void load();
   }, [load]);
 
-  const groups = messages === null ? [] : groupSwarmMessages(messages);
+  const runs = messages === null ? [] : groupSwarmRuns(messages);
   const counts = swarmMessageCounts(messages ?? []);
 
   return (
@@ -267,7 +316,7 @@ export function SwarmMessagesCard(props: { taskId: string }) {
           <div>
             <CardTitle className="text-base">Swarm messages</CardTitle>
             <CardDescription className="mt-0.5">
-              Typed peer broadcasts grouped by worker and round.
+              Typed peer broadcasts grouped by run, round, and sender.
             </CardDescription>
           </div>
         </div>
@@ -316,7 +365,7 @@ export function SwarmMessagesCard(props: { taskId: string }) {
                 {counts.total} message{counts.total === 1 ? "" : "s"}
               </Badge>
               <Badge variant="outline" className="font-normal">
-                {counts.workers} worker{counts.workers === 1 ? "" : "s"}
+                {counts.workers} sender{counts.workers === 1 ? "" : "s"}
               </Badge>
               <Badge variant="outline" className="font-normal">
                 {counts.rounds} round{counts.rounds === 1 ? "" : "s"}
@@ -324,8 +373,8 @@ export function SwarmMessagesCard(props: { taskId: string }) {
               <KindCounts counts={counts.byKind} />
             </div>
             <div className="space-y-2.5">
-              {groups.map((group) => (
-                <SwarmWorkerSection key={group.worker} group={group} />
+              {runs.map((run) => (
+                <SwarmRunSection key={run.runId || "unknown-run"} group={run} />
               ))}
             </div>
           </>

@@ -3,15 +3,19 @@ import { test } from "node:test";
 import { ApiError } from "./api.ts";
 import {
   PIN_UNSET,
+  SWARM_WORKERS_OPTIONS,
   TOPOLOGY_OPTIONS,
   buildCreateTaskInput,
   describeApiError,
   parsePin,
+  parseSwarmWorkers,
   parseTopology,
+  provenanceDetailText,
   renderProvenance,
   serviceState,
   serviceStatusText,
   shortenId,
+  swarmWorkersLabel,
   taskIdFromPathname,
   topologyLabel,
   validateGoal,
@@ -89,16 +93,25 @@ test("parsePin maps select values onto ids or null", () => {
   assert.equal(parsePin("2.5"), null);
 });
 
-test("buildCreateTaskInput always sends topology, defaulting to null", () => {
+test("buildCreateTaskInput always sends topology and swarm_workers, defaulting to null", () => {
   const result = buildCreateTaskInput({
     goal: "  mate in two  ",
     plannerPin: "",
     workerPin: "",
   });
   assert.ok(result.ok);
-  // Topology is explicit (`null` = planner decides); absent pins stay absent.
-  assert.deepEqual(result.input, { goal: "mate in two", topology: null });
-  assert.deepEqual(Object.keys(result.input).sort(), ["goal", "topology"]);
+  // Topology and the swarm width are explicit (`null` = planner decides);
+  // absent pins stay absent.
+  assert.deepEqual(result.input, {
+    goal: "mate in two",
+    topology: null,
+    swarm_workers: null,
+  });
+  assert.deepEqual(Object.keys(result.input).sort(), [
+    "goal",
+    "swarm_workers",
+    "topology",
+  ]);
 
   const blank = buildCreateTaskInput({
     goal: "g",
@@ -107,7 +120,11 @@ test("buildCreateTaskInput always sends topology, defaulting to null", () => {
     topology: "",
   });
   assert.ok(blank.ok);
-  assert.deepEqual(blank.input, { goal: "g", topology: null });
+  assert.deepEqual(blank.input, {
+    goal: "g",
+    topology: null,
+    swarm_workers: null,
+  });
 });
 
 test("buildCreateTaskInput carries a selected topology enum", () => {
@@ -119,7 +136,11 @@ test("buildCreateTaskInput carries a selected topology enum", () => {
       topology,
     });
     assert.ok(result.ok);
-    assert.deepEqual(result.input, { goal: "g", topology });
+    assert.deepEqual(result.input, {
+      goal: "g",
+      topology,
+      swarm_workers: null,
+    });
   }
   // Unknown/blank values degrade to "planner decides" instead of failing.
   const unknown = buildCreateTaskInput({
@@ -130,6 +151,45 @@ test("buildCreateTaskInput carries a selected topology enum", () => {
   });
   assert.ok(unknown.ok);
   assert.equal(unknown.input.topology, null);
+  assert.equal(unknown.input.swarm_workers, null);
+});
+
+test("buildCreateTaskInput sends swarm_workers only for a swarm topology", () => {
+  for (const workers of ["2", "3", "4", "5", "6", "7", "8"]) {
+    const result = buildCreateTaskInput({
+      goal: "g",
+      plannerPin: "",
+      workerPin: "",
+      topology: "swarm",
+      swarmWorkers: workers,
+    });
+    assert.ok(result.ok);
+    assert.equal(result.input.swarm_workers, Number(workers));
+  }
+
+  // Auto/blank stays null even for a swarm.
+  const auto = buildCreateTaskInput({
+    goal: "g",
+    plannerPin: "",
+    workerPin: "",
+    topology: "swarm",
+    swarmWorkers: "",
+  });
+  assert.ok(auto.ok);
+  assert.equal(auto.input.swarm_workers, null);
+
+  // A width selected before switching topology away is not sent.
+  for (const topology of ["", "single", "manager_worker"]) {
+    const result = buildCreateTaskInput({
+      goal: "g",
+      plannerPin: "",
+      workerPin: "",
+      topology,
+      swarmWorkers: "6",
+    });
+    assert.ok(result.ok);
+    assert.equal(result.input.swarm_workers, null);
+  }
 });
 
 test("parseTopology and topologyLabel map the select vocabulary", () => {
@@ -149,6 +209,35 @@ test("parseTopology and topologyLabel map the select vocabulary", () => {
   assert.equal(topologyLabel("swarm"), "Swarm");
 });
 
+test("parseSwarmWorkers accepts Auto and exactly 2 through 8", () => {
+  assert.equal(parseSwarmWorkers(""), null);
+  assert.equal(parseSwarmWorkers(undefined), null);
+  assert.equal(parseSwarmWorkers("auto"), null);
+  assert.equal(parseSwarmWorkers(" 2 "), 2);
+  assert.equal(parseSwarmWorkers("4"), 4);
+  assert.equal(parseSwarmWorkers("8"), 8);
+  // Below/above the server range, fractions, negative, and text are Auto.
+  for (const raw of ["0", "1", "9", "10", "-2", "2.5", "four", "4x"]) {
+    assert.equal(parseSwarmWorkers(raw), null, raw);
+  }
+  assert.deepEqual(
+    SWARM_WORKERS_OPTIONS.map((option) => option.label),
+    [
+      "Auto (planner decides)",
+      "2",
+      "3",
+      "4",
+      "5",
+      "6",
+      "7",
+      "8",
+    ],
+  );
+  assert.equal(swarmWorkersLabel(null), null);
+  assert.equal(swarmWorkersLabel(undefined), null);
+  assert.equal(swarmWorkersLabel(4), "4");
+});
+
 test("buildCreateTaskInput carries numeric pins into the canonical fields", () => {
   const result = buildCreateTaskInput({
     goal: "g",
@@ -159,6 +248,7 @@ test("buildCreateTaskInput carries numeric pins into the canonical fields", () =
   assert.deepEqual(result.input, {
     goal: "g",
     topology: null,
+    swarm_workers: null,
     planner_profile_id: 7,
     worker_profile_id: 9,
   });
@@ -293,6 +383,30 @@ test("renderProvenance never crashes on hostile value types", () => {
   const nulls = renderProvenance({ intent_id: "i6", confidence: null });
   assert.ok(nulls.kind === "worker");
   assert.equal(nulls.lines[1], "Confidence: null");
+});
+
+test("provenanceDetailText joins only Goal/Detail/Evidence content", () => {
+  assert.equal(
+    provenanceDetailText(renderProvenance({ goal: "mate in two" })),
+    "Goal: mate in two",
+  );
+  assert.equal(
+    provenanceDetailText(
+      renderProvenance({
+        intent_id: "i1",
+        detail: "checked Qh5 line",
+        evidence: "stockfish eval +1.2",
+        confidence: "observed",
+      }),
+    ),
+    "Detail: checked Qh5 line\nEvidence: stockfish eval +1.2",
+  );
+  // An id-only worker row has no copyable detail; raw JSON stays plain.
+  assert.equal(provenanceDetailText(renderProvenance({ intent_id: "i2" })), null);
+  assert.equal(
+    provenanceDetailText(renderProvenance({ trace: { nested: true } })),
+    null,
+  );
 });
 
 // ---------------------------------------------------------------------------

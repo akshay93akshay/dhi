@@ -338,6 +338,11 @@ pub struct Task {
     /// Stored in `tasks.topology`.
     #[serde(default)]
     pub topology: Option<Topology>,
+    /// Required swarm worker count, chosen at creation and immutable
+    /// afterwards. Only meaningful with [`Topology::Swarm`]; `None` leaves the
+    /// count to the planner. Stored in `tasks.swarm_workers`.
+    #[serde(default)]
+    pub swarm_workers: Option<usize>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -355,6 +360,7 @@ impl Task {
             pinned_worker_profile_id: None,
             capacity: TaskCapacity::default(),
             topology: None,
+            swarm_workers: None,
             created_at: now,
             updated_at: now,
         }
@@ -494,6 +500,21 @@ pub struct Activity {
     pub message: String,
     pub payload: serde_json::Value,
     pub created_at: DateTime<Utc>,
+}
+
+/// One human instruction for the planner of a task.
+///
+/// Instructions are read only by the planner round that picks them up; they
+/// are never injected into worker prompts. `delivered_at` is the moment the
+/// planner call that saw the text returned, so a restart never re-sends a
+/// delivered instruction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskInstruction {
+    pub id: Uuid,
+    pub task_id: TaskId,
+    pub text: String,
+    pub created_at: DateTime<Utc>,
+    pub delivered_at: Option<DateTime<Utc>>,
 }
 
 /// One typed message broadcast during a DHI+ swarm run.

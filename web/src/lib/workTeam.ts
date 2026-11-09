@@ -418,6 +418,17 @@ export type SwarmMessageView = {
   round: number | null;
   /** The worked subtask when the payload carries one. */
   subtaskId: string | null;
+  /**
+   * Id of the first finding with identical text in the same run. Set by
+   * {@link parseSwarmMessages}; a repeated finding shows `repeat` in the UI
+   * instead of duplicating its text.
+   */
+  repeatOf: number | null;
+  /**
+   * True when the payload matches no recognized `SwarmMessage` shape. Only
+   * these rows fall back to plain JSON.
+   */
+  malformed: boolean;
 };
 
 function isRecord(value: unknown): value is JsonObject {
@@ -465,15 +476,26 @@ export function swarmKindLabel(kind: string): string {
   return SWARM_KIND_LABELS[trimmed.toLowerCase()] ?? trimmed;
 }
 
+/** True for a `done` payload, either by typed payload or persisted kind. */
+function isDoneMessage(payload: unknown, kind?: string): boolean {
+  return (
+    (kind ?? "").trim().toLowerCase() === "done" ||
+    (isRecord(payload) && payload.type === "done")
+  );
+}
+
 /**
  * Compact summary of one serialized `SwarmMessage`:
  * findings use `summary` (plus their subtask id), questions/challenges use
  * `text`, done messages read "done", and anything unfamiliar degrades to
  * compact JSON instead of throwing.
  */
-export function swarmPayloadSummary(payload: unknown): string {
+export function swarmPayloadSummary(
+  payload: unknown,
+  kind?: string,
+): string {
   if (!isRecord(payload)) {
-    return compactJson(payload);
+    return isDoneMessage(payload, kind) ? "done" : compactJson(payload);
   }
 
   const summary = nonEmptyString(payload.summary);
@@ -487,7 +509,7 @@ export function swarmPayloadSummary(payload: unknown): string {
     return text;
   }
 
-  if (payload.type === "done") {
+  if (isDoneMessage(payload, kind)) {
     return "done";
   }
 
@@ -499,8 +521,14 @@ export function swarmPayloadSummary(payload: unknown): string {
  * their summary plus evidence; questions/challenges show their text; done
  * messages read "Done"; unfamiliar shapes fall back to pretty JSON.
  */
-export function swarmPayloadFullText(payload: unknown): string {
+export function swarmPayloadFullText(
+  payload: unknown,
+  kind?: string,
+): string {
   if (!isRecord(payload)) {
+    if (isDoneMessage(payload, kind)) {
+      return "Done";
+    }
     return typeof payload === "string" ? payload : fullJson(payload);
   }
   const summary = nonEmptyString(payload.summary);
@@ -512,10 +540,30 @@ export function swarmPayloadFullText(payload: unknown): string {
   if (text !== null) {
     return text;
   }
-  if (payload.type === "done") {
+  if (isDoneMessage(payload, kind)) {
     return "Done";
   }
   return fullJson(payload);
+}
+
+/**
+ * Whether a payload matches none of the typed `SwarmMessage` shapes. Only
+ * malformed rows render the plain JSON fallback; recognized finding,
+ * question, challenge, and done payloads never do.
+ */
+export function isSwarmPayloadMalformed(
+  payload: unknown,
+  kind?: string,
+): boolean {
+  if (!isRecord(payload)) {
+    return !isDoneMessage(payload, kind);
+  }
+  return (
+    nonEmptyString(payload.summary) === null &&
+    nonEmptyString(payload.text) === null &&
+    nonEmptyString(payload.message) === null &&
+    !isDoneMessage(payload, kind)
+  );
 }
 
 /** Extracts `round` from `payload.round` or a `…:r<N>:…` subtask id. */
@@ -555,6 +603,7 @@ export function parseSwarmMessage(record: unknown): SwarmMessageView | null {
   const kind = nonEmptyString(record.kind) ?? "message";
   const intentId = nonEmptyString(record.intent_id) ?? "";
   const payload = isRecord(record.payload) ? record.payload : {};
+  const malformed = isSwarmPayloadMalformed(record.payload, kind);
   return {
     id,
     kind,
@@ -562,23 +611,53 @@ export function parseSwarmMessage(record: unknown): SwarmMessageView | null {
     intentId,
     intentShort: shortenId(intentId),
     createdAt: typeof record.created_at === "string" ? record.created_at : "",
-    summary: swarmPayloadSummary(payload),
-    fullText: swarmPayloadFullText(payload),
+    summary: malformed
+      ? "Unrecognized message"
+      : swarmPayloadSummary(payload, kind),
+    fullText: malformed
+      ? fullJson(record.payload)
+      : swarmPayloadFullText(payload, kind),
     round: swarmMessageRound(payload),
     subtaskId: nonEmptyString(payload.subtask_id),
+    repeatOf: null,
+    malformed,
   };
 }
 
-/** Parses every valid row, preserving server order (ascending id). */
+/** Normalizes finding text so whitespace-only differences still count as repeats. */
+function repeatKey(view: SwarmMessageView): string {
+  return `${view.intentId}\u0000${view.fullText.trim().replace(/\s+/g, " ")}`;
+}
+
+/**
+ * Parses every valid row, preserving server order (ascending id). Later
+ * findings with the same text in the same run are marked with `repeatOf`
+ * pointing at the first occurrence; other kinds are never deduplicated.
+ */
 export function parseSwarmMessages(
   records: readonly unknown[],
 ): SwarmMessageView[] {
   const views: SwarmMessageView[] = [];
+  const firstFinding = new Map<string, number>();
   for (const record of records) {
     const view = parseSwarmMessage(record);
-    if (view !== null) {
-      views.push(view);
+    if (view === null) {
+      continue;
     }
+    if (
+      !view.malformed &&
+      view.kind.trim().toLowerCase() === "finding" &&
+      view.fullText.trim() !== ""
+    ) {
+      const key = repeatKey(view);
+      const first = firstFinding.get(key);
+      if (first === undefined) {
+        firstFinding.set(key, view.id);
+      } else {
+        view.repeatOf = first;
+      }
+    }
+    views.push(view);
   }
   return views;
 }
@@ -613,17 +692,36 @@ export function swarmMessageCounts(
   };
 }
 
-/** One round's messages for one worker. */
-export type SwarmRoundGroup = {
-  round: number | null;
+/** One sender's messages inside one round. */
+export type SwarmSenderGroup = {
+  sender: string;
   messages: SwarmMessageView[];
   counts: SwarmCounts;
 };
 
-/** One worker's messages, split by swarm round. */
-export type SwarmWorkerGroup = {
-  worker: string;
+/** One round inside a swarm run, split by sender. */
+export type SwarmRoundGroup = {
+  round: number | null;
+  senders: SwarmSenderGroup[];
+  counts: SwarmCounts;
+};
+
+/**
+ * One swarm run: messages sharing an `intent_id`. A single-run task still
+ * returns one group so the UI has a stable run → round → sender shape.
+ */
+export type SwarmRunGroup = {
+  /** The run's swarm intent id; empty when the server omitted it. */
+  runId: string;
+  /** `shortenId(runId)`; empty when there is no intent id. */
+  runShort: string;
+  /** "Run 1", "Run 2", … when multiple runs exist; "Swarm run" otherwise. */
+  label: string;
   rounds: SwarmRoundGroup[];
+  /** Distinct senders in the run, alphabetically (unknown last). */
+  senders: string[];
+  /** Every message is broadcast to the run's other senders. */
+  peerCount: number;
   counts: SwarmCounts;
 };
 
@@ -644,52 +742,111 @@ function compareStrings(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
+function compareSenders(a: string, b: string): number {
+  if (a === "unknown") {
+    return b === "unknown" ? 0 : 1;
+  }
+  if (b === "unknown") {
+    return -1;
+  }
+  return compareStrings(a, b);
+}
+
+function firstMessageId(messages: readonly SwarmMessageView[]): number {
+  return messages.reduce(
+    (lowest, message) => Math.min(lowest, message.id),
+    Number.MAX_SAFE_INTEGER,
+  );
+}
+
 /**
- * Groups parsed messages by sender ("worker") and then round. Unknown senders
- * become `unknown`; messages without a derivable round are grouped under
- * `round: null` (rendered as "Round ?"). Groups sort worker alphabetically,
- * rounds ascending (unknown last), and messages by id.
+ * Groups parsed messages into runs, rounds, and senders.
+ *
+ * The exact heuristic:
+ * - a run key is the message's `intent_id` (all rows with an empty/missing
+ *   intent id share one fallback run);
+ * - when the keys span more than one run, runs are ordered by their first
+ *   message id and labelled "Run 1", "Run 2", …; a single run is labelled
+ *   "Swarm run";
+ * - inside a run, rounds sort ascending with the unknown round last, senders
+ *   sort alphabetically (unknown last), and messages sort by id;
+ * - `peerCount` is the number of distinct senders in the run minus one;
+ * - repeated findings were already marked by {@link parseSwarmMessages}.
  */
-export function groupSwarmMessages(
+export function groupSwarmRuns(
   messages: readonly SwarmMessageView[],
-): SwarmWorkerGroup[] {
-  const workers = new Map<string, Map<number | null, SwarmMessageView[]>>();
+): SwarmRunGroup[] {
+  const byRun = new Map<string, SwarmMessageView[]>();
   for (const message of messages) {
-    const worker = message.from ?? "unknown";
-    let rounds = workers.get(worker);
-    if (rounds === undefined) {
-      rounds = new Map();
-      workers.set(worker, rounds);
-    }
-    const bucket = rounds.get(message.round);
+    const bucket = byRun.get(message.intentId);
     if (bucket === undefined) {
-      rounds.set(message.round, [message]);
+      byRun.set(message.intentId, [message]);
     } else {
       bucket.push(message);
     }
   }
 
-  const groups: SwarmWorkerGroup[] = [];
-  for (const [worker, roundMap] of workers) {
-    const roundGroups: SwarmRoundGroup[] = [];
-    for (const [round, bucket] of roundMap) {
-      const ordered = [...bucket].sort((a, b) => a.id - b.id);
-      roundGroups.push({
+  const runEntries = [...byRun.entries()].sort(
+    (a, b) => firstMessageId(a[1]) - firstMessageId(b[1]),
+  );
+  const multipleRuns = runEntries.length > 1;
+
+  return runEntries.map(([runId, runMessages], runIndex) => {
+    const ordered = [...runMessages].sort((a, b) => a.id - b.id);
+    const roundMap = new Map<
+      number | null,
+      Map<string, SwarmMessageView[]>
+    >();
+    for (const message of ordered) {
+      const sender = message.from ?? "unknown";
+      let senders = roundMap.get(message.round);
+      if (senders === undefined) {
+        senders = new Map();
+        roundMap.set(message.round, senders);
+      }
+      const bucket = senders.get(sender);
+      if (bucket === undefined) {
+        senders.set(sender, [message]);
+      } else {
+        bucket.push(message);
+      }
+    }
+
+    const rounds: SwarmRoundGroup[] = [];
+    for (const [round, senderMap] of roundMap) {
+      const senderGroups: SwarmSenderGroup[] = [];
+      for (const [sender, bucket] of senderMap) {
+        const senderMessages = [...bucket].sort((a, b) => a.id - b.id);
+        senderGroups.push({
+          sender,
+          messages: senderMessages,
+          counts: swarmMessageCounts(senderMessages),
+        });
+      }
+      senderGroups.sort((a, b) => compareSenders(a.sender, b.sender));
+      const all = senderGroups.flatMap((group) => group.messages);
+      rounds.push({
         round,
-        messages: ordered,
-        counts: swarmMessageCounts(ordered),
+        senders: senderGroups,
+        counts: swarmMessageCounts(all),
       });
     }
-    roundGroups.sort((a, b) => compareRounds(a.round, b.round));
-    const all = roundGroups.flatMap((group) => group.messages);
-    groups.push({
-      worker,
-      rounds: roundGroups,
-      counts: swarmMessageCounts(all),
-    });
-  }
-  groups.sort((a, b) => compareStrings(a.worker, b.worker));
-  return groups;
+    rounds.sort((a, b) => compareRounds(a.round, b.round));
+
+    const senders = [
+      ...new Set(ordered.map((message) => message.from ?? "unknown")),
+    ].sort(compareSenders);
+
+    return {
+      runId,
+      runShort: shortenId(runId),
+      label: multipleRuns ? `Run ${runIndex + 1}` : "Swarm run",
+      rounds,
+      senders,
+      peerCount: Math.max(0, senders.length - 1),
+      counts: swarmMessageCounts(ordered),
+    };
+  });
 }
 
 /**

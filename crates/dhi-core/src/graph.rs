@@ -8,7 +8,7 @@ use crate::{
     GuardDecision, GuardDecisionId, GuardVerdict, Intent, IntentId, IntentPlan, IntentState,
     NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus, SideQuestionRequest,
     SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task, TaskCapacity, TaskId,
-    TaskState, ToolCall, ToolCallId, Topology,
+    TaskInstruction, TaskState, ToolCall, ToolCallId, Topology,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -21,16 +21,18 @@ pub trait GraphStore: Send + Sync {
     /// Creates a task with its origin fact and one `task_created` activity.
     async fn create_task(&self, goal: String) -> anyhow::Result<Task>;
 
-    /// Like [`GraphStore::create_task`] with optional per-task role pins and
-    /// a creation-time topology. `None` keeps the task on the role's default
-    /// chain or leaves topology to the planner; a present pin must reference
-    /// an existing `llm_profiles` row (the caller validates).
+    /// Like [`GraphStore::create_task`] with optional per-task role pins, a
+    /// creation-time topology, and an optional swarm worker count. `None`
+    /// keeps the task on the role's default chain, leaves topology to the
+    /// planner, or leaves the swarm size to the planner. A present pin must
+    /// reference an existing `llm_profiles` row (the caller validates).
     async fn create_task_with_pins(
         &self,
         goal: String,
         planner_pin: Option<i64>,
         worker_pin: Option<i64>,
         topology: Option<Topology>,
+        swarm_workers: Option<usize>,
     ) -> anyhow::Result<Task>;
 
     async fn get_task(&self, id: TaskId) -> anyhow::Result<Option<Task>>;
@@ -244,6 +246,50 @@ pub trait GraphStore: Send + Sync {
         task_id: TaskId,
         kind: Option<&str>,
     ) -> anyhow::Result<Vec<Activity>>;
+
+    /// Adds one planner-only instruction to `task_id`.
+    ///
+    /// The default implementation is for test stores that never exercise
+    /// instructions; a real store persists the row.
+    async fn add_instruction(
+        &self,
+        _task_id: TaskId,
+        _text: String,
+    ) -> anyhow::Result<TaskInstruction> {
+        Err(anyhow::anyhow!(
+            "this store does not support task instructions"
+        ))
+    }
+
+    /// Every instruction of `task_id`, oldest first (newest last).
+    async fn list_instructions(&self, _task_id: TaskId) -> anyhow::Result<Vec<TaskInstruction>> {
+        Ok(Vec::new())
+    }
+
+    /// Marks every pending instruction of `task_id` delivered at `now`.
+    /// Returns how many rows changed.
+    async fn mark_instructions_delivered(&self, _task_id: TaskId) -> anyhow::Result<usize> {
+        Ok(0)
+    }
+
+    /// Marks only `instruction_ids` of `task_id` delivered at `now`.
+    ///
+    /// The engine calls this with the exact rows it put in the planner input,
+    /// so an instruction added while the planner call runs stays pending. A
+    /// store that cannot scope the write falls back to the task-wide method.
+    async fn mark_instructions_delivered_ids(
+        &self,
+        task_id: TaskId,
+        _instruction_ids: &[Uuid],
+    ) -> anyhow::Result<usize> {
+        self.mark_instructions_delivered(task_id).await
+    }
+
+    /// Short alias for [`GraphStore::mark_instructions_delivered`], matching
+    /// the store contract's name.
+    async fn mark_delivered(&self, task_id: TaskId) -> anyhow::Result<usize> {
+        self.mark_instructions_delivered(task_id).await
+    }
 
     /// Upserts one `agent_runs` row: one per real completion call.
     ///
