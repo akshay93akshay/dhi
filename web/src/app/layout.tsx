@@ -40,7 +40,7 @@ export default function RootLayout({
           dangerouslySetInnerHTML={{ __html: preferencesBootstrapScript }}
         />
       </head>
-      <body>
+      <body className="type-body">
         <PreferencesProvider>
           <AppShell>{children}</AppShell>
         </PreferencesProvider>

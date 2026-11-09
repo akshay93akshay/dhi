@@ -170,7 +170,7 @@ function ToolValueBlock(props: { label: string; text: string }) {
   return (
     <div className="min-w-0">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+        <span className="text-[12px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
           {label}
         </span>
         <CopyButton text={text} label={lower} size="icon" />
@@ -197,7 +197,7 @@ function ToolIoCell(props: { io: FeedToolIo }) {
   return (
     <div className="mt-2 rounded-lg border border-border bg-surface-subtle px-3 py-2">
       <div className="flex items-center justify-between gap-2">
-        <span className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+        <span className="text-[12px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
           Tool call
         </span>
         <CopyButton
@@ -244,7 +244,7 @@ function ActivityEntry(props: { activity: Activity }) {
       </div>
       <div className="row spread">
         <MarkdownMath
-          className="feed-msg min-w-0 flex-1 text-[13.5px] leading-5 [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1 [&_.katex-display]:my-1"
+          className="feed-msg min-w-0 flex-1 text-[15px] leading-[1.55] [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1 [&_.katex-display]:my-1"
           text={message}
           variant="block"
         />
@@ -309,7 +309,7 @@ function TeamRunPanel(props: { run: TeamRun }) {
           <Badge variant="accent" className="font-mono">
             {run.topology}
           </Badge>
-          <span className="text-[11.5px] text-muted-foreground">
+          <span className="text-[13px] leading-5 text-muted-foreground">
             {run.workerCount} worker{run.workerCount === 1 ? "" : "s"}
           </span>
         </div>
@@ -336,7 +336,7 @@ function TeamRunPanel(props: { run: TeamRun }) {
           {run.workers.map((worker, index) => (
             <li
               key={`${worker.key}:${index}`}
-              className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border bg-card px-2.5 py-1.5 text-[11.5px]"
+              className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-border bg-card px-3 py-2 text-[13px] leading-5"
             >
               <span className="mono font-medium" title={worker.key}>
                 {worker.key}
@@ -356,7 +356,7 @@ function TeamRunPanel(props: { run: TeamRun }) {
           ))}
         </ul>
       ) : (
-        <p className="mt-2 text-[11px] text-muted-foreground">
+        <p className="mt-2 text-[13px] leading-5 text-muted-foreground">
           Worker details were not recorded for this run.
         </p>
       )}
@@ -374,7 +374,7 @@ export function LiveActivityFeed(props: {
     <Card>
       <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
         <div>
-          <CardTitle className="text-base">Activity</CardTitle>
+          <CardTitle className="text-[18px]">Activity</CardTitle>
           <CardDescription className="mt-0.5">
             Live event log — newest last, last ten shown.
           </CardDescription>
@@ -426,7 +426,7 @@ export function RecentActivityFeed(props: {
     <Card>
       <CardHeader className="flex-row flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
         <div>
-          <CardTitle className="text-base">Recent activity</CardTitle>
+          <CardTitle className="text-[18px]">Recent activity</CardTitle>
           <CardDescription className="mt-0.5">
             Latest events — newest last.
           </CardDescription>
@@ -449,7 +449,7 @@ export function RecentActivityFeed(props: {
 
         <ActivityList rows={rows} max={FEED_RECENT_COUNT} />
 
-        <p className="mt-3 text-xs">
+        <p className="mt-3 text-[13px] leading-5">
           <Link
             href={`/tasks/${props.taskId}/work`}
             className="inline-flex items-center gap-1 text-muted-foreground hover:text-foreground"

@@ -22,14 +22,14 @@ export function Crumbs({
   return (
     <nav
       aria-label="Breadcrumb"
-      className="mb-4 flex flex-wrap items-center gap-1.5 text-[12px] text-muted-foreground"
+      className="mb-4 flex flex-wrap items-center gap-1.5 type-meta text-muted-foreground"
     >
       <Link
         href="/"
         className="inline-flex items-center gap-1 rounded px-1 py-0.5 transition-colors hover:bg-secondary hover:text-foreground"
         aria-label="Overview"
       >
-        <Home className="h-3 w-3" />
+        <Home className="h-3.5 w-3.5" />
       </Link>
       {trail.map((segment, index) => {
         const isLast = index === trail.length - 1;
@@ -38,7 +38,7 @@ export function Crumbs({
             className="inline-flex items-center gap-1.5"
             key={`${segment.label}-${index}`}
           >
-            <ChevronRight className="h-3 w-3 text-border" aria-hidden="true" />
+            <ChevronRight className="h-3.5 w-3.5 text-border" aria-hidden="true" />
             {isLast || segment.href === undefined ? (
               <span
                 className={isLast ? "font-medium text-foreground" : undefined}

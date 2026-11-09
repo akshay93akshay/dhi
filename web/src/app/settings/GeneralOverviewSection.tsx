@@ -48,18 +48,18 @@ export function GeneralOverviewSection(props: {
             <span className="flex h-6 w-6 items-center justify-center rounded-md bg-secondary text-muted-foreground">
               <Globe2 className="h-3.5 w-3.5" />
             </span>
-            <span className="text-[10.5px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+            <span className="type-label font-semibold uppercase tracking-[0.12em] text-muted-foreground">
               Web providers
             </span>
           </div>
-          <div className="mt-2 text-[13px] font-medium">
+          <div className="mt-2 type-meta font-medium">
             {providersError !== null
               ? "Unavailable"
               : ready === null || total === null
                 ? "Loading…"
                 : `${ready} of ${total} ready`}
           </div>
-          <div className="mt-0.5 text-[11.5px] text-muted-foreground">
+          <div className="mt-0.5 type-meta text-muted-foreground">
             Search, read, and research routing.
           </div>
         </div>
@@ -81,14 +81,14 @@ function RoleOverview(props: {
         <span className="flex h-6 w-6 items-center justify-center rounded-md bg-secondary text-muted-foreground">
           {icon}
         </span>
-        <span className="text-[10.5px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+        <span className="type-label font-semibold uppercase tracking-[0.12em] text-muted-foreground">
           {label}
         </span>
       </div>
-      <div className="mt-2 truncate text-[13px] font-medium">
+      <div className="mt-2 truncate type-meta font-medium">
         {loading ? "Loading…" : profile?.name ?? "Not set"}
       </div>
-      <div className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground">
+      <div className="mt-0.5 truncate type-mono text-muted-foreground">
         {loading ? "—" : profile?.model ?? "No profile selected"}
       </div>
     </div>

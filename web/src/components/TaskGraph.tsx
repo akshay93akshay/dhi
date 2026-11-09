@@ -49,10 +49,12 @@ import {
   type TaskGraphFlowNodeData,
 } from "@/lib/taskGraphFlow";
 import type { TaskWork } from "@/lib/types";
+import { plainPreview } from "@/lib/preview";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
+import { MarkdownMath } from "@/components/markdown-math";
 import { StateBadge, stateVariant } from "@/components/ui/state-badge";
 
 const KIND_ORDER: readonly TaskGraphNodeKind[] = [
@@ -101,7 +103,7 @@ function stateColor(state: string): string {
  * One card shape for all five kinds. React Flow registers this component under
  * every kind name, so the node `type` still identifies the work record.
  *
- * The label is clamped to the fixed card height; the inspector beside the
+ * The label is clamped to the fixed card height; the inspector below the
  * graph always shows the complete text.
  */
 function TaskGraphNodeCard({ data, selected }: NodeProps<TaskGraphFlowNode>) {
@@ -109,6 +111,9 @@ function TaskGraphNodeCard({ data, selected }: NodeProps<TaskGraphFlowNode>) {
   const Icon = KIND_ICONS[node.kind];
   const color = KIND_COLORS[node.kind];
   const active = selected || node.selected;
+  // Cards show a compact plain-text preview; the inspector renders the full
+  // Markdown/LaTeX source.
+  const preview = plainPreview(node.label);
 
   return (
     <>
@@ -138,7 +143,7 @@ function TaskGraphNodeCard({ data, selected }: NodeProps<TaskGraphFlowNode>) {
       />
       <div
         className={cn(
-          "flex h-full w-full flex-col overflow-hidden rounded-xl border bg-card px-3 py-2.5 shadow-sm transition-shadow",
+          "flex h-full w-full flex-col overflow-hidden rounded-xl border bg-card px-3.5 py-3 shadow-sm transition-shadow",
           active
             ? "border-accent-foreground/60 ring-2 ring-accent-foreground/25"
             : "border-border",
@@ -147,32 +152,32 @@ function TaskGraphNodeCard({ data, selected }: NodeProps<TaskGraphFlowNode>) {
       >
         <span className="flex min-w-0 items-center gap-1.5">
           <Icon
-            className="h-3 w-3 shrink-0"
+            className="h-3.5 w-3.5 shrink-0"
             style={{ color }}
             aria-hidden="true"
           />
           <span
-            className="min-w-0 flex-1 text-[11px] font-bold uppercase tracking-[0.13em]"
+            className="min-w-0 flex-1 text-[12px] font-bold uppercase tracking-[0.13em]"
             style={{ color }}
           >
             {node.kindLabel}
           </span>
           {node.proves ? (
             <span
-              className="flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full bg-success text-success-foreground shadow-sm"
+              className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-success text-success-foreground shadow-sm"
               aria-label="proves"
             >
-              <Check className="h-2 w-2" strokeWidth={3} aria-hidden="true" />
+              <Check className="h-2.5 w-2.5" strokeWidth={3} aria-hidden="true" />
             </span>
           ) : null}
         </span>
         <span
-          className="mt-1.5 line-clamp-3 min-h-0 flex-1 break-words text-[15px] font-medium leading-[21px] text-foreground [overflow-wrap:anywhere]"
-          title={node.label}
+          className="mt-1.5 line-clamp-3 min-h-0 flex-1 break-words text-[15px] font-medium leading-[1.55] text-foreground [overflow-wrap:anywhere]"
+          title={preview}
         >
-          {node.label}
+          {preview}
         </span>
-        <span className="mt-2 flex min-w-0 items-start gap-1.5 text-[11px] leading-[16px] text-muted-foreground">
+        <span className="mt-2 flex min-w-0 items-start gap-1.5 text-[12px] leading-[1.4] text-muted-foreground">
           <span
             className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full"
             style={{ background: stateColor(node.state) }}
@@ -241,7 +246,7 @@ const EDGE_TYPES: EdgeTypes = {
 function InspectorSection(props: { title: string; children: ReactNode }) {
   return (
     <section>
-      <h3 className="text-[10px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+      <h3 className="text-[12px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
         {props.title}
       </h3>
       {props.children}
@@ -275,9 +280,9 @@ function TaskGraphInspector(props: {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <div className="flex items-start gap-2 border-b border-border px-3 py-2.5">
+      <div className="flex items-start gap-2.5 border-b border-border px-4 py-3">
         <span
-          className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-border"
+          className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-border"
           style={{
             background: `color-mix(in srgb, ${color} 12%, transparent)`,
           }}
@@ -286,13 +291,13 @@ function TaskGraphInspector(props: {
         </span>
         <div className="min-w-0 flex-1">
           <p
-            className="text-[10px] font-bold uppercase tracking-[0.13em]"
+            className="text-[12px] font-bold uppercase tracking-[0.13em]"
             style={{ color }}
           >
             {TASK_GRAPH_KIND_LABELS[data.kind]}
           </p>
           <p
-            className="mono truncate text-[10.5px] text-muted-foreground"
+            className="mono truncate text-[12.5px] text-muted-foreground"
             title={data.nodeId}
           >
             {data.entityId}
@@ -310,7 +315,7 @@ function TaskGraphInspector(props: {
         </Button>
       </div>
 
-      <div className="min-h-0 flex-1 space-y-3 overflow-y-auto px-3 py-3">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto px-4 py-4">
         <div className="flex flex-wrap items-center gap-2">
           <StateBadge state={data.state} />
           {data.proves ? (
@@ -322,19 +327,20 @@ function TaskGraphInspector(props: {
         </div>
 
         <InspectorSection title={heading}>
-          <p className="mt-1 whitespace-pre-wrap break-words text-[13px] leading-5 text-foreground [overflow-wrap:anywhere]">
-            {fullLabel}
-          </p>
+          <MarkdownMath
+            className="mt-1 text-[15px] leading-[1.55] text-foreground [&_p+p]:mt-2 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_.katex-display]:my-1"
+            text={fullLabel}
+          />
           <CopyButton
-            className="-ml-2 mt-1 h-7"
+            className="-ml-2 mt-1 h-7 text-[12px]"
             label="Copy label"
             text={fullLabel}
           />
         </InspectorSection>
 
         <InspectorSection title="ID">
-          <div className="mt-1 flex items-start gap-1 rounded-lg border border-border bg-surface-subtle px-2.5 py-2">
-            <code className="mono min-w-0 flex-1 break-all text-[11.5px] leading-4 text-foreground">
+          <div className="mt-1 flex items-start gap-1 rounded-lg border border-border bg-surface-subtle px-3 py-2.5">
+            <code className="mono min-w-0 flex-1 break-all text-[12.5px] leading-[1.5] text-foreground">
               {data.entityId}
             </code>
             <CopyButton
@@ -343,7 +349,7 @@ function TaskGraphInspector(props: {
               text={data.entityId}
             />
           </div>
-          <p className="mt-1 break-all text-[10.5px] text-muted-foreground">
+          <p className="mt-1 break-all text-[12px] leading-[1.45] text-muted-foreground">
             node <span className="mono">{data.nodeId}</span>
           </p>
         </InspectorSection>
@@ -358,8 +364,8 @@ function TaskGraphInspector(props: {
  * Five fixed columns read left to right: origin, goal, intent, fact, result.
  * Positions come from `layoutTaskGraph`; React Flow adds pan, zoom, fit,
  * minimap, controls, and click selection without ever auto-shuffling cards.
- * Clicking a node opens the full-text inspector beside the graph (below it on
- * narrow screens).
+ * Clicking a node opens the full-text inspector below the graph, so the
+ * drawing always keeps the full content width.
  */
 export function TaskGraph({ work }: { work: TaskWork | null }) {
   const model = useMemo(
@@ -411,14 +417,14 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
 
   if (empty) {
     return (
-      <div className="flex h-full min-h-[520px] flex-col items-center justify-center rounded-xl border border-dashed border-border bg-surface-subtle px-6 py-12 text-center">
+      <div className="flex h-full min-h-[560px] flex-col items-center justify-center rounded-xl border border-dashed border-border bg-surface-subtle px-6 py-12 text-center">
         <span className="flex h-11 w-11 items-center justify-center rounded-full border border-border bg-card text-muted-foreground">
           <GitBranch className="h-5 w-5" />
         </span>
-        <h3 className="mt-3 text-sm font-semibold text-foreground">
+        <h3 className="mt-3 text-[18px] font-semibold text-foreground">
           No work nodes yet
         </h3>
-        <p className="mt-1 max-w-md text-xs leading-5 text-muted-foreground">
+        <p className="mt-1 max-w-md text-[13px] leading-5 text-muted-foreground">
           This task has no goals, intents, facts, or results. Its graph will
           appear here as the planner and workers record work.
         </p>
@@ -428,8 +434,8 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
   }
 
   return (
-    <div className="flex flex-col gap-3 lg:h-full lg:flex-row">
-      <div className="flex h-[520px] min-w-0 flex-col overflow-hidden rounded-xl border border-border bg-card lg:h-full lg:flex-1">
+    <div className="flex flex-col gap-3">
+      <div className="flex h-[560px] min-w-0 flex-col overflow-hidden rounded-xl border border-border bg-card sm:h-[620px] lg:h-[calc(100svh-260px)] lg:min-h-[600px] lg:max-h-[900px]">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-border px-3 py-2">
           <div
             className="flex flex-wrap items-center gap-x-3 gap-y-1"
@@ -438,7 +444,7 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
             {KIND_ORDER.map((kind) => (
               <span
                 key={kind}
-                className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground"
+                className="inline-flex items-center gap-1 text-[12px] font-medium text-muted-foreground"
               >
                 <span
                   className="h-1.5 w-1.5 rounded-full"
@@ -448,7 +454,7 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
                 {TASK_GRAPH_KIND_LABELS[kind]}
               </span>
             ))}
-            <span className="inline-flex items-center gap-1 text-[11px] font-medium text-muted-foreground">
+            <span className="inline-flex items-center gap-1 text-[12px] font-medium text-muted-foreground">
               <span className="flex h-3 w-3 items-center justify-center rounded-full bg-success text-success-foreground">
                 <Check className="h-2 w-2" strokeWidth={3} aria-hidden="true" />
               </span>
@@ -475,9 +481,10 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
             edgesReconnectable={false}
             elementsSelectable
             fitView
-            fitViewOptions={{ padding: 0.15, maxZoom: 1.15 }}
-            maxZoom={2}
-            minZoom={0.2}
+            // The 0.9 floor keeps the 15px card text at 13.5px or larger.
+            fitViewOptions={{ padding: 0.06, minZoom: 0.9, maxZoom: 1.1 }}
+            maxZoom={1.1}
+            minZoom={0.9}
             nodes={flow.nodes}
             nodesConnectable={false}
             nodesDraggable={false}
@@ -504,8 +511,8 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
       <aside
         aria-label="Node inspector"
         className={cn(
-          "w-full shrink-0 flex-col overflow-hidden rounded-xl border border-border bg-card lg:flex lg:h-full lg:w-[320px]",
-          flow.selected === null ? "hidden" : "flex",
+          "w-full shrink-0 flex-col overflow-hidden rounded-xl border border-border bg-card",
+          flow.selected === null ? "hidden" : "flex h-[340px]",
         )}
       >
         {flow.selected === null ? (
@@ -513,10 +520,10 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
             <span className="flex h-10 w-10 items-center justify-center rounded-full border border-border bg-surface-subtle text-muted-foreground">
               <MousePointerClick className="h-4 w-4" />
             </span>
-            <p className="mt-2 text-xs font-semibold text-foreground">
+            <p className="mt-2 text-[15px] font-semibold leading-[1.55] text-foreground">
               Select a node
             </p>
-            <p className="mt-1 max-w-[220px] text-[11px] leading-4 text-muted-foreground">
+            <p className="mt-1 max-w-[240px] text-[13px] leading-5 text-muted-foreground">
               Click any card to inspect its full label, state, and ids.
             </p>
           </div>

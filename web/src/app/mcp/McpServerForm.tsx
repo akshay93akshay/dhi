@@ -183,7 +183,7 @@ export function McpServerFormDialog({
 
         <form className="space-y-4" onSubmit={(event) => void handleSubmit(event)}>
           {isEdit && target.summary === undefined ? (
-            <div className="rounded-md border border-warning/30 bg-warning/8 px-3 py-2 text-sm text-warning">
+            <div className="rounded-md border border-warning/30 bg-warning/8 px-3 py-2 type-body text-warning">
               The masked config summary for this server is missing from the
               list response. Re-enter its transport, target, and timeout.
             </div>
@@ -200,7 +200,7 @@ export function McpServerFormDialog({
                 autoComplete="off"
               />
               {isEdit ? (
-                <p className="text-xs text-muted-foreground">
+                <p className="type-meta text-muted-foreground">
                   Rename by deleting and adding a new server.
                 </p>
               ) : null}
@@ -247,9 +247,9 @@ export function McpServerFormDialog({
                   value={form.args}
                   onChange={(event) => update("args", event.target.value)}
                   placeholder={"-y\n@modelcontextprotocol/server-github"}
-                  className="font-mono text-xs"
+                  className="type-mono"
                 />
-                <p className="text-xs text-muted-foreground">
+                <p className="type-meta text-muted-foreground">
                   One argument per line preserves spaces inside an argument.
                   {isEdit
                     ? " The list summary joins the stored command line with spaces, so re-enter complex arguments here."
@@ -263,7 +263,7 @@ export function McpServerFormDialog({
                   value={form.env}
                   onChange={(event) => update("env", event.target.value)}
                   placeholder="GITHUB_TOKEN=…"
-                  className="font-mono text-xs"
+                  className="type-mono"
                 />
               </div>
             </div>
@@ -288,14 +288,14 @@ export function McpServerFormDialog({
                   value={form.headers}
                   onChange={(event) => update("headers", event.target.value)}
                   placeholder="Authorization=Bearer …"
-                  className="font-mono text-xs"
+                  className="type-mono"
                 />
-                <p className="text-xs text-muted-foreground">
+                <p className="type-meta text-muted-foreground">
                   Header values are write-only; the server returns only masked
                   summaries and this page never renders stored values.
                 </p>
                 {existingHeaderNames.length > 0 ? (
-                  <p className="text-xs text-muted-foreground">
+                  <p className="type-meta text-muted-foreground">
                     Currently configured header names:{" "}
                     <span className="font-mono">
                       {existingHeaderNames.join(", ")}
@@ -304,7 +304,7 @@ export function McpServerFormDialog({
                   </p>
                 ) : null}
               </div>
-              <label className="flex cursor-pointer items-center gap-2 text-sm">
+              <label className="flex cursor-pointer items-center gap-2 type-body">
                 <Checkbox
                   checked={form.insecure}
                   onCheckedChange={(checked) =>
@@ -330,11 +330,11 @@ export function McpServerFormDialog({
                 }
                 placeholder="60"
               />
-              <p className="text-xs text-muted-foreground">
+              <p className="type-meta text-muted-foreground">
                 Blank uses the server default (60 s).
               </p>
             </div>
-            <label className="flex cursor-pointer items-center gap-2 self-start pt-6 text-sm">
+            <label className="flex cursor-pointer items-center gap-2 self-start pt-6 type-body">
               <Checkbox
                 checked={form.enabled}
                 onCheckedChange={(checked) =>
@@ -348,7 +348,7 @@ export function McpServerFormDialog({
           {error !== null ? (
             <div
               role="alert"
-              className="rounded-md border border-destructive/30 bg-destructive/8 px-3 py-2 text-sm text-destructive"
+              className="rounded-md border border-destructive/30 bg-destructive/8 px-3 py-2 type-body text-destructive"
             >
               {error}
             </div>

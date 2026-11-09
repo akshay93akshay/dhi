@@ -92,9 +92,9 @@
   align-items: center;
   gap: 6px;
   color: var(--sidebar-foreground);
-  font-size: 10.5px;
+  font-size: var(--type-label, 12px);
   font-weight: 500;
-  line-height: 1;
+  line-height: 1.4;
 }
 
 .statusCompact {

@@ -41,7 +41,7 @@ function SheetContent({
         data-slot="sheet-content"
         data-side={side}
         className={cn(
-          "fixed inset-y-0 z-50 flex w-[min(86vw,20rem)] flex-col border-border bg-sidebar text-sidebar-foreground shadow-2xl outline-none",
+          "fixed inset-y-0 z-50 flex w-[min(86vw,20rem)] flex-col border-border bg-sidebar type-body text-sidebar-foreground shadow-2xl outline-none",
           side === "left"
             ? "left-0 border-r data-[state=open]:animate-[sheet-in-left_180ms_ease-out]"
             : "right-0 border-l data-[state=open]:animate-[sheet-in-right_180ms_ease-out]",
@@ -76,7 +76,7 @@ function SheetTitle({
   return (
     <DialogPrimitive.Title
       data-slot="sheet-title"
-      className={cn("text-base font-semibold", className)}
+      className={cn("type-section font-semibold", className)}
       {...props}
     />
   );
@@ -89,7 +89,7 @@ function SheetDescription({
   return (
     <DialogPrimitive.Description
       data-slot="sheet-description"
-      className={cn("text-sm text-sidebar-muted", className)}
+      className={cn("type-meta text-sidebar-muted", className)}
       {...props}
     />
   );

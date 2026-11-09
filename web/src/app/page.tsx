@@ -90,7 +90,7 @@ export default function Home() {
         />
         <h1
           id="start-heading"
-          className="mt-5 text-[32px] font-medium tracking-[-0.03em] text-foreground sm:text-[40px]"
+          className="mt-5 type-page font-medium tracking-[-0.03em] text-foreground"
         >
           What should DHI<sup>+</sup> work on?
         </h1>
@@ -193,7 +193,7 @@ function CreateTaskCard(props: {
             <Plus className="h-4 w-4" />
           </span>
           <div>
-            <CardTitle className="text-base">Launch a task</CardTitle>
+            <CardTitle>Launch a task</CardTitle>
             <CardDescription className="mt-0.5">
               One goal, one exploration, one origin fact.
             </CardDescription>
@@ -207,7 +207,7 @@ function CreateTaskCard(props: {
         >
           <div className="space-y-1.5">
             <label
-              className="text-xs font-semibold text-foreground"
+              className="type-label font-semibold text-foreground"
               htmlFor="create-goal"
             >
               Goal
@@ -231,19 +231,19 @@ function CreateTaskCard(props: {
           </div>
 
           {profiles === null && profilesError === null ? (
-            <p className="text-[11.5px] text-muted-foreground">
+            <p className="type-meta text-muted-foreground">
               Loading profiles…
             </p>
           ) : null}
 
           {profilesError !== null ? (
-            <p className="rounded-md border border-warning/30 bg-warning/8 px-2.5 py-1.5 text-[11.5px] leading-4 text-warning">
+            <p className="rounded-md border border-warning/30 bg-warning/8 px-2.5 py-1.5 type-meta text-warning">
               Could not load profiles ({profilesError}). Pins unavailable.
             </p>
           ) : null}
 
           {profiles !== null && profiles.length === 0 ? (
-            <p className="rounded-md border border-border bg-surface-subtle px-2.5 py-1.5 text-[11.5px] leading-4 text-muted-foreground">
+            <p className="rounded-md border border-border bg-surface-subtle px-2.5 py-1.5 type-meta text-muted-foreground">
               No profiles seeded yet — the task uses the role pool defaults.
               Seed profiles via Settings to enable pins.
             </p>
@@ -253,14 +253,14 @@ function CreateTaskCard(props: {
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1.5">
                 <label
-                  className="text-xs font-semibold text-foreground"
+                  className="type-label font-semibold text-foreground"
                   htmlFor="create-planner-pin"
                 >
                   Planner profile
                 </label>
                 <select
                   id="create-planner-pin"
-                  className="h-9 rounded-md border-input bg-card text-[13px]"
+                  className="rounded-md border-input bg-card type-body"
                   value={plannerPin}
                   onFocus={() => reportActivity("focus-planner")}
                   onBlur={() => reportActivity("idle")}
@@ -276,14 +276,14 @@ function CreateTaskCard(props: {
               </div>
               <div className="space-y-1.5">
                 <label
-                  className="text-xs font-semibold text-foreground"
+                  className="type-label font-semibold text-foreground"
                   htmlFor="create-worker-pin"
                 >
                   Worker profile
                 </label>
                 <select
                   id="create-worker-pin"
-                  className="h-9 rounded-md border-input bg-card text-[13px]"
+                  className="rounded-md border-input bg-card type-body"
                   value={workerPin}
                   onFocus={() => reportActivity("focus-worker")}
                   onBlur={() => reportActivity("idle")}
@@ -302,14 +302,14 @@ function CreateTaskCard(props: {
 
           <div className="space-y-1.5">
             <label
-              className="text-xs font-semibold text-foreground"
+              className="type-label font-semibold text-foreground"
               htmlFor="create-topology"
             >
               Topology
             </label>
             <select
               id="create-topology"
-              className="h-9 w-full rounded-md border-input bg-card text-[13px]"
+              className="w-full rounded-md border-input bg-card type-body"
               value={topology}
               onChange={(event) => {
                 setTopology(event.target.value);
@@ -324,7 +324,7 @@ function CreateTaskCard(props: {
                 </option>
               ))}
             </select>
-            <p className="text-[11px] leading-4 text-muted-foreground">
+            <p className="type-meta text-muted-foreground">
               Unset lets the planner choose the topology per intent.
             </p>
           </div>
@@ -332,14 +332,14 @@ function CreateTaskCard(props: {
           {parseTopology(topology) === "swarm" ? (
             <div className="space-y-1.5">
               <label
-                className="text-xs font-semibold text-foreground"
+                className="type-label font-semibold text-foreground"
                 htmlFor="create-swarm-workers"
               >
                 Workers
               </label>
               <select
                 id="create-swarm-workers"
-                className="h-9 w-full rounded-md border-input bg-card text-[13px]"
+                className="w-full rounded-md border-input bg-card type-body"
                 value={swarmWorkers}
                 onChange={(event) => {
                   setSwarmWorkers(event.target.value);
@@ -354,7 +354,7 @@ function CreateTaskCard(props: {
                   </option>
                 ))}
               </select>
-              <p className="text-[11px] leading-4 text-muted-foreground">
+              <p className="type-meta text-muted-foreground">
                 Auto lets the planner size the swarm; 2–8 pins the worker
                 count.
               </p>
@@ -363,7 +363,7 @@ function CreateTaskCard(props: {
 
           {formError !== null ? (
             <div
-              className="rounded-md border border-destructive/30 bg-destructive/8 px-3 py-2 text-xs leading-5 text-destructive"
+              className="rounded-md border border-destructive/30 bg-destructive/8 px-3 py-2 type-meta text-destructive"
               role="alert"
             >
               {formError}
@@ -380,7 +380,7 @@ function CreateTaskCard(props: {
               {submitting ? "Creating…" : "Create task"}
             </Button>
           </div>
-          <p className="text-center text-[11px] leading-4 text-muted-foreground">
+          <p className="text-center type-meta text-muted-foreground">
             Tasks run immediately. Every tool call still passes the guard.
           </p>
         </form>

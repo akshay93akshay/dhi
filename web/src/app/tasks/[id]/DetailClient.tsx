@@ -65,7 +65,7 @@ type DetailData = {
 
 const COLUMN_CLASS = "mx-auto w-full max-w-[1160px] px-1 pb-16";
 const TITLE_CLASS =
-  "whitespace-pre-wrap break-words text-[28px] font-medium leading-[1.2] tracking-[-0.025em] text-foreground sm:text-[30px]";
+  "whitespace-pre-wrap break-words text-[28px] font-medium leading-[1.2] tracking-[-0.025em] text-foreground";
 
 const DISCLOSURE_SUMMARY =
   "flex cursor-pointer select-none list-none items-center gap-1.5 text-[13px] text-muted-foreground transition-colors hover:text-foreground [&::-webkit-details-marker]:hidden";
@@ -95,13 +95,13 @@ function GoalBlock(props: { text: string }) {
     <section aria-labelledby="task-goal-label">
       <h2
         id="task-goal-label"
-        className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground"
+        className="text-[12px] font-semibold uppercase tracking-[0.16em] text-muted-foreground"
       >
         Goal
       </h2>
       <MarkdownMath
         text={props.text}
-        className="mt-1.5 max-w-[80ch] text-[15.5px] leading-[1.7] text-foreground"
+        className="mt-1.5 max-w-[80ch] text-[15px] leading-[1.55] text-foreground"
       />
     </section>
   );
@@ -221,12 +221,12 @@ function TaskDetail() {
         <BrandMasthead state="error" activity="idle" />
         <div className="mt-10">
           <h1 className={TITLE_CLASS}>Task not found</h1>
-          <p className="mt-3 max-w-[52ch] text-sm leading-6 text-muted-foreground">
+          <p className="mt-3 max-w-[52ch] text-[15px] leading-[1.55] text-muted-foreground">
             The id may have been created against a different database or
             removed.
           </p>
-          <p className="mt-2 text-sm text-muted-foreground">
-            No task with id <code className="font-mono">{id}</code> exists.
+          <p className="mt-2 text-[15px] leading-[1.55] text-muted-foreground">
+            No task with id <code className="font-mono text-[12.5px]">{id}</code> exists.
           </p>
           <Button asChild variant="outline" className="mt-6">
             <Link href="/">
@@ -245,7 +245,7 @@ function TaskDetail() {
         <div className="mt-10">
           <h1 className={TITLE_CLASS}>Could not load task</h1>
           <p
-            className="mt-3 border-l-2 border-destructive pl-3 text-sm leading-6 text-destructive"
+            className="mt-3 border-l-2 border-destructive pl-3 text-[15px] leading-[1.55] text-destructive"
             role="alert"
           >
             {pageError}
@@ -348,7 +348,7 @@ function TaskDetail() {
         <h1 className="sr-only">Task detail</h1>
         <GoalBlock text={task.goal} />
         <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-1.5 text-[13px] text-muted-foreground">
-          <span className="font-mono text-[12px]">
+          <span className="font-mono text-[12.5px]">
             Task #{shortenId(task.id)}
           </span>
           <span aria-hidden="true">·</span>
@@ -427,7 +427,7 @@ function TaskDetail() {
           <ChevronRight className={DISCLOSURE_CHEVRON} />
         </summary>
         <div className="mt-4 [&_[data-slot=card]]:rounded-none [&_[data-slot=card]]:border-0 [&_[data-slot=card]]:bg-transparent [&_[data-slot=card]]:shadow-none [&_[data-slot=card-header]]:hidden [&_[data-slot=card-content]]:p-0">
-          <p className="mb-3 text-[11px] text-muted-foreground">
+          <p className="mb-3 text-[13px] leading-5 text-muted-foreground">
             Latest events — newest last.
           </p>
           <RecentActivityFeed
@@ -442,7 +442,7 @@ function TaskDetail() {
         <section aria-labelledby="add-goal-heading" className="mt-10">
           <h2
             id="add-goal-heading"
-            className="text-[15px] font-semibold tracking-tight text-foreground"
+            className="text-[18px] font-semibold tracking-tight text-foreground"
           >
             Add a goal
           </h2>
@@ -489,7 +489,7 @@ function TaskDetail() {
               <Button type="submit" size="sm" disabled={goalPending}>
                 {goalPending ? "Adding…" : "Add goal and reopen"}
               </Button>
-              <span className="text-[11px] tabular-nums text-muted-foreground">
+              <span className="text-[12px] tabular-nums text-muted-foreground">
                 {goalDescription.trim().length}/{ADD_GOAL_MAX_CHARS}
               </span>
             </div>
@@ -503,39 +503,39 @@ function TaskDetail() {
           <ChevronRight className={DISCLOSURE_CHEVRON} />
         </summary>
         <dl className="mt-4 grid grid-cols-[minmax(96px,140px)_minmax(0,1fr)] gap-x-6 gap-y-2.5">
-          <dt className="text-xs leading-5 text-muted-foreground">Task id</dt>
+          <dt className="text-[13px] leading-5 text-muted-foreground">Task id</dt>
           <dd className="m-0 flex min-w-0 items-center gap-1">
-            <span className="truncate font-mono text-[12px]" title={task.id}>
+            <span className="truncate font-mono text-[12.5px]" title={task.id}>
               {task.id}
             </span>
             <CopyButton text={task.id} label="task id" size="icon" />
           </dd>
 
-          <dt className="text-xs leading-5 text-muted-foreground">
+          <dt className="text-[13px] leading-5 text-muted-foreground">
             Exploration
           </dt>
           <dd className="m-0 min-w-0">
             <span
-              className="truncate font-mono text-[12px]"
+              className="truncate font-mono text-[12.5px]"
               title={task.exploration_id}
             >
               {shortenId(task.exploration_id)}
             </span>
           </dd>
 
-          <dt className="text-xs leading-5 text-muted-foreground">
+          <dt className="text-[13px] leading-5 text-muted-foreground">
             Origin fact
           </dt>
           <dd className="m-0 min-w-0">
             <span
-              className="truncate font-mono text-[12px]"
+              className="truncate font-mono text-[12.5px]"
               title={task.origin_fact_id}
             >
               {shortenId(task.origin_fact_id)}
             </span>
           </dd>
 
-          <dt className="text-xs leading-5 text-muted-foreground">
+          <dt className="text-[13px] leading-5 text-muted-foreground">
             Planner pin
           </dt>
           <dd className="m-0">
@@ -544,13 +544,13 @@ function TaskDetail() {
                 <Pin className="h-3 w-3" /> #{task.pinned_planner_profile_id}
               </Badge>
             ) : (
-              <span className="text-xs text-muted-foreground">
+              <span className="text-[13px] text-muted-foreground">
                 pool default
               </span>
             )}
           </dd>
 
-          <dt className="text-xs leading-5 text-muted-foreground">
+          <dt className="text-[13px] leading-5 text-muted-foreground">
             Worker pin
           </dt>
           <dd className="m-0">
@@ -559,35 +559,35 @@ function TaskDetail() {
                 <Pin className="h-3 w-3" /> #{task.pinned_worker_profile_id}
               </Badge>
             ) : (
-              <span className="text-xs text-muted-foreground">
+              <span className="text-[13px] text-muted-foreground">
                 pool default
               </span>
             )}
           </dd>
 
-          <dt className="text-xs leading-5 text-muted-foreground">Topology</dt>
-          <dd className="m-0 text-xs leading-5 text-muted-foreground">
+          <dt className="text-[13px] leading-5 text-muted-foreground">Topology</dt>
+          <dd className="m-0 text-[13px] leading-5 text-muted-foreground">
             {topologyName ?? "Planner decides"}
           </dd>
 
           {workersLabel !== null ? (
             <>
-              <dt className="text-xs leading-5 text-muted-foreground">
+              <dt className="text-[13px] leading-5 text-muted-foreground">
                 Workers
               </dt>
-              <dd className="m-0 text-xs leading-5 text-muted-foreground">
+              <dd className="m-0 text-[13px] leading-5 text-muted-foreground">
                 {workersLabel}
               </dd>
             </>
           ) : null}
 
-          <dt className="text-xs leading-5 text-muted-foreground">Created</dt>
-          <dd className="m-0 text-xs leading-5 text-muted-foreground">
+          <dt className="text-[13px] leading-5 text-muted-foreground">Created</dt>
+          <dd className="m-0 text-[13px] leading-5 text-muted-foreground">
             {formatLocalTimestamp(task.created_at)}
           </dd>
 
-          <dt className="text-xs leading-5 text-muted-foreground">Updated</dt>
-          <dd className="m-0 text-xs leading-5 text-muted-foreground">
+          <dt className="text-[13px] leading-5 text-muted-foreground">Updated</dt>
+          <dd className="m-0 text-[13px] leading-5 text-muted-foreground">
             {formatLocalTimestamp(task.updated_at)}
           </dd>
         </dl>
@@ -643,10 +643,10 @@ function ThinkingTranscript(props: { runs: AgentRun[] }) {
             key={run.id}
             className="border-b border-border/70 py-4 last:border-0"
           >
-            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground">
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] leading-5 text-muted-foreground">
               <span className="font-medium text-foreground">{run.role}</span>
               <span aria-hidden="true">·</span>
-              <span className="font-mono">{run.model}</span>
+              <span className="font-mono text-[12.5px]">{run.model}</span>
               <span aria-hidden="true">·</span>
               <span>{formatLocalTimestamp(run.created_at)}</span>
               <span aria-hidden="true">·</span>
@@ -654,7 +654,7 @@ function ThinkingTranscript(props: { runs: AgentRun[] }) {
                 {run.reasoning_tokens} reasoning tokens
               </span>
             </div>
-            <pre className="mt-3 max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-[10px] bg-surface-subtle px-4 py-3 font-mono text-[12px] leading-6 text-foreground [overflow-wrap:anywhere]">
+            <pre className="mt-3 max-h-[420px] overflow-auto whitespace-pre-wrap break-words rounded-[10px] bg-surface-subtle px-4 py-3 font-mono text-[12.5px] leading-[1.6] text-foreground [overflow-wrap:anywhere]">
               {run.thinking}
             </pre>
           </article>
@@ -673,13 +673,13 @@ function UsageCard(props: { runs: AgentRun[]; runsError: string | null }) {
 
   return (
     <section aria-label="Completion calls">
-      <p className="text-[11px] leading-5 text-muted-foreground">
+      <p className="text-[13px] leading-5 text-muted-foreground">
         Persisted agent runs with tokens, cache, cost, and latency.
       </p>
 
       {runsError !== null ? (
         <p
-          className="mt-3 border-l-2 border-destructive pl-3 text-xs text-destructive"
+          className="mt-3 border-l-2 border-destructive pl-3 text-[13px] leading-5 text-destructive"
           role="alert"
         >
           Could not load usage: {runsError}
@@ -687,7 +687,7 @@ function UsageCard(props: { runs: AgentRun[]; runsError: string | null }) {
       ) : null}
 
       {runsError === null && runs.length === 0 ? (
-        <p className="mt-3 text-sm text-muted-foreground">
+        <p className="mt-3 text-[15px] leading-[1.55] text-muted-foreground">
           No completion calls yet. Rows appear once the planner or a worker
           calls the LLM.
         </p>
@@ -695,9 +695,9 @@ function UsageCard(props: { runs: AgentRun[]; runsError: string | null }) {
 
       {runs.length > 0 ? (
         <div className="mt-4 overflow-x-auto">
-          <table className="w-full whitespace-nowrap text-sm">
+          <table className="w-full whitespace-nowrap text-[14px]">
             <thead>
-              <tr className="border-y border-border text-left text-[10px] uppercase tracking-[0.08em] text-muted-foreground">
+              <tr className="border-y border-border text-left text-[12px] uppercase tracking-[0.08em] text-muted-foreground">
                 <th className="px-4 py-2.5 font-semibold">Call</th>
                 <th className="px-3 py-2.5 font-semibold">Role</th>
                 <th className="px-3 py-2.5 font-semibold">Status</th>
@@ -725,40 +725,40 @@ function UsageCard(props: { runs: AgentRun[]; runsError: string | null }) {
                   className="border-b border-border/70 last:border-0"
                 >
                   <td className="px-4 py-3">
-                    <span className="font-mono text-xs">
+                    <span className="font-mono text-[12.5px]">
                       {run.call_index}/{shortenId(run.run_id)}
                     </span>
                   </td>
-                  <td className="px-3 py-3 text-xs">{run.role}</td>
+                  <td className="px-3 py-3 text-[13px]">{run.role}</td>
                   <td className="px-3 py-3">
                     <StateBadge state={run.status} />
                   </td>
-                  <td className="px-3 py-3 font-mono text-[11px]">
+                  <td className="px-3 py-3 font-mono text-[12.5px]">
                     {run.model}
                   </td>
-                  <td className="px-3 py-3 text-right font-mono text-[11px] tabular-nums">
+                  <td className="px-3 py-3 text-right font-mono text-[12.5px] tabular-nums">
                     {run.tokens_in}
                   </td>
-                  <td className="px-3 py-3 text-right font-mono text-[11px] tabular-nums">
+                  <td className="px-3 py-3 text-right font-mono text-[12.5px] tabular-nums">
                     {run.tokens_out}
                   </td>
-                  <td className="px-3 py-3 text-right font-mono text-[11px] tabular-nums">
+                  <td className="px-3 py-3 text-right font-mono text-[12.5px] tabular-nums">
                     {run.cache_read_tokens}/{run.cache_write_tokens}
                   </td>
-                  <td className="px-3 py-3 text-right font-mono text-[11px] tabular-nums">
+                  <td className="px-3 py-3 text-right font-mono text-[12.5px] tabular-nums">
                     {run.reasoning_tokens}
                   </td>
-                  <td className="px-3 py-3 text-right font-mono text-[11px] tabular-nums">
+                  <td className="px-3 py-3 text-right font-mono text-[12.5px] tabular-nums">
                     {run.cost.toFixed(4)}
                   </td>
-                  <td className="px-3 py-3 text-right text-[11px] text-muted-foreground">
+                  <td className="px-3 py-3 text-right text-[13px] text-muted-foreground">
                     {run.latency_ms} ms
                   </td>
-                  <td className="px-3 py-3 text-[11px] text-muted-foreground">
+                  <td className="px-3 py-3 text-[13px] text-muted-foreground">
                     {formatLocalTimestamp(run.created_at)}
                   </td>
                   <td
-                    className="max-w-[14rem] truncate px-4 py-3 text-[11px] text-muted-foreground"
+                    className="max-w-[14rem] truncate px-4 py-3 text-[13px] text-muted-foreground"
                     title={run.error ?? undefined}
                   >
                     {run.error ?? ""}
@@ -788,27 +788,27 @@ function CompletionResponses(props: { runs: AgentRun[] }) {
   }
   return (
     <div className="mt-6">
-      <h3 className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+      <h3 className="text-[12px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
         Responses
       </h3>
       <div className="mt-1 divide-y divide-border/70 border-y border-border/70">
         {responses.map((run) => (
           <details key={run.id} className="group py-2">
             <summary className={DISCLOSURE_SUMMARY}>
-              <span className="font-mono text-[11px]">
+              <span className="font-mono text-[12.5px]">
                 {run.call_index}/{shortenId(run.run_id)}
               </span>
               <span aria-hidden="true">·</span>
               <span>{run.role}</span>
               <span aria-hidden="true">·</span>
-              <span className="font-mono text-[11px]">{run.model}</span>
+              <span className="font-mono text-[12.5px]">{run.model}</span>
               <span aria-hidden="true">·</span>
               <span>{formatLocalTimestamp(run.created_at)}</span>
               <ChevronRight className={DISCLOSURE_CHEVRON} />
             </summary>
             <MarkdownMath
               text={run.response ?? ""}
-              className="mt-3 max-w-[80ch] text-[13.5px] leading-6"
+              className="mt-3 max-w-[80ch] text-[15px] leading-[1.55]"
             />
           </details>
         ))}

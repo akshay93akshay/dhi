@@ -292,7 +292,7 @@ export function SettingsClient() {
                         }
                       : undefined
                   }
-                  className="inline-flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 text-[12.5px] font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground lg:w-full"
+                  className="inline-flex shrink-0 items-center gap-2 rounded-lg px-3 py-2 type-label font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground lg:w-full"
                 >
                   <Icon className="h-3.5 w-3.5" />
                   {group.label}

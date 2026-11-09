@@ -22,6 +22,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { MarkdownMath } from "@/components/markdown-math";
 
 /**
  * Planner instruction panel for the work view.
@@ -137,7 +138,7 @@ export function InstructionsCard(props: {
             <MessageSquareText className="h-4 w-4" />
           </span>
           <div>
-            <CardTitle className="text-base">Instructions</CardTitle>
+            <CardTitle className="text-[18px]">Instructions</CardTitle>
             <CardDescription className="mt-0.5">
               Planner-only notes; workers never see them.
             </CardDescription>
@@ -151,7 +152,7 @@ export function InstructionsCard(props: {
       </CardHeader>
       <CardContent className="space-y-3 pt-4">
         <div>
-          <h3 className="text-[11px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+          <h3 className="text-[12px] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
             Instruction history
           </h3>
 
@@ -166,7 +167,7 @@ export function InstructionsCard(props: {
           ) : null}
 
           {instructions !== null && instructions.length === 0 ? (
-            <p className="mt-2 rounded-lg border border-dashed border-border bg-surface-subtle px-3 py-2.5 text-xs text-muted-foreground">
+            <p className="mt-2 rounded-lg border border-dashed border-border bg-surface-subtle px-3 py-3 text-[13px] leading-5 text-muted-foreground">
               No instructions yet.
             </p>
           ) : null}
@@ -177,13 +178,14 @@ export function InstructionsCard(props: {
                 const status = instructionStatus(instruction);
                 return (
                   <li
-                    className="rounded-md border border-border bg-surface-subtle px-3 py-2"
+                    className="rounded-md border border-border bg-surface-subtle px-3.5 py-2.5"
                     key={instruction.id}
                   >
-                    <p className="whitespace-pre-wrap break-words text-[12.5px] leading-5 text-foreground">
-                      {instruction.text}
-                    </p>
-                    <p className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px] text-muted-foreground">
+                    <MarkdownMath
+                      className="text-[15px] leading-[1.55] text-foreground [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_.katex-display]:my-1"
+                      text={instruction.text}
+                    />
+                    <p className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] leading-5 text-muted-foreground">
                       <Badge
                         className="font-normal"
                         variant={status === "delivered" ? "success" : "outline"}
@@ -215,7 +217,7 @@ export function InstructionsCard(props: {
           <div className="flex flex-wrap items-center gap-2">
             <Input
               id="instruction-text"
-              className="h-8 min-w-0 flex-1 text-[13px]"
+              className="h-9 min-w-0 flex-1 text-[15px]"
               value={text}
               placeholder="Tell the planner what to do next…"
               onChange={(event) => {
@@ -227,7 +229,7 @@ export function InstructionsCard(props: {
               disabled={sending || !accepts}
             />
             <Button
-              className="h-8 rounded-full"
+              className="h-9 rounded-full"
               disabled={sending || !accepts}
               size="sm"
               type="submit"
@@ -237,12 +239,12 @@ export function InstructionsCard(props: {
             </Button>
           </div>
           {!accepts ? (
-            <p className="mt-1.5 text-[11px] leading-4 text-muted-foreground">
+            <p className="mt-1.5 text-[12px] leading-[1.45] text-muted-foreground">
               This task is terminal, so instructions are disabled.
             </p>
           ) : sendError !== null ? (
             <p
-              className="mt-1.5 text-[11px] leading-4 text-destructive"
+              className="mt-1.5 text-[12px] leading-[1.45] text-destructive"
               role="alert"
             >
               {sendError}

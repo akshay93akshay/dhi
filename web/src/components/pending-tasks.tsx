@@ -6,6 +6,7 @@ import { ArrowRight } from "lucide-react";
 
 import { listTasks, stopTasks } from "@/lib/api";
 import type { StopTasksResponse, Task, TaskState } from "@/lib/types";
+import { plainPreview } from "@/lib/preview";
 import { describeApiError, shortenId } from "@/lib/ui";
 import { formatLocalTimestamp } from "@/lib/localTime";
 import { Button } from "@/components/ui/button";
@@ -247,17 +248,17 @@ export function PendingTasks() {
         <div className="flex items-baseline gap-2">
           <h2
             id="pending-tasks-heading"
-            className="text-sm font-semibold tracking-[-0.01em] text-foreground"
+            className="type-section font-semibold tracking-[-0.01em] text-foreground"
           >
             Pending tasks
           </h2>
-          <span className="text-xs tabular-nums text-muted-foreground">
+          <span className="type-meta tabular-nums text-muted-foreground">
             {tasks === null ? "—" : pending.length}
           </span>
         </div>
         <Link
           href="/tasks"
-          className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+          className="inline-flex items-center gap-1 type-meta font-medium text-muted-foreground transition-colors hover:text-foreground"
         >
           View all tasks <span aria-hidden="true">→</span>
         </Link>
@@ -265,12 +266,12 @@ export function PendingTasks() {
 
       {tasks === null ? (
         loadError === null ? (
-          <p className="mt-3 text-[12px] text-muted-foreground">
+          <p className="mt-3 type-meta text-muted-foreground">
             Loading pending tasks…
           </p>
         ) : (
           <div className="mt-3 flex flex-wrap items-center gap-3">
-            <p className="break-words text-[11.5px] leading-5 text-destructive">
+            <p className="break-words type-meta text-destructive">
               Could not load pending tasks: {loadError}
             </p>
             <Button
@@ -292,14 +293,14 @@ export function PendingTasks() {
               onRetry={() => void load()}
             />
           ) : null}
-          <p className="mt-3 text-[13px] leading-5 text-muted-foreground">
+          <p className="mt-3 type-meta text-muted-foreground">
             No pending tasks. Start one above.
           </p>
         </>
       ) : (
         <>
           <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2">
-            <label className="inline-flex cursor-pointer items-center gap-2 text-xs font-medium text-foreground">
+            <label className="inline-flex cursor-pointer items-center gap-2 type-table font-medium text-foreground">
               <Checkbox
                 checked={
                   allSelected ? true : someSelected ? "indeterminate" : false
@@ -320,14 +321,14 @@ export function PendingTasks() {
             >
               {stopping ? "Stopping…" : "Stop selected"}
             </Button>
-            <p className="w-full text-[11px] leading-4 text-muted-foreground sm:w-auto">
+            <p className="w-full type-meta text-muted-foreground sm:w-auto">
               Select tasks to stop them. The task records stay.
             </p>
           </div>
 
           {stopError !== null ? (
             <p
-              className="mt-2 break-words text-[11px] leading-4 text-destructive"
+              className="mt-2 break-words type-meta text-destructive"
               role="alert"
             >
               Could not stop tasks: {stopError}
@@ -344,14 +345,15 @@ export function PendingTasks() {
           <ul className="mt-2 divide-y divide-border/80 border-t border-border/80">
             {visible.map((task) => {
               const rowBlocked = blocked.find((item) => item.id === task.id);
+              const goalPreview = plainPreview(task.goal);
               return (
-                <li key={task.id} className="py-2.5">
+                <li key={task.id} className="py-3">
                   <div className="flex items-start gap-2.5">
                     <Checkbox
-                      className="mt-0.5"
+                      className="mt-1"
                       checked={selected.has(task.id)}
                       disabled={stopping}
-                      aria-label={`Select task ${shortenId(task.id)}: ${task.goal}`}
+                      aria-label={`Select task ${shortenId(task.id)}: ${goalPreview}`}
                       onCheckedChange={(checked) =>
                         toggleSelected(task.id, checked === true)
                       }
@@ -360,13 +362,13 @@ export function PendingTasks() {
                       <StateBadge state={task.state} className="shrink-0" />
                       <Link
                         href={`/tasks/${task.id}`}
-                        title={task.goal}
-                        className="order-last w-full truncate text-[13px] font-medium leading-5 text-foreground hover:underline sm:order-none sm:w-auto sm:flex-1"
+                        title={goalPreview}
+                        className="order-last w-full truncate type-table font-medium text-foreground hover:underline sm:order-none sm:w-auto sm:flex-1"
                       >
-                        {task.goal}
+                        {goalPreview}
                       </Link>
                       <span
-                        className="ml-auto shrink-0 text-[10.5px] tabular-nums text-muted-foreground sm:ml-0"
+                        className="ml-auto shrink-0 type-meta tabular-nums text-muted-foreground sm:ml-0"
                         title={`Created ${formatLocalTimestamp(task.created_at)}`}
                       >
                         {ageLabel(task.created_at, nowMs)}
@@ -374,14 +376,14 @@ export function PendingTasks() {
                       <Link
                         href={`/tasks/${task.id}`}
                         aria-label={`Open task ${shortenId(task.id)}`}
-                        className="inline-flex shrink-0 items-center gap-1 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+                        className="inline-flex shrink-0 items-center gap-1 type-label font-medium text-muted-foreground transition-colors hover:text-foreground"
                       >
-                        Open <ArrowRight className="h-3 w-3" />
+                        Open <ArrowRight className="h-3.5 w-3.5" />
                       </Link>
                     </div>
                   </div>
                   {rowBlocked !== undefined ? (
-                    <p className="ml-6 mt-1 break-words text-[11px] leading-4 text-destructive">
+                    <p className="ml-6 mt-1 break-words type-meta text-destructive">
                       {rowBlocked.state}: {rowBlocked.error}
                     </p>
                   ) : null}
@@ -395,7 +397,7 @@ export function PendingTasks() {
               {hiddenBlocked.map((item) => (
                 <p
                   key={item.id}
-                  className="break-words text-[11px] leading-4 text-destructive"
+                  className="break-words type-meta text-destructive"
                 >
                   Task {shortenId(item.id)} ({item.state}): {item.error}
                 </p>
@@ -442,7 +444,7 @@ function RefreshWarning(props: {
   onRetry: () => void;
 }) {
   return (
-    <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] leading-4 text-warning">
+    <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 type-meta text-warning">
       <span className="break-words">
         Could not refresh pending tasks: {props.message}
       </span>

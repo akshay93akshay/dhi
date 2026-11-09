@@ -92,7 +92,7 @@ export function CapacityCard(props: {
               <Gauge className="h-4 w-4" />
             </span>
             <div>
-              <CardTitle className="text-base">Capacity</CardTitle>
+              <CardTitle>Capacity</CardTitle>
               <CardDescription className="mt-0.5">
                 Current: {capacitySummary(task.capacity)}
               </CardDescription>
@@ -108,12 +108,12 @@ export function CapacityCard(props: {
           <div className="grid grid-cols-2 gap-2.5 lg:grid-cols-4">
             {CAPACITY_FIELDS.map((field) => (
               <label className="space-y-1.5" key={field.key}>
-                <span className="block text-[10.5px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+                <span className="block text-[12px] font-semibold uppercase tracking-[0.08em] text-muted-foreground">
                   {field.label}
                 </span>
                 <Input
                   aria-label={field.label}
-                  className="h-8 font-mono text-[12.5px]"
+                  className="h-9 font-mono text-[12.5px]"
                   disabled={pending}
                   inputMode="numeric"
                   min={1}
@@ -140,16 +140,16 @@ export function CapacityCard(props: {
             >
               {pending ? "Extending…" : "Extend capacity"}
             </Button>
-            <p className="text-[11px] text-muted-foreground">
+            <p className="text-[13px] leading-5 text-muted-foreground">
               Blank fields keep their stored limit.
             </p>
             {notice !== null ? (
-              <span className="text-[11.5px] font-medium text-success" role="status">
+              <span className="text-[13px] font-medium leading-5 text-success" role="status">
                 {notice}
               </span>
             ) : null}
             {error !== null ? (
-              <span className="text-[11.5px] font-medium text-destructive" role="alert">
+              <span className="text-[13px] font-medium leading-5 text-destructive" role="alert">
                 {error}
               </span>
             ) : null}

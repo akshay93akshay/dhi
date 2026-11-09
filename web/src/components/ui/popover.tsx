@@ -22,7 +22,7 @@ function PopoverContent({
         align={align}
         sideOffset={sideOffset}
         className={cn(
-          "z-50 flex w-72 flex-col gap-2.5 rounded-xl border border-border bg-popover p-2.5 text-sm text-popover-foreground shadow-lg outline-none",
+          "z-50 flex w-72 flex-col gap-2.5 rounded-xl border border-border bg-popover p-2.5 type-body text-popover-foreground shadow-lg outline-none",
           "data-[state=open]:animate-[popover-in_140ms_ease-out]",
           className,
         )}
@@ -36,7 +36,7 @@ function PopoverHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (
     <div
       data-slot="popover-header"
-      className={cn("flex flex-col gap-0.5 text-sm", className)}
+      className={cn("flex flex-col gap-0.5 type-body", className)}
       {...props}
     />
   );

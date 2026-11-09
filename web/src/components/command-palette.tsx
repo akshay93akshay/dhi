@@ -6,6 +6,7 @@ import { ArrowRight, CornerDownLeft, Search, Wrench } from "lucide-react";
 
 import { listTasks } from "@/lib/api";
 import type { Task } from "@/lib/types";
+import { plainPreview } from "@/lib/preview";
 import { describeApiError, shortenId } from "@/lib/ui";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -119,7 +120,7 @@ export function CommandPalette() {
       .map((task) => ({
         kind: "task",
         key: `task:${task.id}`,
-        label: task.goal,
+        label: plainPreview(task.goal),
         hint: `#${shortenId(task.id)}`,
         href: `/tasks/${task.id}`,
         state: task.state,
@@ -166,12 +167,12 @@ export function CommandPalette() {
       <button
         type="button"
         onClick={() => setOpen(true)}
-        className="group flex h-9 items-center gap-2 rounded-full border border-border bg-card px-3 text-xs text-muted-foreground shadow-none transition-colors hover:border-input hover:text-foreground sm:min-w-[190px]"
+        className="group flex h-9 items-center gap-2 rounded-full border border-border bg-card px-3 type-label text-muted-foreground shadow-none transition-colors hover:border-input hover:text-foreground sm:min-w-[190px]"
         aria-label="Search pages and tasks"
       >
         <Search className="h-3.5 w-3.5" />
         <span className="hidden sm:inline">Search…</span>
-        <kbd className="ml-auto hidden items-center gap-0.5 rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground sm:inline-flex">
+        <kbd className="ml-auto hidden items-center gap-0.5 rounded border border-border bg-muted px-1.5 py-0.5 type-mono text-muted-foreground sm:inline-flex">
           ⌘K
         </kbd>
       </button>
@@ -192,16 +193,16 @@ export function CommandPalette() {
               onKeyDown={onKeyDown}
               placeholder="Search pages and tasks…"
               aria-label="Search pages and tasks"
-              className="h-12 border-0 bg-transparent px-0 text-sm shadow-none focus-visible:ring-0"
+              className="h-12 border-0 bg-transparent px-0 type-body shadow-none focus-visible:ring-0"
             />
-            <kbd className="hidden rounded border border-border bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground sm:block">
+            <kbd className="hidden rounded border border-border bg-muted px-1.5 py-0.5 type-mono text-muted-foreground sm:block">
               ESC
             </kbd>
           </div>
 
           <div className="max-h-[min(60vh,26rem)] overflow-y-auto p-2">
             {results.length === 0 ? (
-              <div className="px-3 py-10 text-center text-sm text-muted-foreground">
+              <div className="px-3 py-10 text-center type-body text-muted-foreground">
                 Nothing matches “{query}”.
                 {taskError !== null ? ` Tasks unavailable: ${taskError}` : null}
               </div>
@@ -229,10 +230,10 @@ export function CommandPalette() {
                         )}
                       </span>
                       <span className="min-w-0 flex-1">
-                        <span className="block truncate text-sm font-medium">
+                        <span className="block truncate type-table font-medium">
                           {result.label}
                         </span>
-                        <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
+                        <span className="mt-0.5 block truncate type-meta text-muted-foreground">
                           {result.hint}
                         </span>
                       </span>
@@ -248,7 +249,7 @@ export function CommandPalette() {
             )}
           </div>
 
-          <div className="flex items-center justify-between gap-3 border-t border-border bg-surface-subtle px-4 py-2.5 text-[11px] text-muted-foreground">
+          <div className="flex items-center justify-between gap-3 border-t border-border bg-surface-subtle px-4 py-2.5 type-label text-muted-foreground">
             <span className="flex items-center gap-1.5">
               <CornerDownLeft className="h-3 w-3" /> open
               <span className="mx-1 text-border">·</span>

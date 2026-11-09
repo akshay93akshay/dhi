@@ -57,6 +57,34 @@
   --chart-5: #db2777;
 
   --radius: 0.875rem;
+
+  /* -------------------------------------------------------------------------
+   * Typography scale
+   *
+   * One shared set of steps. Use the `type-*` utilities below (or these
+   * variables directly) instead of ad-hoc pixel values. Nothing renders below
+   * 12px.
+   *
+   * page     28px   page title
+   * section  18px   section / card / dialog title
+   * body     15px   prose, form controls, dialog copy (line-height 1.55)
+   * table    14px   dense rows, buttons, key-value grids
+   * meta     13px   captions, descriptions, labels, timestamps
+   * label    12px   uppercase labels, compact controls
+   * badge    12px   badges and chips
+   * mono     12.5px monospace ids, code blocks
+   * min      12px   absolute floor
+   * ---------------------------------------------------------------------- */
+  --type-page: 28px;
+  --type-section: 18px;
+  --type-body: 15px;
+  --type-body-leading: 1.55;
+  --type-table: 14px;
+  --type-meta: 13px;
+  --type-label: 12px;
+  --type-badge: 12px;
+  --type-mono: 12.5px;
+  --type-min: 12px;
 }
 
 .dark {
@@ -183,6 +211,8 @@
     background: var(--background);
     color: var(--foreground);
     font-family: var(--font-sans);
+    font-size: var(--type-body);
+    line-height: var(--type-body-leading);
     font-feature-settings: "cv02", "cv03", "cv04", "ss01";
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
@@ -208,7 +238,7 @@
 
   p {
     color: var(--muted-foreground);
-    line-height: 1.65;
+    line-height: var(--type-body-leading);
   }
 
   a {
@@ -226,7 +256,8 @@
     border-radius: 5px;
     padding: 1px 5px;
     font-family: var(--font-mono);
-    font-size: 0.85em;
+    /* Scales with prose but never drops below the 12px floor. */
+    font-size: max(var(--type-min), 0.9em);
     color: var(--foreground);
   }
 
@@ -268,14 +299,14 @@
 
   main h2 {
     margin: 0 0 6px;
-    font-size: 16px;
+    font-size: var(--type-section);
     font-weight: 650;
-    line-height: 1.4;
+    line-height: 1.35;
   }
 
   main h3 {
     margin: 0 0 6px;
-    font-size: 14px;
+    font-size: var(--type-body);
     font-weight: 650;
     line-height: 1.4;
   }
@@ -315,12 +346,12 @@
 
 .subtle {
   color: var(--muted-foreground);
-  font-size: 13px;
+  font-size: var(--type-meta);
 }
 
 .section-title {
   display: block;
-  font-size: 11px;
+  font-size: var(--type-label);
   letter-spacing: 0.11em;
   text-transform: uppercase;
   color: var(--muted-foreground);
@@ -330,7 +361,7 @@
 
 .mono {
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: var(--type-mono);
   background: var(--muted);
   border: 1px solid var(--border);
   border-radius: 5px;
@@ -341,7 +372,7 @@
 
 .time {
   color: var(--muted-foreground);
-  font-size: 12px;
+  font-size: var(--type-meta);
   white-space: nowrap;
 }
 
@@ -352,17 +383,17 @@
 table.grid {
   width: 100%;
   border-collapse: collapse;
-  font-size: 13.5px;
+  font-size: var(--type-table);
 }
 
 table.grid th {
   text-align: left;
   color: var(--muted-foreground);
   font-weight: 600;
-  font-size: 11px;
+  font-size: var(--type-meta);
   letter-spacing: 0.07em;
   text-transform: uppercase;
-  padding: 9px 12px;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
 }
@@ -409,9 +440,9 @@ table.grid tbody tr.selected {
   border: 1px solid color-mix(in srgb, var(--badge-color) 30%, transparent);
   background: color-mix(in srgb, var(--badge-color) 10%, transparent);
   color: var(--badge-color);
-  font-size: 11px;
+  font-size: var(--type-badge);
   font-weight: 650;
-  line-height: 1.35;
+  line-height: 1.4;
   white-space: nowrap;
 }
 
@@ -480,7 +511,7 @@ table.grid tbody tr.selected {
   border: 1px solid var(--border);
   background: var(--muted);
   color: var(--muted-foreground);
-  font-size: 11px;
+  font-size: var(--type-badge);
   font-weight: 600;
   line-height: 1.5;
   white-space: nowrap;
@@ -510,7 +541,7 @@ table.grid tbody tr.selected {
   align-items: center;
   gap: 3px;
   color: var(--warning);
-  font-size: 12px;
+  font-size: var(--type-badge);
   font-weight: 600;
   white-space: nowrap;
 }
@@ -525,7 +556,7 @@ table.grid tbody tr.selected {
 
 .label {
   display: block;
-  font-size: 12px;
+  font-size: var(--type-meta);
   color: var(--foreground);
   font-weight: 600;
   margin-bottom: 6px;
@@ -539,8 +570,9 @@ select {
   color: var(--foreground);
   border: 1px solid var(--input);
   border-radius: 9px;
-  padding: 9px 11px;
-  font-size: 14px;
+  padding: 10px 12px;
+  font-size: var(--type-body);
+  line-height: 1.5;
   transition:
     border-color 120ms ease,
     box-shadow 120ms ease,
@@ -582,8 +614,8 @@ select:disabled {
   color: var(--foreground);
   border: 1px solid var(--input);
   border-radius: 9px;
-  padding: 7px 13px;
-  font-size: 13px;
+  padding: 8px 14px;
+  font-size: var(--type-table);
   font-weight: 600;
   line-height: 1.4;
   cursor: pointer;
@@ -622,8 +654,9 @@ select:disabled {
 }
 
 .button.small {
-  padding: 3px 9px;
-  font-size: 12px;
+  padding: 4px 10px;
+  font-size: var(--type-label);
+  line-height: 1.4;
   border-radius: 7px;
 }
 
@@ -661,7 +694,7 @@ select:disabled {
 
 .hint {
   color: var(--muted-foreground);
-  font-size: 12.5px;
+  font-size: var(--type-meta);
   line-height: 1.55;
   margin: 8px 0 0;
 }
@@ -673,7 +706,7 @@ select:disabled {
   border-radius: 10px;
   padding: 10px 13px;
   margin-top: 12px;
-  font-size: 13px;
+  font-size: var(--type-meta);
   line-height: 1.55;
 }
 
@@ -684,13 +717,13 @@ select:disabled {
   border-radius: 10px;
   padding: 10px 13px;
   margin-top: 12px;
-  font-size: 13px;
+  font-size: var(--type-meta);
   line-height: 1.55;
 }
 
 .empty {
   color: var(--muted-foreground);
-  font-size: 13px;
+  font-size: var(--type-meta);
   padding: 8px 0;
   line-height: 1.6;
 }
@@ -700,7 +733,7 @@ select:disabled {
   display: grid;
   grid-template-columns: minmax(130px, 180px) 1fr;
   gap: 9px 18px;
-  font-size: 13.5px;
+  font-size: var(--type-table);
   margin: 0;
 }
 
@@ -730,7 +763,7 @@ select:disabled {
   padding: 10px 12px;
   overflow: auto;
   font-family: var(--font-mono);
-  font-size: 11.5px;
+  font-size: var(--type-mono);
   color: var(--foreground);
   white-space: pre-wrap;
   margin: 8px 0 0;
@@ -849,7 +882,7 @@ select:disabled {
 
 .feed-actor {
   color: var(--muted-foreground);
-  font-size: 11px;
+  font-size: var(--type-meta);
 }
 
 .feed-actor::before {
@@ -859,7 +892,8 @@ select:disabled {
 .feed-msg {
   display: block;
   margin-top: 3px;
-  font-size: 13.5px;
+  font-size: var(--type-body);
+  line-height: var(--type-body-leading);
   color: var(--foreground);
   overflow-wrap: anywhere;
 }
@@ -872,7 +906,7 @@ select:disabled {
   cursor: pointer;
   width: max-content;
   color: var(--muted-foreground);
-  font-size: 12px;
+  font-size: var(--type-label);
 }
 
 .feed-cursor {
@@ -894,7 +928,7 @@ select:disabled {
   border-radius: 10px;
   padding: 10px 13px;
   margin-top: 12px;
-  font-size: 13px;
+  font-size: var(--type-meta);
   line-height: 1.55;
 }
 
@@ -937,14 +971,14 @@ select:disabled {
 
 .approval-tool {
   margin: 12px 0 0;
-  font-size: 15px;
+  font-size: var(--type-body);
   color: var(--foreground);
 }
 
 .approval-reason,
 .approval-task {
   margin: 6px 0 0;
-  font-size: 13px;
+  font-size: var(--type-meta);
 }
 
 .approval-input {
@@ -966,7 +1000,7 @@ select:disabled {
   align-items: center;
   gap: 8px;
   margin-top: 12px;
-  font-size: 13px;
+  font-size: var(--type-table);
   color: var(--foreground);
 }
 
@@ -1000,7 +1034,7 @@ select:disabled {
   border-radius: 0 10px 10px 0;
   padding: 10px 14px;
   margin-top: 14px;
-  font-size: 13px;
+  font-size: var(--type-meta);
   color: var(--foreground);
   line-height: 1.6;
 }
@@ -1070,7 +1104,7 @@ ol.chain li::before {
 .side-rules {
   margin: 4px 0 0;
   color: var(--muted-foreground);
-  font-size: 12px;
+  font-size: var(--type-label);
   font-weight: 500;
 }
 
@@ -1096,7 +1130,7 @@ ol.chain li::before {
 
 .side-question {
   color: var(--foreground);
-  font-size: 13.5px;
+  font-size: var(--type-table);
   font-weight: 500;
   margin-bottom: 6px;
   white-space: pre-wrap;
@@ -1108,7 +1142,7 @@ ol.chain li::before {
   border: 1px solid var(--border);
   border-radius: 9px;
   padding: 10px 12px;
-  font-size: 13.5px;
+  font-size: var(--type-table);
   color: var(--foreground);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
@@ -1139,10 +1173,66 @@ ol.chain li::before {
 
 .side-counter {
   color: var(--muted-foreground);
-  font-size: 11.5px;
+  font-size: var(--type-label);
 }
 
 } /* @layer components */
+
+/* ---------------------------------------------------------------------------
+ * Typography role classes
+ *
+ * Reusable classes for the shared scale above. Pair these with colour/weight
+ * utilities; they only set size (and the role's line-height). They live in the
+ * components layer so an explicit Tailwind text utility can still override.
+ * ------------------------------------------------------------------------- */
+
+@layer components {
+  .type-page {
+    font-size: var(--type-page);
+    line-height: 1.15;
+  }
+
+  .type-section {
+    font-size: var(--type-section);
+    line-height: 1.35;
+  }
+
+  .type-body {
+    font-size: var(--type-body);
+    line-height: var(--type-body-leading);
+  }
+
+  .type-table {
+    font-size: var(--type-table);
+    line-height: 1.45;
+  }
+
+  .type-meta {
+    font-size: var(--type-meta);
+    line-height: 1.5;
+  }
+
+  .type-label {
+    font-size: var(--type-label);
+    line-height: 1.4;
+  }
+
+  .type-badge {
+    font-size: var(--type-badge);
+    line-height: 1.4;
+  }
+
+  .type-mono {
+    font-family: var(--font-mono);
+    font-size: var(--type-mono);
+    line-height: 1.5;
+  }
+
+  .type-min {
+    font-size: var(--type-min);
+    line-height: 1.4;
+  }
+}
 
 @keyframes fade-in {
   from { opacity: 0; }
@@ -1279,6 +1369,11 @@ html[data-density="compact"] table.grid td {
 
 html[data-density="compact"] .feed-item {
   padding-bottom: 10px;
+}
+
+/* React Flow ships a 10px attribution; keep the app's 12px floor. */
+.react-flow .react-flow__attribution {
+  font-size: var(--type-label);
 }
 
 @keyframes popover-in {

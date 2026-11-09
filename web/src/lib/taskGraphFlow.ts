@@ -294,14 +294,14 @@ export function buildTaskGraphFlow(
       },
       labelStyle: {
         fill: TASK_GRAPH_FLOW_EDGE_LABEL_COLOR,
-        fontSize: 10,
+        fontSize: 12,
         fontWeight: 600,
       },
       labelBgStyle: {
         fill: TASK_GRAPH_FLOW_EDGE_LABEL_BG,
         fillOpacity: 0.92,
       },
-      labelBgPadding: [4, 2],
+      labelBgPadding: [5, 3],
       labelBgBorderRadius: 4,
       pathOptions: { offset: 20, borderRadius: 8 },
     };

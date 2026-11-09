@@ -16,6 +16,7 @@ import {
   formatApprovalAge,
   renderToolInput,
 } from "@/lib/approvals";
+import { plainPreview } from "@/lib/preview";
 import { describeApiError, shortenId } from "@/lib/ui";
 import { formatLocalTimestamp } from "@/lib/localTime";
 import { Badge } from "@/components/ui/badge";
@@ -376,7 +377,7 @@ export function ApprovalsClient() {
         <Card>
           <CardContent className="py-12 text-center">
             <RefreshCw className="mx-auto h-5 w-5 animate-spin text-muted-foreground" />
-            <p className="mt-3 text-sm text-muted-foreground">Loading approvals…</p>
+            <p className="mt-3 type-body text-muted-foreground">Loading approvals…</p>
           </CardContent>
         </Card>
       ) : null}
@@ -389,8 +390,8 @@ export function ApprovalsClient() {
                 <span className="flex h-12 w-12 items-center justify-center rounded-2xl bg-success/10 text-success">
                   <Inbox className="h-6 w-6" />
                 </span>
-                <h2 className="mt-4 text-base font-semibold">Nothing waiting on you</h2>
-                <p className="mt-1 max-w-md text-sm leading-6 text-muted-foreground">
+                <h2 className="mt-4 type-section font-semibold">Nothing waiting on you</h2>
+                <p className="mt-1 max-w-md type-body text-muted-foreground">
                   Guarded tool calls that need a decision will appear here and
                   refresh every {POLL_INTERVAL_MS / 1000}s while this tab is visible.
                 </p>
@@ -417,7 +418,7 @@ export function ApprovalsClient() {
           )}
 
           {!busy ? (
-            <p className="flex items-center gap-2 text-xs text-muted-foreground">
+            <p className="flex items-center gap-2 type-meta text-muted-foreground">
               <RefreshCw className="h-3 w-3" />
               Auto-refreshes every {POLL_INTERVAL_MS / 1000}s while this tab is visible.
             </p>
@@ -463,7 +464,7 @@ function ApprovalCard(props: {
           <span className="time">waiting {formatApprovalAge(item.created_at)}</span>
         </div>
 
-        <p className="mt-4 text-[15px] text-foreground">
+        <p className="mt-4 type-body text-foreground">
           A tool wants to run:{" "}
           {item.tool_name !== null ? (
             <strong className="font-semibold">{item.tool_name}</strong>
@@ -472,11 +473,11 @@ function ApprovalCard(props: {
           )}
         </p>
 
-        <p className="mt-1.5 text-[13px] leading-5 text-muted-foreground">
+        <p className="mt-1.5 type-meta text-muted-foreground">
           Asked because: {item.reason === "" ? "(no reason recorded)" : item.reason}
         </p>
 
-        <p className="mt-2 text-[13px]">
+        <p className="mt-2 type-meta">
           Task:{" "}
           <Link
             href={`/tasks/${item.task_id}`}
@@ -489,7 +490,7 @@ function ApprovalCard(props: {
         <div className="mt-4">
           <span className="section-title">Input</span>
           {inputView.kind === "missing" ? (
-            <p className="text-xs text-muted-foreground">
+            <p className="type-meta text-muted-foreground">
               <em>{inputView.note}</em>
             </p>
           ) : (
@@ -529,7 +530,7 @@ function ApprovalCard(props: {
               >
                 Cancel
               </Button>
-              <span className="text-[11px] text-muted-foreground">
+              <span className="type-meta text-muted-foreground">
                 The parked tool call will fail with “denied”.
               </span>
             </>
@@ -545,7 +546,7 @@ function ApprovalCard(props: {
               <X className="h-3.5 w-3.5" /> Deny
             </Button>
           )}
-          <span className="ml-auto text-[11px] text-muted-foreground">
+          <span className="ml-auto type-meta text-muted-foreground">
             expires {formatLocalTimestamp(item.expires_at)}
           </span>
         </div>
@@ -554,10 +555,15 @@ function ApprovalCard(props: {
   );
 }
 
-/** Goal excerpt with a deterministic fallback to the short task id. */
+/**
+ * Goal excerpt with a deterministic fallback to the short task id. Goals are
+ * Markdown/TeX source, so compact rows render the plain preview instead of
+ * leaking markup into the one-line label.
+ */
 function excerpt(goal: string | null, taskId: string): string {
-  if (goal === null || goal.trim() === "") {
+  const preview = goal === null ? "" : plainPreview(goal);
+  if (preview === "") {
     return `task ${shortenId(taskId)}`;
   }
-  return goal.length > 80 ? `${goal.slice(0, 80)}…` : goal;
+  return preview.length > 80 ? `${preview.slice(0, 80)}…` : preview;
 }

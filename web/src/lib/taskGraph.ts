@@ -400,10 +400,11 @@ export function selectVisibleTaskId(
 // Layout (five fixed columns, one horizontal band per goal branch)
 // ---------------------------------------------------------------------------
 
-/** Narrow enough for five readable columns on a task-scoped page. */
-export const TASK_GRAPH_NODE_WIDTH = 204;
-/** Fallback height until the DOM reports the card's real border box. */
-export const TASK_GRAPH_NODE_HEIGHT = 140;
+/** Five 200px columns fit the full-width graph stage at the fitted scale. */
+export const TASK_GRAPH_NODE_WIDTH = 200;
+/** Fixed card height keeps every lane and the minimap dimensions stable. */
+export const TASK_GRAPH_NODE_HEIGHT = 172;
+/** Compact gap keeps all five columns inside the viewport at fit scale. */
 export const TASK_GRAPH_COLUMN_GAP = 56;
 export const TASK_GRAPH_ROW_GAP = 16;
 export const TASK_GRAPH_ROW_BAND_GAP = 32;

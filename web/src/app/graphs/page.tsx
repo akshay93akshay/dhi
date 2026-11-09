@@ -18,10 +18,10 @@ export default function GraphsPage() {
 
   return (
     <main className="space-y-3">
-      <h1 className="text-[24px] font-semibold tracking-[-0.02em]">
+      <h1 className="type-page font-semibold tracking-[-0.02em]">
         Graphs moved to tasks
       </h1>
-      <p className="text-sm leading-6 text-muted-foreground">
+      <p className="type-body text-muted-foreground">
         Open a task to see its work graph. Redirecting to{" "}
         <Link
           href="/tasks"

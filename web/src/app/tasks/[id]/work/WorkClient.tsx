@@ -237,8 +237,8 @@ function TaskWorkView() {
         />
         <Card>
           <CardContent className="pt-5">
-            <p className="text-sm text-muted-foreground">
-              No task with id <code>{id}</code> exists, so there is no work
+            <p className="text-[15px] leading-[1.55] text-muted-foreground">
+              No task with id <code className="font-mono text-[12.5px]">{id}</code> exists, so there is no work
               graph to show.
             </p>
           </CardContent>
@@ -334,7 +334,7 @@ function TaskWorkView() {
                 : `auto-refresh ${POLL_INTERVAL_MS / 1000}s`}
             </Badge>
             {updatedAt !== null ? (
-              <span className="text-xs text-muted-foreground">
+              <span className="text-[13px] leading-5 text-muted-foreground">
                 updated {formatLocalTimestamp(updatedAt.toISOString())}
               </span>
             ) : null}
@@ -396,23 +396,24 @@ function TaskWorkView() {
             ) : (
               work.goals.map((goal) => (
                 <div
-                  className="rounded-lg border border-border bg-surface-subtle px-3.5 py-3"
+                  className="rounded-lg border border-border bg-surface-subtle px-4 py-3.5"
                   key={goal.id}
                 >
                   <div className="flex items-start justify-between gap-3">
-                    <strong className="text-[13.5px] font-medium leading-5">
-                      {goal.description}
-                    </strong>
+                    <MarkdownMath
+                      className="min-w-0 flex-1 text-[15px] font-medium leading-[1.55] [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5"
+                      text={goal.description}
+                    />
                     <StateBadge state={goal.state} />
                   </div>
                   {goal.proof_fact_id !== null ? (
-                    <p className="mt-2 flex items-center gap-1.5 text-[11px] text-success">
-                      <CheckCircle2 className="h-3 w-3" />
-                      Proved by fact{" "}
+                    <p className="mt-2 flex flex-wrap items-center gap-1.5 text-[13px] leading-5 text-success">
+                      <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                      <span>Proved by fact</span>
                       <span className="mono" title={goal.proof_fact_id}>
                         {shortenId(goal.proof_fact_id)}
                       </span>
-                      (highlighted below)
+                      <span>(highlighted below)</span>
                     </p>
                   ) : null}
                 </div>
@@ -430,16 +431,17 @@ function TaskWorkView() {
             ) : (
               work.intents.map((intent) => (
                 <div
-                  className="rounded-lg border border-border bg-surface-subtle px-3.5 py-3"
+                  className="rounded-lg border border-border bg-surface-subtle px-4 py-3.5"
                   key={intent.id}
                 >
                   <div className="flex items-start justify-between gap-3">
-                    <strong className="text-[13.5px] font-medium leading-5">
-                      {intent.description}
-                    </strong>
+                    <MarkdownMath
+                      className="min-w-0 flex-1 text-[15px] font-medium leading-[1.55] [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5"
+                      text={intent.description}
+                    />
                     <StateBadge state={intent.state} />
                   </div>
-                  <p className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <p className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[13px] leading-5 text-muted-foreground">
                     <span className="mono" title={intent.id}>
                       {shortenId(intent.id)}
                     </span>
@@ -509,7 +511,7 @@ function TaskWorkView() {
                     <div className="flex min-w-0 items-start gap-1">
                       <MarkdownMath
                         text={result.claim}
-                        className="min-w-0 flex-1 text-[13.5px] font-medium leading-5"
+                        className="min-w-0 flex-1 text-[15px] font-medium leading-[1.55] [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5"
                       />
                       <CopyButton
                         text={result.claim}
@@ -519,7 +521,7 @@ function TaskWorkView() {
                     </div>
                     <StateBadge state={result.acceptance} />
                   </div>
-                  <p className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
+                  <p className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[13px] leading-5 text-muted-foreground">
                     <span>intent</span>
                     <span className="mono" title={result.intent_id}>
                       {shortenId(result.intent_id)}
@@ -548,13 +550,13 @@ function GoalBlock(props: { text: string }) {
     <section aria-labelledby="task-goal-label">
       <h2
         id="task-goal-label"
-        className="text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground"
+        className="text-[12px] font-semibold uppercase tracking-[0.16em] text-muted-foreground"
       >
         Goal
       </h2>
       <MarkdownMath
         text={props.text}
-        className="mt-1.5 max-w-[80ch] text-[15.5px] leading-[1.7] text-foreground"
+        className="mt-1.5 max-w-[80ch] text-[15px] leading-[1.55] text-foreground"
       />
     </section>
   );
@@ -564,13 +566,13 @@ function GoalBlock(props: { text: string }) {
 function CapacityNoticeBar(props: { notice: CapacityPauseNotice }) {
   return (
     <div
-      className="flex items-start gap-2.5 rounded-lg border border-warning/40 bg-warning/10 px-3.5 py-2.5 text-[13px] leading-5 text-warning"
+      className="flex items-start gap-2.5 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-[13px] leading-5 text-warning"
       role="status"
     >
       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
       <div className="min-w-0">
         <p className="font-medium">{props.notice.text}</p>
-        <p className="mt-0.5 text-[11.5px] text-warning/85">
+        <p className="mt-1 text-[12px] leading-[1.45] text-warning/85">
           Extend the exhausted limit below to resume the task.
         </p>
       </div>
@@ -615,7 +617,7 @@ function WorkTabBar(props: {
           <button
             key={tab.id}
             aria-selected={selected}
-            className={`inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-[12.5px] font-medium transition-colors ${
+            className={`inline-flex h-8 items-center gap-1.5 rounded-full border px-3 text-[12px] font-medium transition-colors ${
               selected
                 ? "border-accent-foreground/30 bg-accent text-accent-foreground"
                 : "border-transparent text-muted-foreground hover:bg-surface-subtle hover:text-foreground"
@@ -645,7 +647,7 @@ function FactLine(props: { fact: Fact; proofOf?: string }) {
 
   return (
     <div
-      className={`rounded-lg border border-border px-3.5 py-3 ${
+      className={`rounded-lg border border-border px-4 py-3.5 ${
         proofOf !== undefined
           ? "border-accent-foreground/35 bg-accent/40"
           : "bg-surface-subtle"
@@ -655,19 +657,24 @@ function FactLine(props: { fact: Fact; proofOf?: string }) {
         <div className="flex min-w-0 flex-1 items-start gap-1">
           <MarkdownMath
             text={fact.claim}
-            className="min-w-0 flex-1 text-[13.5px] font-medium leading-5"
+            className="min-w-0 flex-1 text-[15px] font-medium leading-[1.55] [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5"
           />
           <CopyButton text={fact.claim} label="fact claim" size="icon" />
         </div>
         <StateBadge state={fact.state} />
       </div>
       {proofOf !== undefined ? (
-        <p className="mt-1.5 flex items-center gap-1 text-[11px] text-accent-foreground">
-          <CheckCircle2 className="h-3 w-3" /> proves goal “{proofOf}”
+        <p className="mt-1.5 flex items-start gap-1 text-[13px] leading-5 text-accent-foreground">
+          <CheckCircle2 className="mt-1 h-3.5 w-3.5 shrink-0" />
+          <span>
+            {`proves goal “`}
+            <MarkdownMath className="text-[13px] leading-5" text={proofOf} variant="inline" />
+            {`”`}
+          </span>
         </p>
       ) : null}
       {fact.origin_of !== null ? (
-        <p className="mt-1 text-[11px] text-muted-foreground">
+        <p className="mt-1 text-[13px] leading-5 text-muted-foreground">
           refines{" "}
           <span className="mono" title={fact.origin_of}>
             {shortenId(fact.origin_of)}
@@ -678,7 +685,7 @@ function FactLine(props: { fact: Fact; proofOf?: string }) {
         <pre className="pre">{provenance.lines.join("\n")}</pre>
       ) : (
         <div className="mt-1.5 flex flex-wrap items-start justify-between gap-2">
-          <p className="min-w-0 flex flex-wrap gap-x-2 gap-y-1 text-[11px] leading-4 text-muted-foreground">
+          <p className="min-w-0 flex flex-wrap gap-x-2 gap-y-1 text-[13px] leading-5 text-muted-foreground">
             {provenance.lines.map((line, index) => (
               <ProvenanceLine
                 key={index}
@@ -689,7 +696,7 @@ function FactLine(props: { fact: Fact; proofOf?: string }) {
           </p>
           {detailText !== null ? (
             <CopyButton
-              className="h-7 px-2 text-[11px]"
+              className="h-7 px-2 text-[12px]"
               text={detailText}
               label="Copy detail"
             />
@@ -730,16 +737,16 @@ function EvidenceBlock(props: { evidence: ResultRecord["evidence"] }) {
   }
   return (
     <details className="mt-2 rounded-md border border-border bg-card px-3 py-2">
-      <summary className="cursor-pointer text-[11px] font-medium text-muted-foreground">
+      <summary className="cursor-pointer text-[12px] font-semibold text-muted-foreground">
         Evidence
       </summary>
-      <dl className="mt-2 space-y-2 text-[11px]">
+      <dl className="mt-2 space-y-2 text-[13px] leading-5">
         {entries.map(([key, value]) => (
           <div key={key}>
             <dt className="font-semibold uppercase tracking-wide text-muted-foreground">
               {key}
             </dt>
-            <dd className="mt-0.5 break-words font-mono">
+            <dd className="mt-0.5 break-words font-mono text-[12.5px]">
               {typeof value === "string"
                 ? value
                 : JSON.stringify(value, null, 2)}
@@ -766,7 +773,7 @@ function SectionCard({
     <Card>
       <CardHeader className="border-b border-border pb-3">
         <div className="flex items-center justify-between gap-2">
-          <CardTitle className="text-base">{title}</CardTitle>
+          <CardTitle className="text-[18px]">{title}</CardTitle>
           {count !== undefined ? (
             <Badge variant="outline" className="font-mono font-normal">
               {count}
@@ -784,7 +791,7 @@ function SectionCard({
 
 function EmptyState({ message }: { message: string }) {
   return (
-    <div className="rounded-lg border border-dashed border-border bg-surface-subtle px-4 py-6 text-center text-xs text-muted-foreground">
+    <div className="rounded-lg border border-dashed border-border bg-surface-subtle px-4 py-7 text-center text-[13px] leading-5 text-muted-foreground">
       {message}
     </div>
   );

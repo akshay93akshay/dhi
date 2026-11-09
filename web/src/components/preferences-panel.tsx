@@ -41,7 +41,7 @@ function PreferenceSection({
 }) {
   return (
     <div className="space-y-1.5">
-      <div className="text-[11px] font-semibold text-foreground">{label}</div>
+      <div className="type-label font-semibold text-foreground">{label}</div>
       <ToggleGroup
         type="single"
         value={value}
@@ -93,7 +93,7 @@ export function PreferencesPanel() {
       >
         <PopoverHeader className="mb-1 space-y-1">
           <PopoverTitle>Preferences</PopoverTitle>
-          <PopoverDescription className="text-xs leading-5">
+          <PopoverDescription className="type-meta">
             Customize this browser&apos;s DHI layout.
           </PopoverDescription>
         </PopoverHeader>
@@ -152,7 +152,7 @@ export function PreferencesPanel() {
             <RotateCcw className="h-3.5 w-3.5" />
             Restore defaults
           </Button>
-          <p className="mt-2 text-center text-[10.5px] text-muted-foreground">
+          <p className="mt-2 text-center type-label text-muted-foreground">
             Saved in this browser
           </p>
         </div>

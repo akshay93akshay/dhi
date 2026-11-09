@@ -23,7 +23,7 @@ export function ToolAdminNav({ current }: { current: ToolAdminPage }) {
       aria-label="Tool administration"
       className="flex flex-wrap items-center gap-1 rounded-xl border border-border bg-card p-1.5 shadow-sm"
     >
-      <span className="mr-1 hidden px-2 text-[10px] font-semibold uppercase tracking-[0.14em] text-muted-foreground sm:inline">
+      <span className="mr-1 hidden px-2 type-label font-semibold uppercase tracking-[0.14em] text-muted-foreground sm:inline">
         Tool admin
       </span>
       {LINKS.map((link) =>
@@ -31,7 +31,7 @@ export function ToolAdminNav({ current }: { current: ToolAdminPage }) {
           <span
             key={link.page}
             aria-current="page"
-            className="rounded-lg bg-secondary px-3 py-1.5 text-[12px] font-semibold text-secondary-foreground shadow-sm"
+            className="rounded-lg bg-secondary px-3 py-1.5 type-label font-semibold text-secondary-foreground shadow-sm"
           >
             {link.label}
           </span>
@@ -40,7 +40,7 @@ export function ToolAdminNav({ current }: { current: ToolAdminPage }) {
             key={link.page}
             href={link.href}
             className={cn(
-              "rounded-lg px-3 py-1.5 text-[12px] font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground",
+              "rounded-lg px-3 py-1.5 type-label font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground",
             )}
           >
             {link.label}

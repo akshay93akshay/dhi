@@ -40,7 +40,7 @@ export function StatusBanner({
     <div
       role={tone === "error" ? "alert" : "status"}
       className={cn(
-        "flex flex-wrap items-start justify-between gap-3 rounded-xl border px-4 py-3 text-sm text-foreground",
+        "flex flex-wrap items-start justify-between gap-3 rounded-xl border px-4 py-3 type-body text-foreground",
         TONES[tone],
         className,
       )}
@@ -52,7 +52,7 @@ export function StatusBanner({
         {children !== undefined ? (
           <div
             className={cn(
-              "text-[13px] leading-5 text-muted-foreground",
+              "type-meta text-muted-foreground",
               title === undefined ? "" : "mt-1",
             )}
           >

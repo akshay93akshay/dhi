@@ -204,7 +204,7 @@ export function McpClient() {
 
         {loading ? (
           <Card>
-            <CardContent className="py-6 text-sm text-muted-foreground">
+            <CardContent className="py-6 type-body text-muted-foreground">
               Loading MCP servers…
             </CardContent>
           </Card>
@@ -292,14 +292,14 @@ export function McpClient() {
                 </Button>
               </div>
             </CardHeader>
-            <CardContent className="space-y-2 text-sm">
+            <CardContent className="space-y-2 type-body">
               {!lastReload.runtime_attached ? (
                 <div className="text-warning">
                   The MCP runtime is not attached; the config was applied but
                   no new servers could connect.
                 </div>
               ) : null}
-              <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
+              <div className="flex flex-wrap gap-4 type-meta text-muted-foreground">
                 <span>Connected: {lastReload.connected.length}</span>
                 <span>Reconnected: {lastReload.reconnected.length}</span>
                 <span>Disconnected: {lastReload.disconnected.length}</span>
@@ -310,7 +310,7 @@ export function McpClient() {
                 <ul className="list-disc space-y-1 pl-5 text-destructive">
                   {lastReload.failed.map((failure) => (
                     <li key={failure.name}>
-                      <span className="font-mono text-xs">{failure.name}</span>:{" "}
+                      <span className="type-mono">{failure.name}</span>:{" "}
                       {failure.error}
                     </li>
                   ))}
@@ -348,7 +348,7 @@ export function McpClient() {
                     <TableRow>
                       <TableCell
                         colSpan={9}
-                        className="py-6 text-sm text-muted-foreground"
+                        className="py-6 type-body text-muted-foreground"
                       >
                         No MCP servers are configured. Add one here, or edit
                         ops/mcp.json and reload.
@@ -375,10 +375,10 @@ export function McpClient() {
 
                       return (
                         <TableRow key={row.name}>
-                          <TableCell className="font-mono text-xs font-semibold">
+                          <TableCell className="type-mono font-semibold">
                             {row.name}
                           </TableCell>
-                          <TableCell className="whitespace-nowrap text-xs">
+                          <TableCell className="whitespace-nowrap type-meta">
                             {transport ?? "—"}
                             {timeout !== undefined ? (
                               <span className="text-muted-foreground">
@@ -402,22 +402,22 @@ export function McpClient() {
                             )}
                           </TableCell>
                           <TableCell
-                            className="text-xs"
+                            className="type-meta"
                             title={tools.map((tool) => tool.name).join(", ")}
                           >
                             {row.status === undefined ? "—" : tools.length}
                           </TableCell>
                           <TableCell className="max-w-[20rem]">
-                            <span className="font-mono text-xs break-all">
+                            <span className="type-mono break-all">
                               {target ?? "—"}
                             </span>
                           </TableCell>
-                          <TableCell className="max-w-[14rem] text-xs text-muted-foreground">
+                          <TableCell className="max-w-[14rem] type-meta text-muted-foreground">
                             {headerNames.length === 0
                               ? "—"
                               : headerNames.join(", ")}
                           </TableCell>
-                          <TableCell className="max-w-[18rem] break-words text-xs text-destructive">
+                          <TableCell className="max-w-[18rem] break-words type-meta text-destructive">
                             {row.status?.last_error ?? "—"}
                           </TableCell>
                           <TableCell>

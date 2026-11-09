@@ -15,8 +15,10 @@ import {
 
 import { deleteTask, deleteTasks, listTasks, stopTask } from "@/lib/api";
 import type { Task } from "@/lib/types";
+import { plainPreview } from "@/lib/preview";
 import { describeApiError, shortenId } from "@/lib/ui";
 import { formatLocalTimestamp } from "@/lib/localTime";
+import { MarkdownMath } from "@/components/markdown-math";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -297,8 +299,8 @@ export default function TasksPage() {
     <main className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold tracking-[-0.02em]">Tasks</h1>
-          <p className="mt-1 text-xs text-muted-foreground">
+          <h1 className="type-page font-semibold tracking-[-0.02em]">Tasks</h1>
+          <p className="mt-1 type-meta text-muted-foreground">
             {tasks === null
               ? "Loading the task ledger…"
               : `${tasks.length} task${tasks.length === 1 ? "" : "s"} · open one for detail or work view`}
@@ -330,13 +332,13 @@ export default function TasksPage() {
       <Card className="min-w-0" id="tasks">
         <CardHeader className="flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex items-center gap-2">
-            <CardTitle className="text-base">Task ledger</CardTitle>
+            <CardTitle>Task ledger</CardTitle>
             <Badge variant="outline" className="font-normal">
               {tasks === null ? "—" : `${tasks.length} total`}
             </Badge>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <label className="flex cursor-pointer select-none items-center gap-2 rounded-full px-1 text-xs text-muted-foreground">
+            <label className="flex cursor-pointer select-none items-center gap-2 rounded-full px-1 type-table text-muted-foreground">
               <Checkbox
                 aria-label="Select all terminal tasks"
                 checked={
@@ -353,7 +355,7 @@ export default function TasksPage() {
               />
               Select all
             </label>
-            <span className="text-xs text-muted-foreground">
+            <span className="type-meta text-muted-foreground">
               {selectedCount} selected
             </span>
             <Button
@@ -376,14 +378,14 @@ export default function TasksPage() {
           {actionError !== null ? (
             <div
               role="alert"
-              className="mx-5 mb-4 mt-4 rounded-lg border border-destructive/30 bg-destructive/8 px-3 py-2 text-xs leading-5 text-destructive"
+              className="mx-5 mb-4 mt-4 rounded-lg border border-destructive/30 bg-destructive/8 px-3 py-2 type-meta text-destructive"
             >
               {actionError}
             </div>
           ) : null}
 
           {error !== null && tasks !== null ? (
-            <div className="mx-5 mb-4 rounded-lg border border-destructive/30 bg-destructive/8 px-3 py-2 text-xs leading-5 text-destructive">
+            <div className="mx-5 mb-4 rounded-lg border border-destructive/30 bg-destructive/8 px-3 py-2 type-meta text-destructive">
               Could not refresh tasks: {error} — showing the last loaded rows.
             </div>
           ) : null}
@@ -393,7 +395,7 @@ export default function TasksPage() {
               {error !== null ? (
                 <div className="flex flex-col items-center justify-center gap-3 rounded-xl border border-destructive/25 bg-destructive/5 px-5 py-8 text-center">
                   <CircleAlert className="h-5 w-5 text-destructive" />
-                  <p className="max-w-md text-xs leading-5 text-destructive">
+                  <p className="max-w-md type-meta text-destructive">
                     Could not load tasks: {error}
                   </p>
                   <Button
@@ -406,7 +408,7 @@ export default function TasksPage() {
                   </Button>
                 </div>
               ) : (
-                <p className="py-6 text-sm text-muted-foreground">
+                <p className="py-6 type-body text-muted-foreground">
                   Loading tasks…
                 </p>
               )}
@@ -414,36 +416,36 @@ export default function TasksPage() {
           ) : tasks.length === 0 ? (
             <div className="px-5 pb-6 pt-2">
               <div className="rounded-xl border border-dashed border-border bg-surface-subtle px-5 py-8 text-center">
-                <p className="text-sm font-medium text-foreground">
+                <p className="type-table font-medium text-foreground">
                   No tasks yet
                 </p>
-                <p className="mx-auto mt-1 max-w-sm text-xs leading-5 text-muted-foreground">
+                <p className="mx-auto mt-1 max-w-sm type-meta text-muted-foreground">
                   Create the first task from the Overview start page.
                 </p>
               </div>
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[860px] table-fixed text-sm">
+              <table className="w-full min-w-[900px] table-fixed type-table">
                 <thead>
-                  <tr className="border-y border-border bg-surface-subtle text-left text-[10.5px] uppercase tracking-[0.09em] text-muted-foreground">
-                    <th className="w-[52px] px-5 py-2.5 font-semibold">
+                  <tr className="border-y border-border bg-surface-subtle text-left type-label uppercase tracking-[0.09em] text-muted-foreground">
+                    <th className="w-[52px] px-5 py-3 font-semibold">
                       <span className="sr-only">Select</span>
                     </th>
-                    <th className="w-[92px] whitespace-nowrap px-3 py-2.5 font-semibold">
+                    <th className="w-[100px] whitespace-nowrap px-3 py-3 font-semibold">
                       Task
                     </th>
-                    <th className="px-3 py-2.5 font-semibold">Goal</th>
-                    <th className="w-[104px] whitespace-nowrap px-3 py-2.5 font-semibold">
+                    <th className="px-3 py-3 font-semibold">Goal</th>
+                    <th className="w-[104px] whitespace-nowrap px-3 py-3 font-semibold">
                       State
                     </th>
-                    <th className="w-[104px] whitespace-nowrap px-3 py-2.5 font-semibold">
+                    <th className="w-[104px] whitespace-nowrap px-3 py-3 font-semibold">
                       Pins
                     </th>
-                    <th className="w-[150px] whitespace-nowrap px-3 py-2.5 text-right font-semibold">
+                    <th className="w-[150px] whitespace-nowrap px-3 py-3 text-right font-semibold">
                       Created
                     </th>
-                    <th className="w-[124px] whitespace-nowrap px-5 py-2.5 text-right font-semibold">
+                    <th className="w-[124px] whitespace-nowrap px-5 py-3 text-right font-semibold">
                       Actions
                     </th>
                   </tr>
@@ -486,7 +488,7 @@ export default function TasksPage() {
                           <Link
                             href={`/tasks/${task.id}`}
                             onClick={(event) => event.stopPropagation()}
-                            className="rounded font-mono text-[11px] text-muted-foreground hover:text-foreground"
+                            className="rounded type-mono text-muted-foreground hover:text-foreground"
                             title={task.id}
                           >
                             #{shortenId(task.id)}
@@ -496,9 +498,9 @@ export default function TasksPage() {
                           <Link
                             href={`/tasks/${task.id}`}
                             onClick={(event) => event.stopPropagation()}
-                            className="line-clamp-2 max-w-xl text-[13px] font-medium text-foreground hover:underline"
+                            className="line-clamp-2 max-w-xl break-words type-table font-medium text-foreground hover:underline"
                           >
-                            {task.goal}
+                            {plainPreview(task.goal)}
                           </Link>
                         </td>
                         <td className="whitespace-nowrap px-3 py-3">
@@ -507,17 +509,17 @@ export default function TasksPage() {
                         <td className="whitespace-nowrap px-3 py-3">
                           {task.pinned_planner_profile_id === null &&
                           task.pinned_worker_profile_id === null ? (
-                            <span className="text-xs text-muted-foreground">
+                            <span className="type-meta text-muted-foreground">
                               —
                             </span>
                           ) : (
-                            <span className="flex items-center gap-2 text-[11px] text-warning">
+                            <span className="flex items-center gap-2 type-label text-warning">
                               {task.pinned_planner_profile_id !== null ? (
                                 <span
                                   className="inline-flex items-center gap-1"
                                   title={`Planner profile #${task.pinned_planner_profile_id}`}
                                 >
-                                  <Pin className="h-3 w-3" /> planner
+                                  <Pin className="h-3.5 w-3.5" /> planner
                                 </span>
                               ) : null}
                               {task.pinned_worker_profile_id !== null ? (
@@ -525,13 +527,13 @@ export default function TasksPage() {
                                   className="inline-flex items-center gap-1"
                                   title={`Worker profile #${task.pinned_worker_profile_id}`}
                                 >
-                                  <Pin className="h-3 w-3" /> worker
+                                  <Pin className="h-3.5 w-3.5" /> worker
                                 </span>
                               ) : null}
                             </span>
                           )}
                         </td>
-                        <td className="px-3 py-3 text-right text-[10.5px] leading-4 text-muted-foreground">
+                        <td className="px-3 py-3 text-right type-meta text-muted-foreground">
                           <span className="block break-words">
                             {formatLocalTimestamp(task.created_at)}
                           </span>
@@ -545,10 +547,10 @@ export default function TasksPage() {
                               type="button"
                               variant="outline"
                               size="sm"
-                              className="h-7 gap-1.5 px-2 text-[11px]"
+                              className="h-8 gap-1.5 px-2.5 type-label"
                               disabled
                             >
-                              <Loader2 className="h-3 w-3 animate-spin" />
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
                               Stopping…
                             </Button>
                           ) : active ? (
@@ -556,11 +558,11 @@ export default function TasksPage() {
                               type="button"
                               variant="outline"
                               size="sm"
-                              className="h-7 gap-1.5 px-2 text-[11px]"
+                              className="h-8 gap-1.5 px-2.5 type-label"
                               onClick={() => setStopTarget(task)}
                               disabled={deleting}
                             >
-                              <Square className="h-3 w-3 fill-current" />
+                              <Square className="h-3.5 w-3.5 fill-current" />
                               Stop
                             </Button>
                           ) : terminal ? (
@@ -568,7 +570,7 @@ export default function TasksPage() {
                               type="button"
                               variant="ghost"
                               size="sm"
-                              className="h-7 gap-1.5 px-2 text-[11px] text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                              className="h-8 gap-1.5 px-2.5 type-label text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
                               onClick={() => {
                                 setActionError(null);
                                 setDeleteTarget(task);
@@ -577,7 +579,7 @@ export default function TasksPage() {
                               disabled={rowBusy || deleting}
                               title={`Delete task #${shortenId(task.id)}`}
                             >
-                              <Trash2 className="h-3 w-3" />
+                              <Trash2 className="h-3.5 w-3.5" />
                               Delete
                             </Button>
                           ) : null}
@@ -611,7 +613,7 @@ export default function TasksPage() {
               undone.
             </DialogDescription>
           </DialogHeader>
-          <p className="rounded-md border border-border bg-surface-subtle px-3 py-2 text-xs leading-5 text-muted-foreground">
+          <p className="rounded-md border border-border bg-surface-subtle px-3 py-2 type-meta text-muted-foreground">
             Running and paused tasks are not selected.
           </p>
           <DialogFooter>
@@ -660,9 +662,11 @@ export default function TasksPage() {
             </DialogDescription>
           </DialogHeader>
           {stopTarget !== null ? (
-            <p className="rounded-md border border-border bg-surface-subtle px-3 py-2 text-xs leading-5 text-muted-foreground">
-              #{shortenId(stopTarget.id)} · {stopTarget.goal}
-            </p>
+            <div className="rounded-md border border-border bg-surface-subtle px-3 py-2 type-body text-muted-foreground">
+              <span className="type-mono">#{shortenId(stopTarget.id)}</span>
+              <span className="mx-1.5 text-border">·</span>
+              <MarkdownMath text={stopTarget.goal} variant="inline" />
+            </div>
           ) : null}
           <DialogFooter>
             <Button

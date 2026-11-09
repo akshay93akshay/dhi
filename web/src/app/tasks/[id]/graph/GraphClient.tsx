@@ -21,12 +21,12 @@ import { StateBadge } from "@/components/ui/state-badge";
 const POLL_INTERVAL_MS = 5000;
 
 /**
- * Fill the space left by the compact breadcrumb/header chrome. At 1440×900
- * this leaves a ~620px stage without forcing the page to scroll. On narrow
- * screens the graph keeps a usable fixed height and the inspector flows below
- * it, so the page scrolls instead of squeezing both into one viewport.
+ * Placeholder height for the loading and error states. The live graph owns its
+ * canvas height so the inspector can sit below it without squeezing the
+ * drawing; the whole page scrolls once a node is selected.
  */
-const GRAPH_PANEL_HEIGHT = "min-h-[520px] lg:h-[calc(100svh-280px)]";
+const GRAPH_PANEL_HEIGHT =
+  "min-h-[560px] lg:h-[calc(100svh-260px)] lg:min-h-[600px] lg:max-h-[900px]";
 
 /**
  * Four-stop trail. `crumbTrailSegments` supports only one leaf, so the Work
@@ -160,7 +160,6 @@ function TaskGraphView() {
           eyebrow="Work graph"
           icon={<GitBranch className="h-3.5 w-3.5" />}
           title="Task not found"
-          className="[&_h1]:text-[24px]"
           description={
             <>
               No task with id{" "}
@@ -185,8 +184,8 @@ function TaskGraphView() {
         />
         <div className="flex min-h-[240px] flex-col items-center justify-center rounded-xl border border-dashed border-border bg-surface-subtle px-6 py-10 text-center">
           <CircleAlert className="h-6 w-6 text-muted-foreground" />
-          <h2 className="mt-3 text-sm font-semibold">No work graph for this task</h2>
-          <p className="mt-1 max-w-md text-xs leading-5 text-muted-foreground">
+          <h2 className="mt-3 text-[18px] font-semibold">No work graph for this task</h2>
+          <p className="mt-1 max-w-md text-[13px] leading-5 text-muted-foreground">
             The id may belong to a different database, or the task may have been
             removed.
           </p>
@@ -217,7 +216,6 @@ function TaskGraphView() {
           eyebrow="Work graph"
           icon={<GitBranch className="h-3.5 w-3.5" />}
           title="Task graph"
-          className="[&_h1]:text-[24px]"
           description={
             <span className="mono" title={id}>
               #{shortenId(id)}
@@ -240,9 +238,9 @@ function TaskGraphView() {
           className={`${GRAPH_PANEL_HEIGHT} flex flex-col items-center justify-center rounded-xl border border-border bg-card px-6 py-10 text-center`}
         >
           <CircleAlert className="h-6 w-6 text-destructive" />
-          <h2 className="mt-3 text-sm font-semibold">Could not load task graph</h2>
+          <h2 className="mt-3 text-[18px] font-semibold">Could not load task graph</h2>
           <p
-            className="mt-1 max-w-lg break-words text-xs leading-5 text-muted-foreground"
+            className="mt-1 max-w-lg break-words text-[13px] leading-5 text-muted-foreground"
             role="alert"
           >
             {pageError ?? "The work graph request failed."}
@@ -274,7 +272,6 @@ function TaskGraphView() {
         eyebrow="Work graph"
         icon={<GitBranch className="h-3.5 w-3.5" />}
         title="Task graph"
-        className="[&_h1]:text-[24px]"
         description={
           <span className="flex flex-wrap items-center gap-2">
             <StateBadge state={work.task.state} />
@@ -282,7 +279,7 @@ function TaskGraphView() {
               #{shortenId(work.task.id)}
             </span>
             {updatedAt !== null ? (
-              <span className="text-xs text-muted-foreground">
+              <span className="text-[13px] leading-5 text-muted-foreground">
                 updated {formatLocalTimestamp(updatedAt.toISOString())}
               </span>
             ) : null}
@@ -304,7 +301,7 @@ function TaskGraphView() {
 
       {pollError !== null ? (
         <p
-          className="text-[11.5px] leading-4 text-warning"
+          className="text-[13px] leading-5 text-warning"
           role="status"
         >
           Auto-refresh failed: {pollError} — showing the last snapshot and
@@ -312,9 +309,7 @@ function TaskGraphView() {
         </p>
       ) : null}
 
-      <div className={`${GRAPH_PANEL_HEIGHT} w-full`}>
-        <TaskGraph key={work.task.id} work={work} />
-      </div>
+      <TaskGraph key={work.task.id} work={work} />
     </main>
   );
 }

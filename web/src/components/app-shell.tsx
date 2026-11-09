@@ -104,7 +104,7 @@ function NavLinks({
         <div key={group.label}>
           {!collapsed ? (
             <div
-              className="mb-1.5 px-2.5 text-[10px] font-semibold uppercase tracking-[0.16em] text-sidebar-muted/80"
+              className="mb-2 px-2.5 type-label font-semibold uppercase tracking-[0.14em] text-sidebar-muted/80"
               data-sidebar-copy
             >
               {group.label}
@@ -152,7 +152,7 @@ function NavLink({
       aria-current={active ? "page" : undefined}
       title={collapsed ? item.label : undefined}
       className={cn(
-        "group relative flex items-center gap-2.5 rounded-lg py-2 text-[13px] font-medium transition-colors",
+        "group relative flex items-center gap-2.5 rounded-lg py-2.5 type-table font-medium transition-colors",
         collapsed ? "justify-center px-2" : "px-2.5",
         active
           ? "bg-sidebar-accent text-sidebar-accent-foreground"
@@ -326,11 +326,11 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <span className="sm:hidden">
               <DhiBrandStatus state={service} compact badge />
             </span>
-            <span className="hidden text-[11px] font-medium uppercase tracking-[0.12em] text-muted-foreground sm:inline">
+            <span className="hidden type-label font-medium uppercase tracking-[0.1em] text-muted-foreground sm:inline">
               {context.section}
             </span>
             <span className="hidden text-muted-foreground/40 sm:inline">/</span>
-            <span className="truncate text-[13px] font-semibold text-foreground">
+            <span className="truncate type-meta font-semibold text-foreground">
               {context.title}
             </span>
           </div>

@@ -150,7 +150,7 @@ export function ToolsClient() {
       <div className="space-y-4">
         {loading ? (
           <Card>
-            <CardContent className="py-6 text-sm text-muted-foreground">
+            <CardContent className="py-6 type-body text-muted-foreground">
               Loading tool catalog…
             </CardContent>
           </Card>
@@ -190,7 +190,7 @@ export function ToolsClient() {
             <ul className="list-disc space-y-1 pl-5 text-current">
               {catalog.errors.map((sourceError, index) => (
                 <li key={`${sourceError.source}-${index}`}>
-                  <span className="font-mono text-xs">{sourceError.source}</span>:{" "}
+                  <span className="type-mono">{sourceError.source}</span>:{" "}
                   {sourceError.error}
                 </li>
               ))}

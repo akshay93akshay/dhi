@@ -33,18 +33,18 @@ export function PageHeader({
     >
       <div className="min-w-0 space-y-2">
         {eyebrow !== undefined ? (
-          <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+          <div className="flex items-center gap-2 type-label font-semibold uppercase tracking-[0.16em] text-muted-foreground">
             {icon !== undefined ? (
               <span className="text-accent-foreground">{icon}</span>
             ) : null}
             {eyebrow}
           </div>
         ) : null}
-        <h1 className="text-[26px] font-semibold leading-tight tracking-[-0.03em] sm:text-[30px]">
+        <h1 className="type-page font-semibold tracking-[-0.03em]">
           {title}
         </h1>
         {description !== undefined ? (
-          <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
+          <p className="max-w-2xl type-meta text-muted-foreground">
             {description}
           </p>
         ) : null}
