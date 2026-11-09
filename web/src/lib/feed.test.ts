@@ -258,7 +258,7 @@ test("prettyJson expands payloads readably and survives junk", () => {
   assert.match(prettyJson(cyclic), /\[object Object\]|circular/);
 });
 
-test("tool input and output share one formatted view, including old rows", () => {
+test("formatToolValue keeps its string, truncation, and JSON contract", () => {
   assert.equal(formatToolValue("ls -la"), "ls -la");
   assert.equal(formatToolValue({ command: "ls" }), '{\n  "command": "ls"\n}');
   assert.equal(
@@ -267,35 +267,218 @@ test("tool input and output share one formatted view, including old rows", () =>
   );
   assert.equal(formatToolValue(null), null);
   assert.equal(formatToolValue(undefined), null);
+});
 
+test("activityToolIo extracts a shell command and its output", () => {
   const fresh = activityToolIo(
     act(1, {
       kind: "tool_allowed",
-      payload: { tool: "shell", input: "ls", output: "a\nb" },
+      payload: {
+        tool: "shell",
+        input: {
+          command: "npm test",
+          cwd: "/repo",
+          __dhi_task_id: "task-1",
+          __dhi_scope_mac: "mac",
+        },
+        output: "all tests passed",
+      },
     }),
   );
-  assert.deepEqual(fresh, { input: "ls", output: "a\nb" });
-  assert.equal(toolIoFullText(fresh!), "Input:\nls\n\nOutput:\na\nb");
+  assert.deepEqual(fresh, {
+    tool: "shell",
+    command: "npm test",
+    content: null,
+    output: "all tests passed",
+    details: null,
+  });
+  assert.equal(
+    toolIoFullText(fresh!),
+    "Tool:\nshell\n\nCommand:\nnpm test\n\nOutput:\nall tests passed",
+  );
 
+  // Output objects with a string `output` unwrap before the generic formatter.
+  const wrapped = activityToolIo(
+    act(2, {
+      kind: "tool_allowed",
+      payload: {
+        tool: "shell",
+        input: { command: "ls" },
+        output: { output: "a.txt\nb.txt" },
+      },
+    }),
+  );
+  assert.equal(wrapped?.command, "ls");
+  assert.equal(wrapped?.output, "a.txt\nb.txt");
+
+  // Older rows stored the raw input string; it still reads as the command.
+  const legacy = activityToolIo(
+    act(3, {
+      kind: "tool_allowed",
+      payload: { tool: "shell", input: "ls -la", output: "total 0" },
+    }),
+  );
+  assert.equal(legacy?.command, "ls -la");
+  assert.equal(legacy?.output, "total 0");
+});
+
+test("activityToolIo separates write file path, content, and result", () => {
+  const io = activityToolIo(
+    act(4, {
+      kind: "tool_allowed",
+      payload: {
+        tool: "write",
+        input: { path: "src/app.ts", content: "export {};\n" },
+        output: "Wrote src/app.ts",
+      },
+    }),
+  );
+  assert.deepEqual(io, {
+    tool: "write",
+    command: "src/app.ts",
+    content: "export {};\n",
+    output: "Wrote src/app.ts",
+    details: null,
+  });
+
+  // Alternate field names and `{ message }` results are accepted too.
+  const alternate = activityToolIo(
+    act(5, {
+      kind: "tool_allowed",
+      payload: {
+        tool: "write",
+        input: { file_path: "notes.md", text: "hello" },
+        output: { message: "saved" },
+      },
+    }),
+  );
+  assert.deepEqual(alternate, {
+    tool: "write",
+    command: "notes.md",
+    content: "hello",
+    output: "saved",
+    details: null,
+  });
+});
+
+test("activityToolIo treats read and list paths as the command", () => {
+  const read = activityToolIo(
+    act(6, {
+      kind: "tool_allowed",
+      payload: {
+        tool: "read",
+        input: { path: "README.md", offset: 2 },
+        output: "# DHI",
+      },
+    }),
+  );
+  assert.deepEqual(read, {
+    tool: "read",
+    command: "README.md",
+    content: null,
+    output: "# DHI",
+    details: null,
+  });
+
+  const list = activityToolIo(
+    act(7, {
+      kind: "tool_allowed",
+      payload: { tool: "list", input: { path: "src" }, output: "a.ts\nb.ts" },
+    }),
+  );
+  assert.equal(list?.command, "src");
+  assert.equal(list?.output, "a.ts\nb.ts");
+});
+
+test("activityToolIo strips __dhi metadata and keeps compact details for other tools", () => {
+  const io = activityToolIo(
+    act(8, {
+      kind: "tool_allowed",
+      payload: {
+        tool: "lookup",
+        input: {
+          query: "rust",
+          __dhi_task_id: "task-1",
+          __dhi_scope_mac: "mac",
+          __dhi: true,
+          options: { __dhi_role: "worker", limit: 3 },
+        },
+        output: "found",
+      },
+    }),
+  );
+  assert.deepEqual(io, {
+    tool: "lookup",
+    command: null,
+    content: null,
+    output: "found",
+    details: 'query: rust\noptions: {"limit":3}',
+  });
+  assert.doesNotMatch(toolIoFullText(io!), /__dhi/);
+
+  const other = activityToolIo(
+    act(9, {
+      kind: "tool_allowed",
+      payload: {
+        tool: "createGame",
+        input: { color: "white", level: 3, timed: false },
+        output: { result: { game_id: "g-1" } },
+      },
+    }),
+  );
+  assert.equal(other?.details, "color: white\nlevel: 3\ntimed: false");
+  assert.match(other?.output ?? "", /g-1/);
+});
+
+test("activityToolIo keeps output-only rows and joins the full copy text", () => {
   // Older rows predate the contract's `input`; output alone still renders.
   const old = activityToolIo(
-    act(2, {
+    act(10, {
       kind: "tool_allowed",
       payload: { tool: "shell", output: { truncated: true, preview: "ok" } },
     }),
   );
   assert.deepEqual(old, {
-    input: null,
+    tool: "shell",
+    command: null,
+    content: null,
     output: "ok\n… (truncated by the server)",
+    details: null,
   });
   assert.equal(
     toolIoFullText(old!),
-    "Output:\nok\n… (truncated by the server)",
+    "Tool:\nshell\n\nOutput:\nok\n… (truncated by the server)",
   );
 
+  assert.equal(
+    toolIoFullText({
+      tool: "write",
+      command: "a.txt",
+      content: "hi",
+      output: "ok",
+      details: "mode: overwrite",
+    }),
+    "Tool:\nwrite\n\nCommand:\na.txt\n\nContent:\nhi\n\nOutput:\nok\n\nDetails:\nmode: overwrite",
+  );
+});
+
+test("activityToolIo returns null when a row has no useful tool cell", () => {
   // Non-tool activity keeps the generic payload expansion.
   assert.equal(
-    activityToolIo(act(3, { kind: "task_created", payload: { goal: "g" } })),
+    activityToolIo(act(11, { kind: "task_created", payload: { goal: "g" } })),
+    null,
+  );
+  // A tool row carrying only reserved metadata has nothing to show.
+  assert.equal(
+    activityToolIo(
+      act(12, {
+        kind: "tool_allowed",
+        payload: {
+          input: { __dhi_task_id: "task-1" },
+          __dhi_scope_mac: "mac",
+        },
+      }),
+    ),
     null,
   );
 });

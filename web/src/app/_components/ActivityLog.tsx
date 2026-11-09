@@ -45,9 +45,9 @@ import { StateBadge } from "@/components/ui/state-badge";
  * - `ActivityTimeline` — the shared presentational piece: a vertical event
  *   log, NEWEST AT BOTTOM (the header says so), each entry showing the
  *   system-local time (short clock, full stamp on hover), the kind as a
- *   badge, the actor when derivable, the message, and either one combined
- *   tool input/output cell for `tool_allowed` rows or the generic payload
- *   collapsed behind a one-click `<details>`.
+ *   badge, the actor when derivable, and either one compact semantic tool
+ *   cell for `tool_allowed` rows (no raw JSON/`__dhi_*` dump) or the generic
+ *   payload collapsed behind a one-click `<details>`.
  * - `LiveActivityFeed` — the work view's live log: history seed + SSE
  *   stream + connection indicator + graceful polling fallback, showing the
  *   newest ten events.
@@ -169,46 +169,63 @@ function ToolValueBlock(props: { label: string; text: string }) {
   const lower = label.toLowerCase();
   return (
     <div className="min-w-0">
-      <div className="flex items-center justify-between gap-2">
-        <span className="type-label font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-          {label}
-        </span>
-        <CopyButton text={text} label={lower} size="icon" />
-      </div>
+      <span className="type-label font-semibold uppercase tracking-[0.08em] text-muted-foreground">
+        {label}
+      </span>
       <pre className="pre mt-1 max-h-72 overflow-auto whitespace-pre-wrap break-words type-mono">
         {preview}
       </pre>
       {truncated ? (
         <details className="feed-details">
           <summary className="subtle">Show full {lower}</summary>
-          <pre className="pre max-h-96 type-mono">{text}</pre>
+          <pre className="pre max-h-96 overflow-auto whitespace-pre-wrap break-words type-mono">
+            {text}
+          </pre>
         </details>
       ) : null}
     </div>
   );
 }
 
+/** The command block label follows the tool's meaning. */
+function toolCommandLabel(tool: string | null): string {
+  const name = (tool ?? "").toLowerCase();
+  if (name.includes("write")) {
+    return "File";
+  }
+  if (name.includes("shell")) {
+    return "Command";
+  }
+  return "Path";
+}
+
 /**
- * One tool call's input and output, combined in a single cell. Older
- * `tool_allowed` rows have no `input`; they render the output alone.
+ * One tool call in a single compact cell: the tool name, one Copy button,
+ * and only the semantic parts the row carries. Older `tool_allowed` rows
+ * without `input` render their output alone.
  */
 function ToolIoCell(props: { io: FeedToolIo }) {
   const { io } = props;
   return (
     <div className="mt-2 rounded-lg border border-border bg-surface-subtle px-3.5 py-2.5">
       <div className="flex items-center justify-between gap-2">
-        <span className="type-label font-semibold uppercase tracking-[0.08em] text-muted-foreground">
-          Tool call
+        <span className="type-label font-semibold text-foreground">
+          {io.tool ?? "Tool call"}
         </span>
-        <CopyButton
-          text={toolIoFullText(io)}
-          label="tool input and output"
-          size="icon"
-        />
+        <CopyButton text={toolIoFullText(io)} label="tool call" size="icon" />
       </div>
       <div className="mt-1.5 space-y-2">
-        {io.input !== null ? (
-          <ToolValueBlock label="Input" text={io.input} />
+        {io.command !== null ? (
+          <ToolValueBlock
+            label={toolCommandLabel(io.tool)}
+            text={io.command}
+          />
+        ) : null}
+        {io.content !== null ? (
+          <ToolValueBlock label="Content" text={io.content} />
+        ) : null}
+        {io.details !== null ? (
+          <ToolValueBlock label="Details" text={io.details} />
         ) : null}
         {io.output !== null ? (
           <ToolValueBlock label="Output" text={io.output} />
@@ -242,14 +259,16 @@ function ActivityEntry(props: { activity: Activity }) {
         </span>
         {actor !== null ? <span className="feed-actor">{actor}</span> : null}
       </div>
-      <div className="row spread">
-        <MarkdownMath
-          className="feed-msg min-w-0 flex-1 type-body [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1 [&_.katex-display]:my-1"
-          text={message}
-          variant="block"
-        />
-        <CopyButton text={message} label="message" size="icon" />
-      </div>
+      {toolIo === null ? (
+        <div className="row spread">
+          <MarkdownMath
+            className="feed-msg min-w-0 flex-1 type-body [&_p+p]:mt-1.5 [&_ul]:my-1 [&_ol]:my-1 [&_li]:my-0.5 [&_pre]:my-1.5 [&_blockquote]:my-1 [&_.katex-display]:my-1"
+            text={message}
+            variant="block"
+          />
+          <CopyButton text={message} label="message" size="icon" />
+        </div>
+      ) : null}
       {toolIo !== null ? <ToolIoCell io={toolIo} /> : null}
       {payload !== null ? (
         <details className="feed-details">

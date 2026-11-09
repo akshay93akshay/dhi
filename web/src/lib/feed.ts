@@ -19,9 +19,10 @@
  * - `activityKindView` / `activityActor` — kind strings as served are shown
  *   verbatim; known kinds additionally map onto the shared badge color
  *   vocabulary and a coarse actor label. Unknown/hostile kinds never crash.
- * - `activityToolIo` / `previewFeedText` — one combined input/output cell for
- *   `tool_allowed` rows, with a short collapsed preview and a full-text
- *   expansion; old rows without `input` render output only.
+ * - `activityToolIo` / `previewFeedText` — one compact semantic cell for
+ *   `tool_allowed` rows (tool, command/path, content, output, details), with
+ *   short collapsed previews and a full-text expansion; old rows without
+ *   `input` render output only.
  * - `advanceFeedConnection` — the connection-indicator state machine
  *   (connecting/live/reconnecting → polling fallback after N error streak).
  * - `createLiveFeedController` — the headless feed controller the work-view
@@ -326,12 +327,18 @@ function hasOwn(object: JsonObjectLike, key: string): boolean {
   return Object.prototype.hasOwnProperty.call(object, key);
 }
 
-/** One tool call's combined input/output text, ready for a single feed cell. */
+/** One tool call's semantic parts, ready for a single compact feed cell. */
 export type FeedToolIo = {
-  /** `payload.input` formatted for display, or `null` on old rows. */
-  input: string | null;
-  /** `payload.output` formatted for display, or `null` when absent. */
+  /** `payload.tool` — the tool name shown in the cell header. */
+  tool: string | null;
+  /** Shell command, or the file path for read/write/list tools. */
+  command: string | null;
+  /** Written content for write tools, when present. */
+  content: string | null;
+  /** Extracted output text. */
   output: string | null;
+  /** Compact `key: value` lines for the remaining input arguments. */
+  details: string | null;
 };
 
 /**
@@ -356,17 +363,134 @@ export function formatToolValue(value: unknown): string | null {
   return prettyJson(value);
 }
 
+/** Reserved engine metadata keys never shown in the activity feed. */
+function isDhiKey(key: string): boolean {
+  return key === "__dhi" || key.startsWith("__dhi_");
+}
+
+/** Recursively drops `__dhi` / `__dhi_*` scope metadata from a tool value. */
+function stripDhiKeys(
+  value: unknown,
+  seen: WeakMap<object, unknown> = new WeakMap(),
+): unknown {
+  if (Array.isArray(value)) {
+    const cached = seen.get(value);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const out: unknown[] = [];
+    seen.set(value, out);
+    for (const item of value) {
+      out.push(stripDhiKeys(item, seen));
+    }
+    return out;
+  }
+  if (isJsonObject(value)) {
+    const cached = seen.get(value);
+    if (cached !== undefined) {
+      return cached;
+    }
+    const out: JsonObjectLike = {};
+    seen.set(value, out);
+    for (const [key, inner] of Object.entries(value)) {
+      if (isDhiKey(key)) {
+        continue;
+      }
+      out[key] = stripDhiKeys(inner, seen);
+    }
+    return out;
+  }
+  return value;
+}
+
+/** Reads one input field as display text; non-string values are formatted. */
+function fieldText(value: unknown, key: string): string | null {
+  if (!isJsonObject(value) || !hasOwn(value, key)) {
+    return null;
+  }
+  return formatToolValue(value[key]);
+}
+
+/** Reads a string field from an object, or `null` when it is not a string. */
+function objectString(value: unknown, key: string): string | null {
+  if (!isJsonObject(value)) {
+    return null;
+  }
+  const field = value[key];
+  return typeof field === "string" ? field : null;
+}
+
+/** One-line rendering for compact `key: value` detail rows. */
+function compactToolValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return String(value);
+  }
+  if (value === null) {
+    return "null";
+  }
+  if (value === undefined) {
+    return "undefined";
+  }
+  try {
+    return JSON.stringify(value) ?? String(value);
+  } catch {
+    try {
+      return String(value);
+    } catch {
+      return "[unprintable]";
+    }
+  }
+}
+
+/** Compact `key: value` lines for an input object (or a legacy string). */
+function compactInputDetails(input: unknown): string | null {
+  if (typeof input === "string") {
+    return input === "" ? null : input;
+  }
+  if (!isJsonObject(input)) {
+    return null;
+  }
+  const lines: string[] = [];
+  for (const [key, value] of Object.entries(input)) {
+    if (isDhiKey(key)) {
+      continue;
+    }
+    lines.push(`${key}: ${compactToolValue(value)}`);
+  }
+  return lines.length > 0 ? lines.join("\n") : null;
+}
+
+/** Extracts readable output text from a tool's `payload.output`. */
+function extractOutputText(value: unknown): string | null {
+  return (
+    objectString(value, "output") ??
+    objectString(value, "message") ??
+    formatToolValue(value)
+  );
+}
+
 /**
- * Extracts the combined input/output cell for a `tool_allowed` activity.
- * Rows written before the contract gained `input` simply return output only.
- * Non-tool activity without either key returns `null` so its payload keeps
- * the generic JSON expansion.
+ * Extracts the semantic cell for a `tool_allowed` activity: shell commands,
+ * write file/content pairs, read/list paths, and compact details for every
+ * other tool. Old rows that only carry `output` still render. Reserved
+ * `__dhi_*` metadata is stripped everywhere. Non-tool activity with nothing
+ * useful returns `null` so its payload keeps the generic JSON expansion.
  */
 export function activityToolIo(activity: Activity): FeedToolIo | null {
   if (!isJsonObject(activity.payload)) {
     return null;
   }
-  const payload = activity.payload;
+  const payload = stripDhiKeys(activity.payload);
+  if (!isJsonObject(payload)) {
+    return null;
+  }
   const hasInput = hasOwn(payload, "input");
   const hasOutput = hasOwn(payload, "output");
   const looksLikeToolCall =
@@ -374,12 +498,57 @@ export function activityToolIo(activity: Activity): FeedToolIo | null {
   if (!looksLikeToolCall && !hasInput && !hasOutput) {
     return null;
   }
-  const input = hasInput ? formatToolValue(payload.input) : null;
-  const output = hasOutput ? formatToolValue(payload.output) : null;
-  if (input === null && output === null) {
+
+  const tool =
+    typeof payload.tool === "string" && payload.tool !== ""
+      ? payload.tool
+      : null;
+  const input = hasInput ? payload.input : undefined;
+  const rawOutput = hasOutput ? payload.output : undefined;
+  const name = (tool ?? "").toLowerCase();
+
+  let command: string | null = null;
+  let content: string | null = null;
+  let details: string | null = null;
+  let output: string | null = null;
+
+  if (name.includes("shell")) {
+    command =
+      fieldText(input, "command") ??
+      (typeof input === "string" ? input : null);
+    output = extractOutputText(rawOutput);
+  } else if (name.includes("write")) {
+    command =
+      fieldText(input, "path") ??
+      fieldText(input, "file_path") ??
+      fieldText(input, "file") ??
+      (typeof input === "string" ? input : null);
+    content = fieldText(input, "content") ?? fieldText(input, "text");
+    output =
+      objectString(rawOutput, "output") ??
+      objectString(rawOutput, "message") ??
+      formatToolValue(rawOutput);
+  } else if (name.includes("read") || name.includes("list")) {
+    command =
+      fieldText(input, "path") ??
+      fieldText(input, "file_path") ??
+      fieldText(input, "file");
+    output = extractOutputText(rawOutput);
+  } else {
+    details = compactInputDetails(input);
+    output = extractOutputText(rawOutput);
+  }
+
+  if (
+    tool === null &&
+    command === null &&
+    content === null &&
+    details === null &&
+    output === null
+  ) {
     return null;
   }
-  return { input, output };
+  return { tool, command, content, output, details };
 }
 
 /** Result of {@link previewFeedText}: collapsed text plus a truncation flag. */
@@ -406,14 +575,23 @@ export function previewFeedText(
   return { preview: `${text.slice(0, cap - 1)}…`, truncated: true };
 }
 
-/** Full combined text copied from the expanded tool cell. */
+/** Full labeled text copied from the tool cell's single Copy button. */
 export function toolIoFullText(io: FeedToolIo): string {
   const parts: string[] = [];
-  if (io.input !== null) {
-    parts.push(`Input:\n${io.input}`);
+  if (io.tool !== null) {
+    parts.push(`Tool:\n${io.tool}`);
+  }
+  if (io.command !== null) {
+    parts.push(`Command:\n${io.command}`);
+  }
+  if (io.content !== null) {
+    parts.push(`Content:\n${io.content}`);
   }
   if (io.output !== null) {
     parts.push(`Output:\n${io.output}`);
+  }
+  if (io.details !== null) {
+    parts.push(`Details:\n${io.details}`);
   }
   return parts.join("\n\n");
 }
