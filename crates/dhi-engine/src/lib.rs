@@ -298,9 +298,7 @@ async fn load_project_instructions(
     if !task.load_agents_md {
         return None;
     }
-    let Some(folder) = task.project_folder.as_deref() else {
-        return None;
-    };
+    let folder = task.project_folder.as_deref()?;
     match dhi_core::read_agents_md(std::path::Path::new(folder)) {
         Ok(content) => {
             if task.agents_md_state != content.state {
