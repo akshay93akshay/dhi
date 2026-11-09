@@ -232,6 +232,7 @@ fn app_state(manager: Arc<McpManager>) -> AppState {
         tool_control: None,
         web: Arc::new(dhi_server::web_providers::WebProviderRuntime::empty()),
         task_runs: Arc::new(dhi_server::TaskRunRegistry::disabled()),
+        project_folders: Arc::new(dhi_server::project_folders::ProjectFolders::default()),
     }
 }
 

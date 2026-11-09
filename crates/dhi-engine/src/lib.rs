@@ -284,6 +284,68 @@ fn apply_task_capacity(
     plan
 }
 
+/// Reads the selected project's one `AGENTS.md` for a task start.
+///
+/// The engine calls this once per `run_task`, before the first planner round.
+/// A missing file is `not_found` and adds no prompt section. A read failure
+/// is logged, recorded as `not_found`, and never blocks the task. The state is
+/// written back only when it changed, so a file that grew past the cap after
+/// creation becomes `truncated`.
+async fn load_project_instructions(
+    store: &dyn GraphStore,
+    task: &mut dhi_core::Task,
+) -> Option<String> {
+    if !task.load_agents_md {
+        return None;
+    }
+    let Some(folder) = task.project_folder.as_deref() else {
+        return None;
+    };
+    match dhi_core::read_agents_md(std::path::Path::new(folder)) {
+        Ok(content) => {
+            if task.agents_md_state != content.state {
+                if let Err(err) = store.set_task_agents_md_state(task.id, content.state).await {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %err,
+                        "could not record the AGENTS.md state"
+                    );
+                }
+                task.agents_md_state = content.state;
+            }
+            let mut text = content.text;
+            if content.state == dhi_core::AgentsMdState::Truncated {
+                text.push_str(
+                    "\n\n[AGENTS.md was longer than 32 KiB and the text above was truncated.]",
+                );
+            }
+            content.state.has_instructions().then_some(text)
+        }
+        Err(err) => {
+            tracing::warn!(
+                task_id = %task.id,
+                folder,
+                error = %err,
+                "could not read the project AGENTS.md; continuing without it"
+            );
+            if task.agents_md_state != dhi_core::AgentsMdState::NotFound {
+                if let Err(err) = store
+                    .set_task_agents_md_state(task.id, dhi_core::AgentsMdState::NotFound)
+                    .await
+                {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        error = %err,
+                        "could not record the missing AGENTS.md state"
+                    );
+                }
+                task.agents_md_state = dhi_core::AgentsMdState::NotFound;
+            }
+            None
+        }
+    }
+}
+
 /// The persisted `kind` of one typed swarm message.
 ///
 /// `Shutdown` is runtime control and has no persisted kind; a swarm run never
@@ -981,6 +1043,10 @@ impl Engine {
             self.store.add_goal(task_id, task.goal.clone()).await?;
         }
 
+        // Project instructions are read exactly once per task start. The
+        // worker never receives them: only PlanInput carries the text.
+        let project_instructions = load_project_instructions(self.store.as_ref(), &mut task).await;
+
         let mut rounds = 0;
         let started = std::time::Instant::now();
         let mut model_calls = 0;
@@ -1110,6 +1176,7 @@ impl Engine {
                         required_topology: task.topology,
                         swarm_workers: task.swarm_workers,
                         instructions: instruction_texts,
+                        project_instructions: project_instructions.clone(),
                     })
                     .await
                 {
@@ -2050,9 +2117,9 @@ mod tests {
     use crate::team::team_intent;
     use dhi_agent::{AgentCallRecord, MockAgentRuntime, PlanOutcome, Role};
     use dhi_core::{
-        Activity, AgentRole, Approval, ApprovalStatus, FactId, FactState, Goal, GoalId, GoalState,
-        GuardVerdict, Intent, IntentId, NewSideQuestionRequest, ReopenOutcome, ResultRecord,
-        ResultStatus, SideQuestionRequest, SideQuestionSession, SideQuestionThread,
+        Activity, AgentRole, AgentsMdState, Approval, ApprovalStatus, FactId, FactState, Goal,
+        GoalId, GoalState, GuardVerdict, Intent, IntentId, NewSideQuestionRequest, ReopenOutcome,
+        ResultRecord, ResultStatus, SideQuestionRequest, SideQuestionSession, SideQuestionThread,
         SwarmMessageRecord, TaskId,
     };
     use dhi_guard::Policy;
@@ -2881,11 +2948,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let task = GraphStore::create_task_with_pins(
             store.as_ref(),
-            "split the work".to_string(),
-            None,
-            None,
-            Some(Topology::Swarm),
-            None,
+            dhi_core::NewTask::new("split the work").with_topology(Some(Topology::Swarm)),
         )
         .await
         .unwrap();
@@ -2930,11 +2993,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let task = GraphStore::create_task_with_pins(
             store.as_ref(),
-            "just do it".to_string(),
-            None,
-            None,
-            Some(Topology::Single),
-            None,
+            dhi_core::NewTask::new("just do it").with_topology(Some(Topology::Single)),
         )
         .await
         .unwrap();
@@ -2969,11 +3028,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let task = GraphStore::create_task_with_pins(
             store.as_ref(),
-            "swarm task".to_string(),
-            None,
-            None,
-            Some(Topology::Swarm),
-            None,
+            dhi_core::NewTask::new("swarm task").with_topology(Some(Topology::Swarm)),
         )
         .await
         .unwrap();
@@ -2989,6 +3044,181 @@ mod tests {
         assert_eq!(
             agent.plan_inputs()[0].required_topology,
             Some(Topology::Swarm)
+        );
+    }
+
+    #[tokio::test]
+    async fn planner_receives_the_project_agents_md_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("AGENTS.md"),
+            "PROJECT-MARKER: keep the public API stable",
+        )
+        .unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new("project task").with_project(
+                project.display().to_string(),
+                true,
+                AgentsMdState::Loaded,
+            ),
+        )
+        .await
+        .unwrap();
+        let goal = seed_goal(&store, &task).await;
+        store
+            .record_fact(task.id, "confirmed project evidence".to_string(), json!({}))
+            .await
+            .unwrap();
+        let agent = Arc::new(ScriptedAgent::with_plans(
+            vec![
+                ScriptedPlan::Outcome(idle_plan()),
+                ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+            ],
+            vec![],
+        ));
+        let engine = Engine::new(store.clone(), Arc::clone(&agent) as Arc<dyn AgentRuntime>)
+            .with_heartbeat(Duration::from_millis(1))
+            .with_max_idle_ticks(2);
+
+        let _ = engine.run_task(task.id).await;
+
+        let inputs = agent.plan_inputs();
+        assert!(!inputs.is_empty(), "the planner ran");
+        assert_eq!(
+            inputs[0].project_instructions.as_deref(),
+            Some("PROJECT-MARKER: keep the public API stable"),
+            "the planner receives the bounded AGENTS.md text"
+        );
+        assert!(
+            inputs[1..]
+                .iter()
+                .all(|input| input.project_instructions.as_deref()
+                    == Some("PROJECT-MARKER: keep the public API stable")),
+            "later planner rounds reuse the text read at task start"
+        );
+        assert_eq!(
+            store
+                .get_task(task.id)
+                .await
+                .unwrap()
+                .expect("task exists")
+                .agents_md_state,
+            AgentsMdState::Loaded
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_agents_md_is_truncated_and_marked_in_the_planner_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("AGENTS.md"),
+            "a".repeat(dhi_core::AGENTS_MD_MAX_BYTES + 64),
+        )
+        .unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new("project task").with_project(
+                project.display().to_string(),
+                true,
+                AgentsMdState::Loaded,
+            ),
+        )
+        .await
+        .unwrap();
+        let goal = seed_goal(&store, &task).await;
+        store
+            .record_fact(
+                task.id,
+                "confirmed truncated-file evidence".to_string(),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let agent = Arc::new(ScriptedAgent::with_plans(
+            vec![ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id }],
+            vec![],
+        ));
+        let engine = Engine::new(store.clone(), Arc::clone(&agent) as Arc<dyn AgentRuntime>);
+
+        let _ = engine.run_task(task.id).await;
+
+        let input = agent
+            .plan_inputs()
+            .into_iter()
+            .next()
+            .expect("the planner ran");
+        let text = input.project_instructions.expect("truncated text is sent");
+        let content = text
+            .split("\n\n[AGENTS.md")
+            .next()
+            .expect("the instruction text");
+        assert_eq!(content.len(), dhi_core::AGENTS_MD_MAX_BYTES);
+        assert!(content.bytes().all(|byte| byte == b'a'));
+        assert!(
+            text.contains("was longer than 32 KiB"),
+            "the prompt marks truncation: {text}"
+        );
+        assert_eq!(
+            store
+                .get_task(task.id)
+                .await
+                .unwrap()
+                .expect("task exists")
+                .agents_md_state,
+            AgentsMdState::Truncated
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_agents_md_is_not_found_and_does_not_block_the_plan() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new("project task").with_project(
+                project.display().to_string(),
+                true,
+                AgentsMdState::Loaded,
+            ),
+        )
+        .await
+        .unwrap();
+        let goal = seed_goal(&store, &task).await;
+        store
+            .record_fact(
+                task.id,
+                "confirmed missing-file evidence".to_string(),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let agent = Arc::new(ScriptedAgent::with_plans(
+            vec![ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id }],
+            vec![],
+        ));
+        let engine = Engine::new(store.clone(), Arc::clone(&agent) as Arc<dyn AgentRuntime>);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(agent.plan_inputs()[0].project_instructions, None);
+        assert_eq!(
+            store
+                .get_task(task.id)
+                .await
+                .unwrap()
+                .expect("task exists")
+                .agents_md_state,
+            AgentsMdState::NotFound
         );
     }
 
@@ -3084,11 +3314,9 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let task = GraphStore::create_task_with_pins(
             store.as_ref(),
-            "split the research".to_string(),
-            None,
-            None,
-            Some(Topology::Swarm),
-            Some(3),
+            dhi_core::NewTask::new("split the research")
+                .with_topology(Some(Topology::Swarm))
+                .with_swarm_workers(Some(3)),
         )
         .await
         .unwrap();
@@ -4633,17 +4861,8 @@ mod tests {
             self.inner.create_task(goal).await
         }
 
-        async fn create_task_with_pins(
-            &self,
-            goal: String,
-            planner_pin: Option<i64>,
-            worker_pin: Option<i64>,
-            topology: Option<dhi_core::Topology>,
-            swarm_workers: Option<usize>,
-        ) -> anyhow::Result<Task> {
-            self.inner
-                .create_task_with_pins(goal, planner_pin, worker_pin, topology, swarm_workers)
-                .await
+        async fn create_task_with_pins(&self, task: dhi_core::NewTask) -> anyhow::Result<Task> {
+            self.inner.create_task_with_pins(task).await
         }
 
         async fn get_task(&self, id: TaskId) -> anyhow::Result<Option<Task>> {

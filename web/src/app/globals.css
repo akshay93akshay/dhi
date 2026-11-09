@@ -1387,9 +1387,57 @@ html[data-density="compact"] .feed-item {
   padding-bottom: 10px;
 }
 
+/* ---------------------------------------------------------------------------
+ * React Flow surfaces
+ *
+ * React Flow's package defaults are light-only. Point its overridable
+ * variables at the DHI tokens so controls, the minimap, attribution, and
+ * default edge labels follow the same light/dark palette as the app.
+ * ------------------------------------------------------------------------- */
+
+.dhi-flow.react-flow {
+  --xy-attribution-background-color: color-mix(
+    in srgb,
+    var(--surface-subtle) 88%,
+    transparent
+  );
+  --xy-minimap-background-color: var(--surface-subtle);
+  --xy-minimap-mask-background-color: color-mix(
+    in srgb,
+    var(--background) 72%,
+    transparent
+  );
+  --xy-minimap-mask-stroke-color: var(--border);
+  --xy-minimap-node-background-color: var(--border);
+  --xy-minimap-node-stroke-color: var(--card);
+  --xy-controls-button-background-color: var(--card);
+  --xy-controls-button-background-color-hover: var(--surface-subtle);
+  --xy-controls-button-color: var(--foreground);
+  --xy-controls-button-color-hover: var(--foreground);
+  --xy-controls-button-border-color: var(--border);
+  --xy-controls-box-shadow: 0 1px 2px rgb(24 24 20 / 0.06);
+  --xy-edge-label-background-color: var(--card);
+  --xy-edge-label-color: var(--foreground);
+}
+
+.dhi-flow.react-flow.dark {
+  --xy-controls-box-shadow:
+    0 1px 0 rgb(255 255 255 / 0.04),
+    0 8px 24px -16px rgb(0 0 0 / 0.85);
+}
+
+.dhi-flow.react-flow .react-flow__attribution a {
+  color: var(--muted-foreground);
+}
+
+.dhi-flow.react-flow .react-flow__attribution a:hover {
+  color: var(--foreground);
+}
+
 /* React Flow ships a 10px attribution; keep the app's 13px floor. */
-.react-flow .react-flow__attribution {
+.dhi-flow.react-flow .react-flow__attribution {
   font-size: var(--type-label);
+  border-top-left-radius: 6px;
 }
 
 @keyframes popover-in {

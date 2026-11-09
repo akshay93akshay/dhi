@@ -25,6 +25,7 @@ import {
   listInstructions,
   listModels,
   listProfiles,
+  listProjectFolders,
   listRules,
   listSideQuestions,
   listTasks,
@@ -173,6 +174,30 @@ test("listTasks forwards the limit query parameter", async () => {
   ]);
 });
 
+test("listProjectFolders unwraps the { folders } envelope", async () => {
+  const folder = {
+    path: "/srv/projects/build",
+    name: "Build",
+    agents_md_present: true,
+  };
+  const recorder = stubFetch(() => jsonResponse({ folders: [folder] }));
+
+  const folders = await listProjectFolders();
+
+  assert.equal(recorder.urls[0], "/api/project-folders");
+  assert.equal(recorder.calls[0]?.init?.method, undefined);
+  assert.deepEqual(folders, [folder]);
+});
+
+test("listProjectFolders keeps an empty listing", async () => {
+  const recorder = stubFetch(() => jsonResponse({ folders: [] }));
+
+  const folders = await listProjectFolders();
+
+  assert.equal(recorder.urls[0], "/api/project-folders");
+  assert.deepEqual(folders, []);
+});
+
 test("getHealth reads the bare health object", async () => {
   const recorder = stubFetch(() =>
     jsonResponse({ status: "ok", service: "dhi", version: "0.1.0" }),
@@ -233,6 +258,22 @@ test("createTask forwards topology and swarm_workers, including explicit nulls",
       { goal: "planner task", topology: null, swarm_workers: null },
     ],
   );
+});
+
+test("createTask forwards project_folder and load_agents_md", async () => {
+  const recorder = stubFetch(() => jsonResponse(sampleTask, 201));
+
+  await createTask({
+    goal: "project task",
+    project_folder: "/srv/projects/build",
+    load_agents_md: true,
+  });
+
+  assert.deepEqual(JSON.parse(String(recorder.calls[0]?.init?.body)), {
+    goal: "project task",
+    project_folder: "/srv/projects/build",
+    load_agents_md: true,
+  });
 });
 
 test("getTask reads a bare task by id", async () => {

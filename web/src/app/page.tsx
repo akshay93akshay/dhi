@@ -4,12 +4,21 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Plus } from "lucide-react";
 
-import { createTask, getHealth, listProfiles } from "@/lib/api";
-import type { Health, LlmProfile } from "@/lib/types";
 import {
+  ApiError,
+  createTask,
+  getHealth,
+  listProfiles,
+  listProjectFolders,
+} from "@/lib/api";
+import type { Health, LlmProfile, ProjectFolder } from "@/lib/types";
+import {
+  PROJECT_FOLDER_UNSET,
   SWARM_WORKERS_OPTIONS,
   TOPOLOGY_OPTIONS,
+  agentsMdDefaultOn,
   buildCreateTaskInput,
+  defaultProjectFolderPath,
   describeApiError,
   parseTopology,
   serviceState,
@@ -19,6 +28,7 @@ import {
   type BrandActivity,
 } from "@/components/dhi-brand-status";
 import { PendingTasks } from "@/components/pending-tasks";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -27,6 +37,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Textarea } from "@/components/ui/textarea";
 
 /**
@@ -40,6 +51,14 @@ export default function Home() {
   const [healthError, setHealthError] = useState<string | null>(null);
   const [profiles, setProfiles] = useState<LlmProfile[] | null>(null);
   const [profilesError, setProfilesError] = useState<string | null>(null);
+  const [projectFolders, setProjectFolders] = useState<
+    ProjectFolder[] | null
+  >(null);
+  const [projectFoldersError, setProjectFoldersError] = useState<
+    string | null
+  >(null);
+  const [projectFoldersUnavailable, setProjectFoldersUnavailable] =
+    useState(false);
   const [activity, setActivity] = useState<BrandActivity>("idle");
 
   useEffect(() => {
@@ -71,6 +90,28 @@ export default function Home() {
         }
       });
 
+    listProjectFolders()
+      .then((value) => {
+        if (alive) {
+          setProjectFolders(value);
+          setProjectFoldersError(null);
+          setProjectFoldersUnavailable(false);
+        }
+      })
+      .catch((error) => {
+        if (alive) {
+          // A missing route means an older server: show a clean legacy-mode
+          // notice instead of the generic "Not found" error prefix.
+          if (error instanceof ApiError && error.isNotFound()) {
+            setProjectFoldersUnavailable(true);
+            setProjectFoldersError(null);
+          } else {
+            setProjectFoldersUnavailable(false);
+            setProjectFoldersError(describeApiError(error));
+          }
+        }
+      });
+
     return () => {
       alive = false;
     };
@@ -98,6 +139,9 @@ export default function Home() {
           <CreateTaskCard
             profiles={profiles}
             profilesError={profilesError}
+            projectFolders={projectFolders}
+            projectFoldersError={projectFoldersError}
+            projectFoldersUnavailable={projectFoldersUnavailable}
             onCreated={(task) => router.push(`/tasks/${task.id}`)}
             onActivity={setActivity}
           />
@@ -113,16 +157,29 @@ export default function Home() {
 function CreateTaskCard(props: {
   profiles: LlmProfile[] | null;
   profilesError: string | null;
+  projectFolders: ProjectFolder[] | null;
+  projectFoldersError: string | null;
+  projectFoldersUnavailable: boolean;
   onCreated: (task: { id: string }) => void;
   onActivity: (activity: BrandActivity) => void;
 }) {
-  const { profiles, profilesError, onCreated, onActivity } = props;
+  const {
+    profiles,
+    profilesError,
+    projectFolders,
+    projectFoldersError,
+    projectFoldersUnavailable,
+    onCreated,
+    onActivity,
+  } = props;
 
   const [goal, setGoal] = useState("");
   const [plannerPin, setPlannerPin] = useState("");
   const [workerPin, setWorkerPin] = useState("");
   const [topology, setTopology] = useState("");
   const [swarmWorkers, setSwarmWorkers] = useState("");
+  const [projectFolder, setProjectFolder] = useState(PROJECT_FOLDER_UNSET);
+  const [loadAgentsMd, setLoadAgentsMd] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const activityTimeoutRef = useRef<number | null>(null);
@@ -156,6 +213,22 @@ function CreateTaskCard(props: {
     };
   }, []);
 
+  // A single available folder is preselected; several require an explicit
+  // choice, and a failed/empty listing stays on legacy workspace mode.
+  useEffect(() => {
+    if (projectFolders === null) {
+      return;
+    }
+    const path = defaultProjectFolderPath(projectFolders);
+    setProjectFolder(path);
+    setLoadAgentsMd(
+      agentsMdDefaultOn(projectFolders.find((folder) => folder.path === path)),
+    );
+  }, [projectFolders]);
+
+  const selectedFolder =
+    projectFolders?.find((folder) => folder.path === projectFolder) ?? null;
+
   const handleSubmit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     reportActivity("submit");
@@ -166,6 +239,8 @@ function CreateTaskCard(props: {
       workerPin,
       topology,
       swarmWorkers,
+      projectFolder,
+      loadAgentsMd,
     });
     if (!parsed.ok) {
       setFormError(parsed.error);
@@ -228,6 +303,130 @@ function CreateTaskCard(props: {
                 }
               }}
             />
+          </div>
+
+          <div className="space-y-1.5">
+            <label
+              className="type-label font-semibold text-foreground"
+              htmlFor="create-project-folder"
+            >
+              Project folder
+            </label>
+
+            {projectFolders === null &&
+            projectFoldersError === null &&
+            !projectFoldersUnavailable ? (
+              <p className="type-meta text-muted-foreground">
+                Loading project folders…
+              </p>
+            ) : null}
+
+            {projectFoldersUnavailable ? (
+              <p className="rounded-md border border-warning/30 bg-warning/8 px-2.5 py-1.5 type-meta text-warning">
+                Project folders are not available on this server. Tasks still
+                create in the legacy workspace — the form is not blocked.
+              </p>
+            ) : null}
+
+            {projectFoldersError !== null ? (
+              <p className="rounded-md border border-warning/30 bg-warning/8 px-2.5 py-1.5 type-meta text-warning">
+                Could not load project folders ({projectFoldersError}). Tasks
+                still create in the legacy workspace — the form is not blocked.
+              </p>
+            ) : null}
+
+            {projectFolders !== null && projectFolders.length === 0 ? (
+              <p className="rounded-md border border-border bg-surface-subtle px-2.5 py-1.5 type-meta text-muted-foreground">
+                No project folders configured — tasks use the legacy
+                workspace.
+              </p>
+            ) : null}
+
+            {projectFolders !== null && projectFolders.length > 0 ? (
+              <>
+                <select
+                  id="create-project-folder"
+                  className="w-full rounded-md border-input bg-card type-body"
+                  value={projectFolder}
+                  onChange={(event) => {
+                    const next = event.target.value;
+                    setProjectFolder(next);
+                    const folder =
+                      projectFolders.find((entry) => entry.path === next) ??
+                      null;
+                    setLoadAgentsMd(agentsMdDefaultOn(folder));
+                    if (formError !== null) {
+                      setFormError(null);
+                    }
+                  }}
+                >
+                  <option value={PROJECT_FOLDER_UNSET}>
+                    Legacy workspace (no folder)
+                  </option>
+                  {projectFolders.map((folder) => (
+                    <option key={folder.path} value={folder.path}>
+                      {folder.name} — {folder.path}
+                    </option>
+                  ))}
+                </select>
+
+                {selectedFolder !== null ? (
+                  <>
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 type-meta text-muted-foreground">
+                      <span
+                        className="min-w-0 break-all type-mono"
+                        title={selectedFolder.path}
+                      >
+                        {selectedFolder.path}
+                      </span>
+                      <Badge
+                        variant={
+                          selectedFolder.agents_md_present ? "success" : "muted"
+                        }
+                      >
+                        {selectedFolder.agents_md_present
+                          ? "AGENTS.md present"
+                          : "No AGENTS.md"}
+                      </Badge>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 pt-0.5">
+                      <label className="flex cursor-pointer items-center gap-2 type-table text-foreground">
+                        <Checkbox
+                          checked={loadAgentsMd}
+                          disabled={!selectedFolder.agents_md_present}
+                          onCheckedChange={(checked) =>
+                            setLoadAgentsMd(checked === true)
+                          }
+                          aria-describedby="create-agents-md-note"
+                        />
+                        Load AGENTS.md
+                      </label>
+                      {selectedFolder.agents_md_present ? (
+                        <span
+                          id="create-agents-md-note"
+                          className="type-meta text-muted-foreground"
+                        >
+                          Planner-only guidance from the project folder.
+                        </span>
+                      ) : (
+                        <span
+                          id="create-agents-md-note"
+                          className="type-meta text-muted-foreground/80"
+                        >
+                          No AGENTS.md found
+                        </span>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <p className="type-meta text-muted-foreground">
+                    No project folder selected — the task uses the legacy
+                    workspace.
+                  </p>
+                )}
+              </>
+            ) : null}
           </div>
 
           {profiles === null && profilesError === null ? (

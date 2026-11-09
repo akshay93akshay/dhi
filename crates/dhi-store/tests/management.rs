@@ -414,7 +414,7 @@ async fn profile_delete_guards_404_conflict(pool: PgPool) {
     ));
     // A task pin also protects a non-active profile.
     let task = store
-        .create_task_with_pins("pinned", Some(spare), None, None, None)
+        .create_task_with_pins(dhi_core::NewTask::new("pinned").with_pins(Some(spare), None))
         .await
         .unwrap();
     assert!(matches!(
@@ -447,11 +447,8 @@ async fn task_pins_persist_and_resolve_through_pool(pool: PgPool) {
 
     let task = store
         .create_task_with_pins(
-            "mate in two",
-            Some(boxed),
-            Some(settings.worker_profile_id),
-            None,
-            None,
+            dhi_core::NewTask::new("mate in two")
+                .with_pins(Some(boxed), Some(settings.worker_profile_id)),
         )
         .await
         .unwrap();

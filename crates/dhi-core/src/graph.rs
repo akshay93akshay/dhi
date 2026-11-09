@@ -4,11 +4,11 @@
 //! engine testable with an in-memory store.
 
 use crate::{
-    Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, Fact, FactId, Goal, GoalId,
-    GuardDecision, GuardDecisionId, GuardVerdict, Intent, IntentId, IntentPlan, IntentState,
-    NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus, SideQuestionRequest,
-    SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task, TaskCapacity, TaskId,
-    TaskInstruction, TaskState, ToolCall, ToolCallId, Topology,
+    Activity, AgentRun, AgentsMdState, Approval, ApprovalDecision, ApprovalId, Fact, FactId, Goal,
+    GoalId, GuardDecision, GuardDecisionId, GuardVerdict, Intent, IntentId, IntentPlan,
+    IntentState, NewSideQuestionRequest, NewTask, ReopenOutcome, ResultRecord, ResultStatus,
+    SideQuestionRequest, SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task,
+    TaskCapacity, TaskId, TaskInstruction, TaskState, ToolCall, ToolCallId,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -22,18 +22,22 @@ pub trait GraphStore: Send + Sync {
     async fn create_task(&self, goal: String) -> anyhow::Result<Task>;
 
     /// Like [`GraphStore::create_task`] with optional per-task role pins, a
-    /// creation-time topology, and an optional swarm worker count. `None`
-    /// keeps the task on the role's default chain, leaves topology to the
-    /// planner, or leaves the swarm size to the planner. A present pin must
-    /// reference an existing `llm_profiles` row (the caller validates).
-    async fn create_task_with_pins(
+    /// creation-time topology, an optional swarm worker count, and the
+    /// project/instructions selection. `None` keeps the task on the role's
+    /// default chain, leaves topology to the planner, or leaves the swarm
+    /// size to the planner. A present pin must reference an existing
+    /// `llm_profiles` row (the caller validates).
+    async fn create_task_with_pins(&self, task: NewTask) -> anyhow::Result<Task>;
+
+    /// Records the instruction-file state found when a task start reads (or
+    /// skips) its project `AGENTS.md`. Test stores may ignore this.
+    async fn set_task_agents_md_state(
         &self,
-        goal: String,
-        planner_pin: Option<i64>,
-        worker_pin: Option<i64>,
-        topology: Option<Topology>,
-        swarm_workers: Option<usize>,
-    ) -> anyhow::Result<Task>;
+        _task_id: TaskId,
+        _state: AgentsMdState,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     async fn get_task(&self, id: TaskId) -> anyhow::Result<Option<Task>>;
     async fn list_tasks(&self, limit: i64) -> anyhow::Result<Vec<Task>>;

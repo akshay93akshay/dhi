@@ -31,7 +31,8 @@ Use only the output mechanism this role is given. Never answer in JSON text.\n";
 
 /// The only variables this crate defines: `goal`, `goals`, `facts`,
 /// `open_intents`, `failures`, `required_topology`, `swarm_workers`,
-/// `instructions`, `intent`, `context`. Nothing else is renderable.
+/// `instructions`, `project_instructions`, `intent`, `context`. Nothing else
+/// is renderable.
 pub const DECLARED_VARIABLES: &[&str] = &[
     "goal",
     "goals",
@@ -41,6 +42,7 @@ pub const DECLARED_VARIABLES: &[&str] = &[
     "required_topology",
     "swarm_workers",
     "instructions",
+    "project_instructions",
     "intent",
     "context",
 ];
@@ -62,6 +64,9 @@ pub struct PlannerVars {
     pub swarm_workers: String,
     /// Pending human instructions, one bullet each, or `none`.
     pub instructions: String,
+    /// The conditional planner-only `AGENTS.md` section, or empty when no
+    /// project instructions were loaded.
+    pub project_instructions: String,
 }
 
 /// Variables of one worker render. The intent text goes in the system prompt.
@@ -83,10 +88,11 @@ impl PlannerVars {
             "required_topology": self.required_topology,
             "swarm_workers": self.swarm_workers,
             "instructions": self.instructions,
+            "project_instructions": self.project_instructions,
         })
     }
 
-    fn pairs(&self) -> [(&'static str, String); 8] {
+    fn pairs(&self) -> [(&'static str, String); 9] {
         [
             ("goal", self.goal.clone()),
             ("goals", self.goals.clone()),
@@ -96,6 +102,7 @@ impl PlannerVars {
             ("required_topology", self.required_topology.clone()),
             ("swarm_workers", self.swarm_workers.clone()),
             ("instructions", self.instructions.clone()),
+            ("project_instructions", self.project_instructions.clone()),
         ]
     }
 }
@@ -360,6 +367,7 @@ mod tests {
             required_topology: "none".to_string(),
             swarm_workers: "none".to_string(),
             instructions: "- focus on the endgame first".to_string(),
+            project_instructions: String::new(),
         }
     }
 
@@ -423,6 +431,23 @@ mod tests {
         for tool in WORKER_RETIRED_TOOLS {
             assert!(!worker.contains(tool), "worker still names `{tool}`");
         }
+    }
+
+    #[test]
+    fn project_instructions_are_conditional_in_the_planner_turn() {
+        let set = loaded();
+        let mut vars = planner_vars();
+        let (_, user) = set.render_planner(&vars).unwrap();
+        assert!(!user.contains("Project instructions (AGENTS.md)"));
+
+        vars.project_instructions = "## Project instructions (AGENTS.md)\n\nuse tabs".to_string();
+        let (_, user) = set.render_planner(&vars).unwrap();
+        assert!(user.contains("Project instructions (AGENTS.md)"));
+        assert!(user.contains("use tabs"));
+
+        let worker = set.render_worker(&worker_vars()).unwrap();
+        assert!(!worker.0.contains("Project instructions (AGENTS.md)"));
+        assert!(!worker.1.contains("Project instructions (AGENTS.md)"));
     }
 
     #[test]

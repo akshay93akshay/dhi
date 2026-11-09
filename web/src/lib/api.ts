@@ -29,6 +29,8 @@ import type {
   PoolResetInput,
   PoolStatus,
   ProfilesResponse,
+  ProjectFolder,
+  ProjectFoldersResponse,
   RulesResponse,
   SaveProfileInput,
   SaveProfileResponse,
@@ -158,6 +160,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function getHealth(): Promise<Health> {
   return request<Health>("/health");
+}
+
+/** Unwraps the `{ folders: [...] }` envelope of `GET /api/project-folders`. */
+export function listProjectFolders(): Promise<ProjectFolder[]> {
+  return request<ProjectFoldersResponse>("/project-folders").then(
+    (response) => response.folders,
+  );
 }
 
 export function listTasks(opts?: { limit?: number }): Promise<Task[]> {

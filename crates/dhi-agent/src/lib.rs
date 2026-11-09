@@ -90,6 +90,11 @@ pub struct PlanInput {
     /// engine never injects them into a worker prompt.
     #[serde(default)]
     pub instructions: Vec<String>,
+    /// The project's bounded `AGENTS.md` text, read once when the task starts.
+    /// Planner-only: [`ExecuteInput`] deliberately has no such field, so a
+    /// worker prompt can never receive project instructions.
+    #[serde(default)]
+    pub project_instructions: Option<String>,
 }
 
 /// What one planner call decided.
@@ -1003,6 +1008,9 @@ impl RigAgentRuntime {
                 .swarm_workers
                 .map_or_else(|| "none".to_string(), |count| count.to_string()),
             instructions: instruction_lines(&input.instructions),
+            project_instructions: project_instructions_section(
+                input.project_instructions.as_deref(),
+            ),
         };
         let (system, user) = self.prompts.render_planner(&vars)?;
         Ok(self.rendered(Role::Planner, system, user))
@@ -1395,6 +1403,24 @@ fn instruction_lines(instructions: &[String]) -> String {
     } else {
         bullet_list(instructions)
     }
+}
+
+/// The conditional planner-only `AGENTS.md` section.
+///
+/// The whole section is empty when the task has no project instructions, so
+/// a missing file adds no prompt section at all. The text is already capped by
+/// `dhi_core::read_agents_md`.
+fn project_instructions_section(instructions: Option<&str>) -> String {
+    let Some(instructions) = instructions.map(str::trim).filter(|text| !text.is_empty()) else {
+        return String::new();
+    };
+    format!(
+        "## Project instructions (AGENTS.md)\n\n\
+         The selected project provides the following instructions. Apply them \
+         as planning guidance. The user goal and the DHI+ safety rules override \
+         these instructions whenever they conflict.\n\n\
+         <AGENTS.md>\n{instructions}\n</AGENTS.md>"
+    )
 }
 
 /// Minimal templates for [`RigAgentRuntime::new`], which resolves no file. A
@@ -2256,6 +2282,7 @@ mod tests {
             required_topology: None,
             swarm_workers: None,
             instructions: vec![],
+            project_instructions: None,
         }
     }
 
@@ -2303,6 +2330,70 @@ mod tests {
             call.prompt_hash,
             runtime.prompts().planner.version(Role::Planner)
         );
+    }
+
+    #[test]
+    fn planner_render_includes_project_instructions_only_when_present() {
+        let runtime = runtime_with("river-planner", "river-worker");
+
+        let plain = runtime.render_plan(&plan_input()).expect("renders");
+        assert!(
+            !plain.user.contains("Project instructions (AGENTS.md)"),
+            "no section without project instructions: {}",
+            plain.user
+        );
+        assert!(!plain.user.contains("PROJECT-MARKER"));
+
+        let mut input = plan_input();
+        input.project_instructions = Some("PROJECT-MARKER: use tabs".to_string());
+        let with_project = runtime.render_plan(&input).expect("renders");
+        assert!(
+            with_project
+                .user
+                .contains("Project instructions (AGENTS.md)"),
+            "{}",
+            with_project.user
+        );
+        assert!(
+            with_project.user.contains("PROJECT-MARKER: use tabs"),
+            "{}",
+            with_project.user
+        );
+        assert!(
+            with_project
+                .user
+                .contains("user goal and the DHI+ safety rules override"),
+            "the override rule must be stated: {}",
+            with_project.user
+        );
+
+        let mut empty = plan_input();
+        empty.project_instructions = Some("   ".to_string());
+        let empty = runtime.render_plan(&empty).expect("renders");
+        assert!(!empty.user.contains("Project instructions (AGENTS.md)"));
+    }
+
+    #[test]
+    fn worker_render_never_includes_project_instructions() {
+        let runtime = runtime_with("river-planner", "river-worker");
+        let mut plan = plan_input();
+        plan.project_instructions = Some("PROJECT-MARKER: planner only".to_string());
+        let planned = runtime.render_plan(&plan).expect("renders");
+        assert!(planned.user.contains("PROJECT-MARKER: planner only"));
+
+        let worker = runtime.render_execute(&execute_input()).expect("renders");
+        assert!(!worker.system.contains("PROJECT-MARKER"));
+        assert!(!worker.user.contains("PROJECT-MARKER"));
+        assert!(!worker.system.contains("Project instructions (AGENTS.md)"));
+        assert!(
+            worker.system.contains("/project")
+                && worker.system.contains("read-only")
+                && worker.system.contains("/work")
+                && worker.system.contains("writable"),
+            "the worker prompt states the project/work path rules: {}",
+            worker.system
+        );
+        assert!(!worker.system.contains("/work/AGENTS.md"));
     }
 
     #[test]

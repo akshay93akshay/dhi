@@ -588,6 +588,19 @@ export function swarmMessageRound(payload: unknown): number | null {
 }
 
 /**
+ * Display label for one swarm round.
+ *
+ * Seed messages carry no round id because the initial worker turn runs before
+ * the numbered peer rounds. That turn is the first round of the run, so it
+ * reads "Round 1 (seed)" instead of the old "Round ?" placeholder.
+ */
+export function swarmRoundLabel(round: number | null | undefined): string {
+  return round === null || round === undefined
+    ? "Round 1 (seed)"
+    : `Round ${round}`;
+}
+
+/**
  * Parses one API record into a display view. Rows without a usable numeric
  * id are rejected (React keys and ordering depend on it); every other field
  * degrades to a safe default.
@@ -702,6 +715,8 @@ export type SwarmSenderGroup = {
 /** One round inside a swarm run, split by sender. */
 export type SwarmRoundGroup = {
   round: number | null;
+  /** Display label; a null round is the seed turn ("Round 1 (seed)"). */
+  label: string;
   senders: SwarmSenderGroup[];
   counts: SwarmCounts;
 };
@@ -729,11 +744,12 @@ function compareRounds(a: number | null, b: number | null): number {
   if (a === b) {
     return 0;
   }
+  // The seed turn has no stored round id and always precedes round 1+.
   if (a === null) {
-    return 1;
+    return -1;
   }
   if (b === null) {
-    return -1;
+    return 1;
   }
   return a - b;
 }
@@ -768,8 +784,8 @@ function firstMessageId(messages: readonly SwarmMessageView[]): number {
  * - when the keys span more than one run, runs are ordered by their first
  *   message id and labelled "Run 1", "Run 2", …; a single run is labelled
  *   "Swarm run";
- * - inside a run, rounds sort ascending with the unknown round last, senders
- *   sort alphabetically (unknown last), and messages sort by id;
+ * - inside a run, rounds sort ascending with the seed turn (null) first,
+ *   senders sort alphabetically (unknown last), and messages sort by id;
  * - `peerCount` is the number of distinct senders in the run minus one;
  * - repeated findings were already marked by {@link parseSwarmMessages}.
  */
@@ -827,6 +843,7 @@ export function groupSwarmRuns(
       const all = senderGroups.flatMap((group) => group.messages);
       rounds.push({
         round,
+        label: swarmRoundLabel(round),
         senders: senderGroups,
         counts: swarmMessageCounts(all),
       });

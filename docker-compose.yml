@@ -30,6 +30,7 @@ services:
       DHI_WEB_DIR: /app/web/out
       DHI_WORKSPACE_ROOT: /app/workspace
       DHI_WORKSPACE_HOST_ROOT: ${DHI_WORKSPACE_HOST_ROOT:-${PWD}/workspace}
+      DHI_PROJECT_FOLDERS: ${DHI_PROJECT_FOLDERS:-}
       RUST_LOG: dhi=info,tower_http=info
       DHI_LLM_BASE_URL: ${DHI_LLM_BASE_URL:-}
       DHI_LLM_API_KEY: ${DHI_LLM_API_KEY:-}
@@ -41,6 +42,10 @@ services:
     volumes:
       - ./workspace:/app/workspace
       - /var/run/docker.sock:/var/run/docker.sock
+      # Mount each folder listed in DHI_PROJECT_FOLDERS at the same absolute
+      # path, read-write. Repeat one line per folder. See README "Project
+      # folders". Example:
+      # - /srv/projects/build:/srv/projects/build
     restart: unless-stopped
 
 volumes:

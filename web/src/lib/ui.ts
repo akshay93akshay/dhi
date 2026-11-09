@@ -9,9 +9,11 @@
 
 import { ApiError } from "./api.ts";
 import type {
+  AgentsMdState,
   CreateTaskInput,
   Health,
   JsonObject,
+  ProjectFolder,
   TaskTopology,
 } from "./types.ts";
 
@@ -195,6 +197,9 @@ export function provenanceDetailText(view: ProvenanceView): string | null {
 /** Select value that means "no pin — use the role's pool default". */
 export const PIN_UNSET = "";
 
+/** Select value that means "no project folder — legacy workspace mode". */
+export const PROJECT_FOLDER_UNSET = "";
+
 /**
  * Validates the goal field: trimmed non-empty text is required (the server
  * rejects empty-after-trim goals with `400`). Returns an error message, or
@@ -213,6 +218,62 @@ export function parsePin(raw: string): number | null {
   return /^\d+$/.test(trimmed) ? Number(trimmed) : null;
 }
 
+/**
+ * Selector default for the project-folder picker: exactly one available
+ * folder is preselected; zero or several leave the picker on legacy workspace
+ * mode so the active folder is an explicit choice.
+ */
+export function defaultProjectFolderPath(
+  folders: readonly ProjectFolder[],
+): string {
+  return folders.length === 1 ? folders[0].path : PROJECT_FOLDER_UNSET;
+}
+
+/**
+ * Default of the "Load AGENTS.md" toggle for a selected folder: on only when
+ * the folder actually carries the file.
+ */
+export function agentsMdDefaultOn(
+  folder: ProjectFolder | null | undefined,
+): boolean {
+  return folder?.agents_md_present === true;
+}
+
+/**
+ * Human label for a task's `agents_md_state`, or `null` for legacy tasks and
+ * older servers that omit the field.
+ */
+export function agentsMdStateLabel(
+  state: AgentsMdState | null | undefined,
+): string | null {
+  switch (state) {
+    case "loaded":
+      return "AGENTS.md loaded";
+    case "truncated":
+      return "AGENTS.md truncated";
+    case "not_found":
+      return "No AGENTS.md";
+    case "disabled":
+      return "AGENTS.md off";
+    default:
+      return null;
+  }
+}
+
+/** Badge tone matching {@link agentsMdStateLabel}. */
+export function agentsMdStateVariant(
+  state: AgentsMdState | null | undefined,
+): "success" | "warning" | "muted" {
+  switch (state) {
+    case "loaded":
+      return "success";
+    case "truncated":
+      return "warning";
+    default:
+      return "muted";
+  }
+}
+
 /** Raw create-form state (HTML inputs hand us strings). */
 export type CreateFormValues = {
   goal: string;
@@ -222,6 +283,10 @@ export type CreateFormValues = {
   topology?: string;
   /** Create-form Workers value; blank means Auto (send `null`). */
   swarmWorkers?: string;
+  /** Selected project folder path; blank means legacy workspace mode. */
+  projectFolder?: string;
+  /** Create-form Load AGENTS.md toggle. */
+  loadAgentsMd?: boolean;
 };
 
 /** Select options for the create-task topology picker, in display order. */
@@ -318,6 +383,8 @@ export type CreateFormResult =
  *   the selected enum value;
  * - `swarm_workers` is ALWAYS sent: the selected 2–8 count only when the
  *   topology is `swarm`, otherwise (and for Auto) `null`.
+ * - `project_folder` and `load_agents_md` are sent together only when a
+ *   folder is selected; legacy workspace mode omits both fields entirely.
  */
 export function buildCreateTaskInput(
   values: CreateFormValues,
@@ -340,6 +407,11 @@ export function buildCreateTaskInput(
   const worker = parsePin(values.workerPin);
   if (worker !== null) {
     input.worker_profile_id = worker;
+  }
+  const projectFolder = (values.projectFolder ?? "").trim();
+  if (projectFolder !== PROJECT_FOLDER_UNSET) {
+    input.project_folder = projectFolder;
+    input.load_agents_md = values.loadAgentsMd === true;
   }
   return { ok: true, input };
 }

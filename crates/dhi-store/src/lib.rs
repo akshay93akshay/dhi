@@ -5,12 +5,12 @@
 
 use chrono::{DateTime, Utc};
 use dhi_core::{
-    Activity, AgentRole, AgentRun, Approval, ApprovalDecision, ApprovalId, ApprovalStatus,
-    CheckpointId, CoreError, Fact, FactState, Goal, GoalState, GuardDecision, GuardVerdict, Intent,
-    IntentId, IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord,
-    ResultStatus, RunId, SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus,
-    SideQuestionStatus, SideQuestionThread, SwarmMessageRecord, Task, TaskCapacity, TaskId,
-    TaskInstruction, TaskState, ToolCall, ToolCallId, Topology,
+    Activity, AgentRole, AgentRun, AgentsMdState, Approval, ApprovalDecision, ApprovalId,
+    ApprovalStatus, CheckpointId, CoreError, Fact, FactState, Goal, GoalState, GuardDecision,
+    GuardVerdict, Intent, IntentId, IntentPlan, IntentState, NewSideQuestionRequest, NewTask,
+    ReopenOutcome, ResultRecord, ResultStatus, RunId, SideQuestionRequest, SideQuestionSession,
+    SideQuestionSessionStatus, SideQuestionStatus, SideQuestionThread, SwarmMessageRecord, Task,
+    TaskCapacity, TaskId, TaskInstruction, TaskState, ToolCall, ToolCallId, Topology,
 };
 use sqlx::{FromRow, PgPool};
 use std::collections::HashMap;
@@ -74,27 +74,26 @@ impl Store {
     }
 
     pub async fn create_task(&self, goal: &str) -> Result<Task, StoreError> {
-        self.create_task_with_pins(goal, None, None, None, None)
-            .await
+        self.create_task_with_pins(NewTask::new(goal)).await
     }
 
-    /// Pins, topology, and the swarm worker count are validated by the caller
-    /// (`profile_exists` and the API range); the SQL foreign keys enforce the
-    /// pin invariant.
-    pub async fn create_task_with_pins(
-        &self,
-        goal: &str,
-        planner_pin: Option<i64>,
-        worker_pin: Option<i64>,
-        topology: Option<Topology>,
-        swarm_workers: Option<usize>,
-    ) -> Result<Task, StoreError> {
-        let mut task = Task::new(goal);
+    /// Pins, topology, the swarm worker count, and the project selection are
+    /// validated by the caller; the SQL foreign keys enforce the pin
+    /// invariant.
+    pub async fn create_task_with_pins(&self, new: NewTask) -> Result<Task, StoreError> {
+        let mut task = Task::new(new.goal.clone());
+        if let Some(id) = new.id {
+            task.id = id;
+        }
         // The returned task must describe the persisted row, pins included.
-        task.pinned_planner_profile_id = planner_pin;
-        task.pinned_worker_profile_id = worker_pin;
-        task.topology = topology;
-        task.swarm_workers = swarm_workers;
+        task.pinned_planner_profile_id = new.planner_pin;
+        task.pinned_worker_profile_id = new.worker_pin;
+        task.topology = new.topology;
+        task.swarm_workers = new.swarm_workers;
+        task.project_folder = new.project_folder;
+        task.load_agents_md = new.load_agents_md;
+        task.agents_md_state = new.agents_md_state;
+        task.refresh_task_folder();
         let origin = task.origin_fact();
         let capacity =
             serde_json::to_value(task.capacity).expect("task capacity is always serializable");
@@ -103,19 +102,23 @@ impl Store {
         sqlx::query(
             "INSERT INTO tasks (id, goal, state, exploration_id, origin_fact_id, \
              pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, \
-             swarm_workers, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             swarm_workers, project_folder, load_agents_md, agents_md_state, \
+             created_at, updated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
         )
         .bind(task.id)
         .bind(&task.goal)
         .bind(task.state.as_str())
         .bind(task.exploration_id)
         .bind(task.origin_fact_id)
-        .bind(planner_pin)
-        .bind(worker_pin)
+        .bind(new.planner_pin)
+        .bind(new.worker_pin)
         .bind(capacity)
         .bind(task.topology.map(Topology::as_str))
         .bind(task.swarm_workers.map(|count| count as i32))
+        .bind(&task.project_folder)
+        .bind(task.load_agents_md)
+        .bind(task.agents_md_state.as_str())
         .bind(task.created_at)
         .bind(task.updated_at)
         .execute(&mut *tx)
@@ -154,6 +157,7 @@ impl Store {
         let row = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, state, exploration_id, origin_fact_id, \
                     pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
+                    project_folder, load_agents_md, agents_md_state, \
                     created_at, updated_at
              FROM tasks WHERE id = $1",
         )
@@ -167,6 +171,7 @@ impl Store {
         let rows = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, state, exploration_id, origin_fact_id, \
                     pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
+                    project_folder, load_agents_md, agents_md_state, \
                     created_at, updated_at
              FROM tasks ORDER BY created_at DESC LIMIT $1",
         )
@@ -226,6 +231,7 @@ impl Store {
              WHERE id = $1
              RETURNING id, goal, state, exploration_id, origin_fact_id, \
                        pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
+                    project_folder, load_agents_md, agents_md_state, \
                        created_at, updated_at",
         )
         .bind(task_id)
@@ -234,6 +240,25 @@ impl Store {
         .await?
         .ok_or_else(|| StoreError::NotFound(format!("task {task_id}")))?;
         Task::try_from(row)
+    }
+
+    /// Records the instruction state read at task start. Missing tasks are a
+    /// normal `NotFound` error.
+    pub async fn set_task_agents_md_state(
+        &self,
+        task_id: TaskId,
+        state: AgentsMdState,
+    ) -> Result<(), StoreError> {
+        let result =
+            sqlx::query("UPDATE tasks SET agents_md_state = $2, updated_at = now() WHERE id = $1")
+                .bind(task_id)
+                .bind(state.as_str())
+                .execute(&self.pool)
+                .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound(format!("task {task_id}")));
+        }
+        Ok(())
     }
 
     /// Deletes one terminal task and every task-owned row that cascades from
@@ -363,6 +388,7 @@ impl Store {
         let row = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, state, exploration_id, origin_fact_id, \
                     pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
+                    project_folder, load_agents_md, agents_md_state, \
                     created_at, updated_at
              FROM tasks WHERE id = $1 FOR UPDATE",
         )
@@ -415,6 +441,7 @@ impl Store {
              WHERE id = $1
              RETURNING id, goal, state, exploration_id, origin_fact_id, \
                        pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
+                    project_folder, load_agents_md, agents_md_state, \
                        created_at, updated_at",
         )
         .bind(task_id)
@@ -1718,6 +1745,9 @@ struct TaskRow {
     capacity: serde_json::Value,
     topology: Option<String>,
     swarm_workers: Option<i32>,
+    project_folder: Option<String>,
+    load_agents_md: bool,
+    agents_md_state: String,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -1740,6 +1770,10 @@ impl TryFrom<TaskRow> for Task {
             swarm_workers: r
                 .swarm_workers
                 .and_then(|count| usize::try_from(count).ok()),
+            task_folder: Task::task_folder_for(r.project_folder.as_deref(), r.id),
+            project_folder: r.project_folder,
+            load_agents_md: r.load_agents_md,
+            agents_md_state: parse_agents_md_state(&r.agents_md_state)?,
             created_at: r.created_at,
             updated_at: r.updated_at,
         })
@@ -2170,6 +2204,10 @@ fn parse_topology(s: &str) -> Result<Topology, StoreError> {
         "swarm" => Ok(Topology::Swarm),
         other => Err(StoreError::InvalidValue(format!("task topology {other}"))),
     }
+}
+
+fn parse_agents_md_state(s: &str) -> Result<AgentsMdState, StoreError> {
+    AgentsMdState::parse(s).ok_or_else(|| StoreError::InvalidValue(format!("agents_md_state {s}")))
 }
 
 fn parse_goal_state(s: &str) -> Result<GoalState, StoreError> {

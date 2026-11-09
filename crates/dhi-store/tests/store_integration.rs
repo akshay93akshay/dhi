@@ -5,8 +5,8 @@
 //! allowed to create databases.
 
 use dhi_core::{
-    CapabilityLimits, CoreError, FactState, IntentPlan, IntentState, Subtask, TaskCapacity,
-    TaskState, Topology, WorkerSpec,
+    AgentsMdState, CapabilityLimits, CoreError, FactState, IntentPlan, IntentState, NewTask,
+    Subtask, TaskCapacity, TaskState, Topology, WorkerSpec,
 };
 use dhi_store::{Store, StoreError};
 use sqlx::PgPool;
@@ -28,6 +28,105 @@ async fn create_task_writes_one_origin_fact(pool: PgPool) {
     assert_eq!(facts[0].id, task.origin_fact_id);
     assert_eq!(facts[0].state, FactState::Origin);
     assert_eq!(facts[0].task_id, task.id);
+}
+
+/// A task created without a project keeps the legacy row defaults through
+/// every read path. This is the compatibility contract for old tasks: the
+/// migration backfills project_folder null, load_agents_md false, and
+/// agents_md_state disabled.
+#[sqlx::test]
+async fn legacy_tasks_keep_project_fields_unset(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store.create_task("legacy task").await.unwrap();
+
+    for row in [
+        task.clone(),
+        store.get_task(task.id).await.unwrap().expect("task exists"),
+        store
+            .list_tasks(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == task.id)
+            .expect("task is listed"),
+    ] {
+        assert_eq!(row.project_folder, None);
+        assert_eq!(row.task_folder, None);
+        assert!(!row.load_agents_md);
+        assert_eq!(row.agents_md_state, AgentsMdState::Disabled);
+    }
+}
+
+/// A row inserted the way a pre-migration task row looked gets the column
+/// defaults: no project, the toggle off, and `disabled`.
+#[sqlx::test]
+async fn migration_defaults_apply_to_a_row_without_project_columns(pool: PgPool) {
+    let store = Store::new(pool);
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO tasks (id, goal, state, exploration_id, origin_fact_id)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(id)
+    .bind("pre-migration task")
+    .bind("created")
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .execute(store.pool())
+    .await
+    .unwrap();
+
+    let task = store.get_task(id).await.unwrap().expect("legacy row loads");
+    assert_eq!(task.project_folder, None);
+    assert_eq!(task.task_folder, None);
+    assert!(!task.load_agents_md);
+    assert_eq!(task.agents_md_state, AgentsMdState::Disabled);
+}
+
+/// Project selection and instruction state round-trip through the task row,
+/// and the derived task folder follows the project id rule.
+#[sqlx::test]
+async fn project_task_fields_round_trip(pool: PgPool) {
+    let store = Store::new(pool);
+    let project = "/srv/projects/build".to_string();
+    let task = store
+        .create_task_with_pins(NewTask::new("project task").with_project(
+            project.clone(),
+            true,
+            AgentsMdState::Loaded,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(task.project_folder.as_deref(), Some(project.as_str()));
+    let expected_folder = std::path::Path::new(&project)
+        .join(".dhi")
+        .join(task.id.to_string())
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(task.task_folder.as_deref(), Some(expected_folder.as_str()));
+    assert!(task.load_agents_md);
+    assert_eq!(task.agents_md_state, AgentsMdState::Loaded);
+
+    let persisted = store.get_task(task.id).await.unwrap().expect("task exists");
+    assert_eq!(persisted.project_folder, task.project_folder);
+    assert_eq!(persisted.task_folder, task.task_folder);
+    assert!(persisted.load_agents_md);
+    assert_eq!(persisted.agents_md_state, AgentsMdState::Loaded);
+
+    store
+        .set_task_agents_md_state(task.id, AgentsMdState::Truncated)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .get_task(task.id)
+            .await
+            .unwrap()
+            .expect("task exists")
+            .agents_md_state,
+        AgentsMdState::Truncated
+    );
 }
 
 /// The claim is a single atomic `UPDATE ... WHERE state = 'open'`.
@@ -550,7 +649,11 @@ async fn task_topology_round_trips_and_survives_capacity_and_reopen(pool: PgPool
     );
 
     let task = store
-        .create_task_with_pins("swarm task", None, None, Some(Topology::Swarm), Some(4))
+        .create_task_with_pins(
+            dhi_core::NewTask::new("swarm task")
+                .with_topology(Some(Topology::Swarm))
+                .with_swarm_workers(Some(4)),
+        )
         .await
         .unwrap();
     assert_eq!(task.topology, Some(Topology::Swarm));

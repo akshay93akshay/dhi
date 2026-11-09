@@ -359,8 +359,10 @@ export default function TasksPage() {
             </span>
             <Button
               type="button"
-              variant="destructive"
-              className="h-8 rounded-full px-3"
+              variant={selectedCount === 0 ? "outline" : "destructive"}
+              className={`h-8 rounded-full px-3${
+                selectedCount === 0 ? " text-muted-foreground" : ""
+              }`}
               onClick={() => {
                 setActionError(null);
                 setDeleteTarget(null);
@@ -368,7 +370,9 @@ export default function TasksPage() {
               }}
               disabled={selectedCount === 0 || deleting}
             >
-              Delete selected ({selectedCount})
+              {selectedCount === 0
+                ? "Delete selected"
+                : `Delete selected (${selectedCount})`}
             </Button>
           </div>
         </CardHeader>

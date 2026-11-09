@@ -19,3 +19,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 dhi-testkit = { path = "../dhi-testkit" }
+tempfile.workspace = true

@@ -56,6 +56,7 @@ import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/ui/copy-button";
 import { MarkdownMath } from "@/components/markdown-math";
 import { StateBadge, stateVariant } from "@/components/ui/state-badge";
+import { useColorMode } from "@/components/use-color-mode";
 
 const KIND_ORDER: readonly TaskGraphNodeKind[] = [
   "origin",
@@ -377,6 +378,7 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
     [model.nodes],
   );
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const colorMode = useColorMode();
 
   // Polling can remove the selected record; close the inspector instead of
   // showing a stale snapshot that no longer exists on the graph.
@@ -475,7 +477,8 @@ export function TaskGraph({ work }: { work: TaskWork | null }) {
           aria-label={`Task work graph for ${work.task.goal}`}
         >
           <ReactFlow
-            className="h-full w-full"
+            className="dhi-flow h-full w-full"
+            colorMode={colorMode}
             edges={flow.edges}
             edgeTypes={EDGE_TYPES}
             edgesReconnectable={false}

@@ -8,12 +8,13 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use chrono::Utc;
 use dhi_core::{
-    Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, ApprovalStatus, CoreError, Fact,
-    FactId, FactState, Goal, GoalState, GraphStore, GuardDecision, GuardDecisionId, GuardStore,
-    GuardVerdict, Intent, IntentId, IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome,
-    ResultRecord, ResultStatus, RunId, SideQuestionRequest, SideQuestionSession,
-    SideQuestionSessionStatus, SideQuestionStatus, SideQuestionThread, SwarmMessageRecord, Task,
-    TaskCapacity, TaskId, TaskInstruction, TaskState, ToolCall, ToolCallId,
+    Activity, AgentRun, AgentsMdState, Approval, ApprovalDecision, ApprovalId, ApprovalStatus,
+    CoreError, Fact, FactId, FactState, Goal, GoalState, GraphStore, GuardDecision,
+    GuardDecisionId, GuardStore, GuardVerdict, Intent, IntentId, IntentPlan, IntentState,
+    NewSideQuestionRequest, NewTask, ReopenOutcome, ResultRecord, ResultStatus, RunId,
+    SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus, SideQuestionStatus,
+    SideQuestionThread, SwarmMessageRecord, Task, TaskCapacity, TaskId, TaskInstruction, TaskState,
+    ToolCall, ToolCallId,
 };
 use uuid::Uuid;
 
@@ -202,7 +203,24 @@ impl GraphStore for MemoryStore {
     /// Creates a task the way the Postgres store does: the task row, its
     /// origin fact, and one `task_created` activity in a single step.
     async fn create_task(&self, goal: String) -> anyhow::Result<Task> {
-        let task = Task::new(goal);
+        self.create_task_with_pins(NewTask::new(goal)).await
+    }
+
+    /// Memory twin of the pinned create: the creation-time fields ride on the
+    /// task.
+    async fn create_task_with_pins(&self, new: NewTask) -> anyhow::Result<Task> {
+        let mut task = Task::new(new.goal.clone());
+        if let Some(id) = new.id {
+            task.id = id;
+        }
+        task.pinned_planner_profile_id = new.planner_pin;
+        task.pinned_worker_profile_id = new.worker_pin;
+        task.topology = new.topology;
+        task.swarm_workers = new.swarm_workers;
+        task.project_folder = new.project_folder;
+        task.load_agents_md = new.load_agents_md;
+        task.agents_md_state = new.agents_md_state;
+        task.refresh_task_folder();
         let origin = task.origin_fact();
         let mut inner = self.inner.lock().unwrap();
         inner.facts.insert(origin.id, origin);
@@ -220,32 +238,17 @@ impl GraphStore for MemoryStore {
         Ok(task)
     }
 
-    /// Memory twin of the pinned create: the pins ride on the task.
-    async fn create_task_with_pins(
+    async fn set_task_agents_md_state(
         &self,
-        goal: String,
-        planner_pin: Option<i64>,
-        worker_pin: Option<i64>,
-        topology: Option<dhi_core::Topology>,
-        swarm_workers: Option<usize>,
-    ) -> anyhow::Result<Task> {
-        let task = self.create_task(goal).await?;
+        task_id: TaskId,
+        state: AgentsMdState,
+    ) -> anyhow::Result<()> {
         let mut inner = self.inner.lock().unwrap();
-        let stored = inner
-            .tasks
-            .get_mut(&task.id)
-            .expect("the task create just inserted the row");
-        stored.pinned_planner_profile_id = planner_pin;
-        stored.pinned_worker_profile_id = worker_pin;
-        stored.topology = topology;
-        stored.swarm_workers = swarm_workers;
-        drop(inner);
-        let mut task = task;
-        task.pinned_planner_profile_id = planner_pin;
-        task.pinned_worker_profile_id = worker_pin;
-        task.topology = topology;
-        task.swarm_workers = swarm_workers;
-        Ok(task)
+        if let Some(task) = inner.tasks.get_mut(&task_id) {
+            task.agents_md_state = state;
+            task.updated_at = Utc::now();
+        }
+        Ok(())
     }
 
     async fn get_task(&self, id: TaskId) -> anyhow::Result<Option<Task>> {

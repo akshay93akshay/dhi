@@ -6,7 +6,11 @@
  * the selected/recipient highlighting, and both layouts without a DOM.
  */
 
-import { swarmKindLabel, type SwarmMessageView } from "./workTeam.ts";
+import {
+  swarmKindLabel,
+  swarmRoundLabel,
+  type SwarmMessageView,
+} from "./workTeam.ts";
 import type { SwarmRoundGroup, SwarmRunGroup } from "./workTeam.ts";
 
 /** Circle for six workers or fewer; a centered grid above that. */
@@ -69,6 +73,8 @@ export type SwarmGraphModel = {
   nodes: SwarmGraphNode[];
   edges: SwarmGraphEdge[];
   chips: SwarmGraphChip[];
+  /** Shared round label; matches the run's selector (`Round 1 (seed)`, …). */
+  roundLabel: string;
   selected: SwarmMessageView | null;
   /** Sender of the selected message, or null when the round is empty. */
   sender: string | null;
@@ -199,6 +205,7 @@ export function buildSwarmGraph(
     nodes,
     edges,
     chips,
+    roundLabel: round.label || swarmRoundLabel(round.round),
     selected,
     sender,
     recipients,

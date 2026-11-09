@@ -46,7 +46,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Output;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +66,13 @@ use uuid::Uuid;
 
 /// Where the one mounted task folder appears inside a container.
 const CONTAINER_WORK: &str = "/work";
+
+/// Where the selected project root is mounted read-only in project mode.
+const CONTAINER_PROJECT: &str = "/project";
+
+/// Empty read-only tmpfs that hides `<project>/.dhi` in project mode, so one
+/// task can never see another task's folder through the project mount.
+const PROJECT_DHI_TMPFS: &str = "/project/.dhi:ro,noexec,nosuid,size=64k";
 
 /// Where the task's spill directory is mounted read-only inside a container.
 const CONTAINER_SPILL: &str = "/work/.dhi/spill";
@@ -161,13 +168,17 @@ fn env_or(name: &str, fallback: &str) -> String {
 /// reachable.
 #[derive(Debug, Clone)]
 pub struct TaskRuntime {
-    /// The task's directory on the host, `root/<task-id>`.
+    /// The task's directory on the host: `root/<task-id>` in legacy mode, or
+    /// `<project>/.dhi/<task-id>` in project mode.
     pub host_dir: PathBuf,
     /// The directory the tools resolve paths against: `/work` in container
     /// mode, the host task directory in local mode.
     pub base: PathBuf,
     /// Where every file operation and shell command runs.
     pub workspace: Arc<dyn Workspace>,
+    /// The project root as the tools name it: `/project` in container mode,
+    /// the host project directory in local test mode. `None` is legacy mode.
+    pub project_dir: Option<PathBuf>,
     /// The [`Seen`] shared by this task's reads, writes and edits.
     pub seen: Seen,
     /// Where this task's cut output is kept.
@@ -208,6 +219,10 @@ pub struct TaskContainers {
     cache: Mutex<HashMap<Uuid, Arc<TaskRuntime>>>,
     /// One async mutex per task that serializes `ensure` and `remove`.
     starting: Mutex<HashMap<Uuid, Arc<AsyncMutex<()>>>>,
+    /// Project folder per task. A task in this map gets
+    /// `<project>/.dhi/<task-id>` as its host work directory and a read-only
+    /// `/project` mount; a task without an entry keeps legacy mode.
+    projects: Mutex<HashMap<Uuid, PathBuf>>,
     /// Set by `shutdown`; no new runtime starts after it.
     closed: AtomicBool,
 }
@@ -247,6 +262,7 @@ impl TaskContainers {
             mode,
             cache: Mutex::new(HashMap::new()),
             starting: Mutex::new(HashMap::new()),
+            projects: Mutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
         })
     }
@@ -291,6 +307,182 @@ impl TaskContainers {
         &self.root
     }
 
+    /// Selects project mode for `task_id`, or clears it when `project` is
+    /// `None`.
+    ///
+    /// The folder must be an absolute real directory and is canonicalized
+    /// here. A project task's host work directory is
+    /// `<project>/.dhi/<task-id>`; its container also mounts `<project>` at
+    /// `/project` read-only. The mapping is set before the task's first tool
+    /// call and is immutable for the task's life.
+    pub fn set_task_project(&self, task_id: Uuid, project: Option<&Path>) -> io::Result<()> {
+        let mut projects = self.projects.lock().unwrap_or_else(PoisonError::into_inner);
+        match project {
+            None => {
+                projects.remove(&task_id);
+                Ok(())
+            }
+            Some(project) => {
+                if !project.is_absolute() {
+                    // Keep the task in project mode even on this failure, so
+                    // a later tool call cannot silently fall back to legacy
+                    // workspace mode.
+                    projects.insert(task_id, project.to_path_buf());
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "project folder {} must be an absolute path",
+                            project.display()
+                        ),
+                    ));
+                }
+                let metadata = fs::symlink_metadata(project).map_err(|err| {
+                    projects.insert(task_id, project.to_path_buf());
+                    io::Error::new(
+                        err.kind(),
+                        format!(
+                            "project folder {} cannot be inspected: {err}",
+                            project.display()
+                        ),
+                    )
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    projects.insert(task_id, project.to_path_buf());
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "project folder {} is not a real directory",
+                            project.display()
+                        ),
+                    ));
+                }
+                let canonical = fs::canonicalize(project).map_err(|err| {
+                    projects.insert(task_id, project.to_path_buf());
+                    io::Error::new(
+                        err.kind(),
+                        format!(
+                            "project folder {} cannot be resolved: {err}",
+                            project.display()
+                        ),
+                    )
+                })?;
+                projects.insert(task_id, canonical);
+                Ok(())
+            }
+        }
+    }
+
+    fn task_project(&self, task_id: Uuid) -> Option<PathBuf> {
+        self.projects
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&task_id)
+            .cloned()
+    }
+
+    /// Refuses a `/project` read whose real target is outside the project or
+    /// inside the hidden `.dhi` directory.
+    ///
+    /// In Docker mode this runs `realpath -e` inside the task container,
+    /// because `rig-tools`' remote workspace canonicalizes `..` lexically and
+    /// does not resolve symbolic links. In local mode `fs::canonicalize` does
+    /// the same job on the host path. A missing path is left to the tool so it
+    /// returns its normal not-found error. Paths outside `/project` are
+    /// ignored.
+    pub async fn verify_project_read(&self, task_id: Uuid, requested: &str) -> anyhow::Result<()> {
+        if self.task_project(task_id).is_none() {
+            return Ok(());
+        }
+        if project_request_relative(requested).is_none() {
+            return Ok(());
+        }
+        match self.mode {
+            Mode::Local => self.verify_local_project_read(task_id, requested),
+            Mode::Docker => self.verify_docker_project_read(task_id, requested).await,
+        }
+    }
+
+    fn verify_local_project_read(&self, task_id: Uuid, requested: &str) -> anyhow::Result<()> {
+        let Some(project) = self.task_project(task_id) else {
+            return Ok(());
+        };
+        let Some(relative) = project_request_relative(requested) else {
+            return Ok(());
+        };
+        let Ok(root) = fs::canonicalize(&project) else {
+            // The project disappeared after task creation; the tool will
+            // report the same missing path.
+            return Ok(());
+        };
+        let candidate = if relative.is_empty() {
+            root.clone()
+        } else {
+            root.join(relative)
+        };
+        let resolved = match fs::canonicalize(&candidate) {
+            Ok(resolved) => resolved,
+            // A missing path is the file tool's normal not-found error.
+            Err(_) => return Ok(()),
+        };
+        if !resolved.starts_with(&root) {
+            bail!(
+                "refusing to read {requested}: its real path {} is outside the project {}",
+                resolved.display(),
+                root.display()
+            );
+        }
+        let hidden = root.join(".dhi");
+        if resolved == hidden || resolved.starts_with(&hidden) {
+            bail!("refusing to read {requested}: the project .dhi directory is hidden");
+        }
+        Ok(())
+    }
+
+    async fn verify_docker_project_read(
+        &self,
+        task_id: Uuid,
+        requested: &str,
+    ) -> anyhow::Result<()> {
+        let name = container_name(task_id);
+        let mut command = Command::new("docker");
+        command
+            .arg("exec")
+            .arg(&name)
+            .arg("realpath")
+            .arg("-e")
+            .arg("--")
+            .arg(requested);
+        let output = run_docker(
+            command,
+            INSPECT_TIMEOUT,
+            &format!("resolve {requested} in container {name}"),
+        )
+        .await?;
+        if !output.status.success() {
+            // A missing path is the tool's normal not-found error. Docker or
+            // exec failures are also left to the tool's own path check.
+            return Ok(());
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let resolved = stdout.trim();
+        if resolved.is_empty() {
+            return Ok(());
+        }
+        let resolved = Path::new(resolved);
+        let root = Path::new(CONTAINER_PROJECT);
+        if resolved != root && !resolved.starts_with(root) {
+            bail!(
+                "refusing to read {requested}: its real path {} is outside {CONTAINER_PROJECT}",
+                resolved.display()
+            );
+        }
+        let hidden = root.join(".dhi");
+        if resolved == hidden.as_path() || resolved.starts_with(&hidden) {
+            bail!("refusing to read {requested}: {CONTAINER_PROJECT}/.dhi is hidden");
+        }
+        Ok(())
+    }
+
     /// The Docker container name for `task_id`.
     ///
     /// This is the name [`ensure`](Self::ensure) starts and checks. It is
@@ -325,11 +517,20 @@ impl TaskContainers {
             return Ok(runtime);
         }
 
-        let host_dir = prepare_task_dir(&self.root, task_id)
-            .map_err(|err| anyhow!("cannot prepare the task directory for {task_id}: {err}"))?;
+        let project = self.task_project(task_id);
+        let host_dir = match project.as_deref() {
+            Some(project) => prepare_project_task_dir(project, task_id).map_err(|err| {
+                anyhow!("cannot prepare the project task directory for {task_id}: {err}")
+            })?,
+            None => prepare_task_dir(&self.root, task_id)
+                .map_err(|err| anyhow!("cannot prepare the task directory for {task_id}: {err}"))?,
+        };
         let runtime = match self.mode {
-            Mode::Local => self.local_runtime(host_dir)?,
-            Mode::Docker => self.docker_runtime(task_id, host_dir).await?,
+            Mode::Local => self.local_runtime(host_dir, project.as_deref())?,
+            Mode::Docker => {
+                self.docker_runtime(task_id, host_dir, project.as_deref())
+                    .await?
+            }
         };
         let runtime = Arc::new(runtime);
         self.cache
@@ -552,7 +753,11 @@ impl TaskContainers {
         )
     }
 
-    fn local_runtime(&self, host_dir: PathBuf) -> anyhow::Result<TaskRuntime> {
+    fn local_runtime(
+        &self,
+        host_dir: PathBuf,
+        project: Option<&Path>,
+    ) -> anyhow::Result<TaskRuntime> {
         let spill = Spill(validate_private_dir(
             &host_dir.join(".dhi").join("spill"),
             "task spill directory",
@@ -561,6 +766,7 @@ impl TaskContainers {
             base: host_dir.clone(),
             host_dir,
             workspace: Arc::new(Local),
+            project_dir: project.map(Path::to_path_buf),
             seen: Seen::default(),
             spill,
             is_container: false,
@@ -571,6 +777,7 @@ impl TaskContainers {
         &self,
         task_id: Uuid,
         host_dir: PathBuf,
+        project: Option<&Path>,
     ) -> anyhow::Result<TaskRuntime> {
         // The `.dhi` directory and its spill subdirectory are the host paths
         // the container gets read-only, separately from the read-write task
@@ -597,7 +804,7 @@ impl TaskContainers {
         }
         self.start_container(
             task_id,
-            &task_mounts(&self.root, self.host_root.as_deref(), task_id),
+            &task_mounts(&self.root, self.host_root.as_deref(), task_id, project),
         )
         .await?;
 
@@ -623,6 +830,7 @@ impl TaskContainers {
             base: PathBuf::from(CONTAINER_WORK),
             host_dir,
             workspace,
+            project_dir: project.map(|_| PathBuf::from(CONTAINER_PROJECT)),
             seen: Seen::default(),
             spill: Spill(spill),
             is_container: true,
@@ -700,7 +908,14 @@ impl TaskContainers {
             .arg("--cpus")
             .arg(&self.config.cpus)
             .arg("--network")
-            .arg(&self.config.network)
+            .arg(&self.config.network);
+        if let Some(project) = &mounts.project {
+            command.arg("--tmpfs").arg(PROJECT_DHI_TMPFS);
+            command
+                .arg("-v")
+                .arg(mount_spec(project, CONTAINER_PROJECT, "ro"));
+        }
+        command
             .arg("-v")
             .arg(work_mount)
             .arg("-v")
@@ -963,15 +1178,46 @@ struct TaskMounts {
     dhi: PathBuf,
     /// The task spill directory, mounted read-only at [`CONTAINER_SPILL`].
     spill: PathBuf,
+    /// The selected project root, mounted read-only at [`CONTAINER_PROJECT`].
+    project: Option<PathBuf>,
+}
+
+/// The path below `/project`, or `None` when `requested` is not a `/project`
+/// path. `/project` itself is the empty relative path; `/project-x` is not a
+/// match.
+fn project_request_relative(requested: &str) -> Option<&str> {
+    let rest = requested.strip_prefix(CONTAINER_PROJECT)?;
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return None;
+    }
+    Some(rest.trim_start_matches('/'))
 }
 
 /// The host paths Docker mounts for `task_id`.
-fn task_mounts(root: &Path, host_root: Option<&Path>, task_id: Uuid) -> TaskMounts {
-    let task = host_root.unwrap_or(root).join(task_id.to_string());
+///
+/// Deployment requirement: project bind sources are passed to Docker exactly
+/// as configured in `DHI_PROJECT_FOLDERS`. The server process and the Docker
+/// daemon must therefore see the project folder at the same absolute path.
+/// Unlike the legacy workspace root, project folders have no host-root
+/// remapping variable; configure the same path on both sides.
+fn task_mounts(
+    root: &Path,
+    host_root: Option<&Path>,
+    task_id: Uuid,
+    project: Option<&Path>,
+) -> TaskMounts {
+    let (work, project) = match project {
+        Some(project) => (
+            project.join(".dhi").join(task_id.to_string()),
+            Some(project.to_path_buf()),
+        ),
+        None => (host_root.unwrap_or(root).join(task_id.to_string()), None),
+    };
     TaskMounts {
-        work: task.clone(),
-        dhi: task.join(".dhi"),
-        spill: task.join(".dhi").join("spill"),
+        dhi: work.join(".dhi"),
+        spill: work.join(".dhi").join("spill"),
+        work,
+        project,
     }
 }
 
@@ -1011,9 +1257,73 @@ fn stderr_of(output: &Output) -> String {
 /// Creates `root/<task-id>` and its private subdirectories, then validates
 /// every one of them.
 fn prepare_task_dir(root: &Path, task_id: Uuid) -> io::Result<PathBuf> {
-    let expected = root.join(task_id.to_string());
-    create_private_dir(&expected)?;
-    let dir = validate_private_dir(&expected, "task directory")?;
+    prepare_task_dir_at(&root.join(task_id.to_string()))
+}
+
+/// Creates a project-mode task folder at `<project>/.dhi/<task-id>`.
+///
+/// The project's `.dhi` directory and its `.gitignore` (containing `*`) are
+/// created when absent. An existing `.gitignore` is never overwritten. The
+/// task folder must be writable by the task container user; a failure is
+/// reported with the folder path and uid/gid.
+pub fn prepare_project_task_dir(project: &Path, task_id: Uuid) -> io::Result<PathBuf> {
+    let metadata = fs::symlink_metadata(project).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "project folder {} cannot be inspected: {err}",
+                project.display()
+            ),
+        )
+    })?;
+    if metadata.file_type().is_symlink() {
+        return Err(integrity_error(format!(
+            "project folder {} is a symbolic link; refusing to use it",
+            project.display()
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(integrity_error(format!(
+            "project folder {} is not a directory",
+            project.display()
+        )));
+    }
+    let project = fs::canonicalize(project)?;
+
+    let dhi_path = project.join(".dhi");
+    create_private_dir(&dhi_path)?;
+    let dhi = validate_private_dir(&dhi_path, "project .dhi directory").map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot use the project .dhi directory: {err}"),
+        )
+    })?;
+    if !dhi.starts_with(&project) {
+        return Err(integrity_error(format!(
+            "project .dhi directory {} resolved outside the project {}",
+            dhi.display(),
+            project.display()
+        )));
+    }
+    create_gitignore_if_absent(&dhi)?;
+
+    let expected = dhi.join(task_id.to_string());
+    let dir = prepare_task_dir_at(&expected)?;
+    if !dir.starts_with(&dhi) {
+        return Err(integrity_error(format!(
+            "project task folder {} resolved outside {}",
+            dir.display(),
+            dhi.display()
+        )));
+    }
+    check_task_folder_writable(&dir)?;
+    Ok(dir)
+}
+
+/// Creates and validates one task directory with its private layout.
+fn prepare_task_dir_at(expected: &Path) -> io::Result<PathBuf> {
+    create_private_dir(expected)?;
+    let dir = validate_private_dir(expected, "task directory")?;
     if dir != expected {
         return Err(integrity_error(format!(
             "task directory {} resolved to {}, not {}",
@@ -1036,6 +1346,58 @@ fn prepare_task_dir(root: &Path, task_id: Uuid) -> io::Result<PathBuf> {
         }
     }
     Ok(dir)
+}
+
+/// Writes `*` into `<dhi>/.gitignore` only when the file does not exist.
+fn create_gitignore_if_absent(dhi: &Path) -> io::Result<()> {
+    let path = dhi.join(".gitignore");
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+    {
+        Ok(mut file) => {
+            if let Err(err) = file.write_all(b"*\n") {
+                drop(file);
+                let _ = fs::remove_file(&path);
+                return Err(io::Error::new(
+                    err.kind(),
+                    format!("cannot write {}: {err}", path.display()),
+                ));
+            }
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        Err(err) => Err(io::Error::new(
+            err.kind(),
+            format!("cannot create {}: {err}", path.display()),
+        )),
+    }
+}
+
+/// Proves the task container user can write in the task folder.
+fn check_task_folder_writable(dir: &Path) -> io::Result<()> {
+    let probe = dir.join(format!(".dhi-write-check-{}", Uuid::new_v4()));
+    let user = container_user().unwrap_or_else(|| "the container user".to_string());
+    if let Err(err) = fs::write(&probe, b"ok") {
+        return Err(io::Error::new(
+            err.kind(),
+            format!(
+                "task folder {} is not writable by the task container user ({user}): {err}",
+                dir.display()
+            ),
+        ));
+    }
+    fs::remove_file(&probe).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "task folder {} is not writable by the task container user ({user}): \
+                 cannot remove the write probe: {err}",
+                dir.display()
+            ),
+        )
+    })
 }
 
 /// Creates `path` and any missing parent with private permissions on Unix.
@@ -1292,13 +1654,178 @@ mod tests {
         assert_eq!(runtime.spill.0, runtime.host_dir.join(".dhi/spill"));
     }
 
+    #[tokio::test]
+    async fn project_mode_creates_the_task_folder_and_gitignore_without_deleting_on_shutdown() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("AGENTS.md"), "project rules").unwrap();
+        let task = Uuid::new_v4();
+        let containers = TaskContainers::local(temp.path().join("tasks")).unwrap();
+        containers.set_task_project(task, Some(&project)).unwrap();
+
+        let runtime = containers.ensure(task).await.unwrap();
+        let canonical_project = fs::canonicalize(&project).unwrap();
+        let expected = canonical_project.join(".dhi").join(task.to_string());
+        assert_eq!(runtime.host_dir, expected);
+        assert_eq!(runtime.base, expected);
+        assert!(expected.join(".home").is_dir());
+        assert!(expected.join(".dhi/spill").is_dir());
+
+        let gitignore = canonical_project.join(".dhi").join(".gitignore");
+        assert_eq!(fs::read_to_string(&gitignore).unwrap(), "*\n");
+
+        // An existing .gitignore is never overwritten.
+        fs::write(&gitignore, "custom\n").unwrap();
+        containers.remove(task).await.unwrap();
+        containers.ensure(task).await.unwrap();
+        assert_eq!(fs::read_to_string(&gitignore).unwrap(), "custom\n");
+
+        containers.shutdown().await.unwrap();
+        assert!(expected.is_dir(), "shutdown keeps the task folder");
+        assert!(
+            expected.join(".dhi/spill").is_dir(),
+            "shutdown keeps the task layout"
+        );
+        assert_eq!(fs::read_to_string(&gitignore).unwrap(), "custom\n");
+        assert_eq!(
+            fs::read_to_string(canonical_project.join("AGENTS.md")).unwrap(),
+            "project rules"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_project_dot_dhi_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, project.join(".dhi")).unwrap();
+        let task = Uuid::new_v4();
+
+        let err =
+            prepare_project_task_dir(&project, task).expect_err("a symlinked .dhi is refused");
+        assert!(err.to_string().contains("symbolic link"), "{err}");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unusable_project_folder_never_falls_back_to_legacy_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let containers = TaskContainers::local(temp.path().join("tasks")).unwrap();
+        let task = Uuid::new_v4();
+        let missing = temp.path().join("missing-project");
+
+        let err = containers
+            .set_task_project(task, Some(&missing))
+            .expect_err("a missing project folder is refused");
+        assert!(err.to_string().contains("cannot be inspected"), "{err}");
+
+        let err = containers
+            .ensure(task)
+            .await
+            .expect_err("the task stays in project mode and fails");
+        assert!(err.to_string().contains("project"), "{err}");
+        assert!(
+            !containers.root().join(task.to_string()).exists(),
+            "no legacy task folder may be created for a project task"
+        );
+    }
+
+    #[test]
+    fn project_mounts_use_the_project_task_folder_and_read_only_root() {
+        let task = Uuid::new_v4();
+        let root = Path::new("/app/workspace");
+        let host = Path::new("/srv/dhi/workspace");
+        let project = Path::new("/srv/repos/build");
+
+        let mounts = task_mounts(root, Some(host), task, Some(project));
+
+        assert_eq!(mounts.work, project.join(".dhi").join(task.to_string()));
+        assert_eq!(
+            mounts.dhi,
+            project.join(".dhi").join(task.to_string()).join(".dhi")
+        );
+        assert_eq!(
+            mounts.spill,
+            project
+                .join(".dhi")
+                .join(task.to_string())
+                .join(".dhi")
+                .join("spill")
+        );
+        assert_eq!(mounts.project.as_deref(), Some(project));
+        assert_eq!(PROJECT_DHI_TMPFS, "/project/.dhi:ro,noexec,nosuid,size=64k");
+        assert!(
+            PROJECT_DHI_TMPFS.starts_with("/project/.dhi:ro"),
+            "the sibling task folders are hidden by a read-only tmpfs"
+        );
+        assert_ne!(
+            mounts.work,
+            host.join(task.to_string()),
+            "project mode never falls back to the legacy workspace root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_read_verification_refuses_symlinks_and_hidden_dhi() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let outside = temp.path().join("outside.txt");
+        fs::create_dir_all(project.join(".dhi")).unwrap();
+        fs::write(project.join("ok.txt"), "ok\n").unwrap();
+        fs::write(&outside, "secret\n").unwrap();
+        fs::write(project.join(".dhi").join("sibling.txt"), "sibling\n").unwrap();
+        symlink(&outside, project.join("escape.txt")).unwrap();
+
+        let containers = TaskContainers::local(temp.path().join("tasks")).unwrap();
+        let task = Uuid::new_v4();
+        containers.set_task_project(task, Some(&project)).unwrap();
+
+        containers
+            .verify_project_read(task, "/project/ok.txt")
+            .await
+            .expect("a regular project file is allowed");
+        containers
+            .verify_project_read(task, "/project/missing.txt")
+            .await
+            .expect("a missing path is left to the tool");
+        containers
+            .verify_project_read(task, "/project-x/anything")
+            .await
+            .expect("a path outside /project is ignored");
+
+        for path in [
+            "/project/escape.txt",
+            "/project/../outside.txt",
+            "/project/.dhi/sibling.txt",
+        ] {
+            let err = containers
+                .verify_project_read(task, path)
+                .await
+                .expect_err("a project read may not escape or enter .dhi");
+            let text = err.to_string();
+            assert!(
+                text.contains("outside") || text.contains("hidden"),
+                "{path}: {text}"
+            );
+        }
+    }
+
     #[test]
     fn docker_mounts_follow_the_host_root() {
         let task = Uuid::new_v4();
         let root = Path::new("/app/workspace");
         let host = Path::new("/srv/dhi/workspace");
 
-        let mounts = task_mounts(root, Some(host), task);
+        let mounts = task_mounts(root, Some(host), task, None);
 
         assert_eq!(mounts.work, host.join(task.to_string()));
         assert_eq!(mounts.dhi, host.join(task.to_string()).join(".dhi"));
@@ -1306,6 +1833,7 @@ mod tests {
             mounts.spill,
             host.join(task.to_string()).join(".dhi").join("spill")
         );
+        assert_eq!(mounts.project, None);
     }
 
     #[test]
@@ -1313,11 +1841,12 @@ mod tests {
         let task = Uuid::new_v4();
         let root = Path::new("/app/workspace");
 
-        let mounts = task_mounts(root, None, task);
+        let mounts = task_mounts(root, None, task, None);
 
         assert_eq!(mounts.work, root.join(task.to_string()));
         assert_eq!(mounts.dhi, root.join(task.to_string()).join(".dhi"));
         assert_eq!(mounts.spill, root.join(task.to_string()).join(".dhi/spill"));
+        assert_eq!(mounts.project, None);
     }
 
     #[test]

@@ -1,0 +1,3 @@
+ALTER TABLE tasks ADD COLUMN project_folder TEXT;
+ALTER TABLE tasks ADD COLUMN load_agents_md BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE tasks ADD COLUMN agents_md_state TEXT NOT NULL DEFAULT 'disabled';

@@ -21,6 +21,7 @@ import {
   TASK_GRAPH_RELATION_LABELS,
   buildTaskGraphFlow,
   findTaskGraphFlowNode,
+  taskGraphFlowEdgeLabelStyles,
   taskGraphNodeText,
 } from "./taskGraphFlow.ts";
 import type {
@@ -716,6 +717,27 @@ test("buildTaskGraphFlow keeps edges as labelled smoothstep arrows", () => {
       (edge) => typeof edge.label === "string" && !edge.label.includes("_"),
     ),
   );
+});
+
+test("flow relation labels use a high-contrast themed pill", () => {
+  const work = taskGraphFixture();
+  const model = buildTaskGraph(work);
+  const flow = buildTaskGraphFlow(model, layoutTaskGraph(model.nodes));
+  const styles = taskGraphFlowEdgeLabelStyles();
+
+  assert.equal(styles.labelStyle.fill, "var(--foreground)");
+  assert.equal(styles.labelBgStyle.fill, "var(--card)");
+  assert.equal(styles.labelBgStyle.stroke, "var(--border)");
+  assert.equal(styles.labelBgStyle.fillOpacity, 1);
+  assert.deepEqual(styles.labelBgPadding, [8, 4]);
+  assert.equal(styles.labelBgBorderRadius, 6);
+
+  for (const edge of flow.edges) {
+    assert.deepEqual(edge.labelStyle, styles.labelStyle);
+    assert.deepEqual(edge.labelBgStyle, styles.labelBgStyle);
+    assert.deepEqual(edge.labelBgPadding, styles.labelBgPadding);
+    assert.equal(edge.labelBgBorderRadius, styles.labelBgBorderRadius);
+  }
 });
 
 test("flow edges pick handles that route around the goal and fact columns", () => {

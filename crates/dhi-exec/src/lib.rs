@@ -14,19 +14,21 @@
 //!
 //! # Design B: one container per task
 //!
-//! Every task gets its own Docker container, named `dhi-task-<task-id>`. The
-//! only host paths visible in it are the task's own folder,
+//! Every task gets its own Docker container, named `dhi-task-<task-id>`. In
+//! legacy mode the only host paths visible in it are the task's own folder,
 //! `root/<task-id>`, mounted at `/work` read-write, and its private `.dhi`
 //! folder and `.dhi/spill` folder, mounted at `/work/.dhi` and
-//! `/work/.dhi/spill` read-only. The nested read-only mounts are what keep
+//! `/work/.dhi/spill` read-only. In project mode the task folder is
+//! `<project>/.dhi/<task-id>` at `/work`, and the selected project root is
+//! mounted read-only at `/project`. The nested read-only mounts are what keep
 //! the container from replacing the spill folder, or the `.dhi` folder that
 //! contains it, with a symbolic link and making the host spill writer write
 //! elsewhere. The container runs read-only apart from `/work` and a tmpfs at
 //! `/tmp`, drops all capabilities, sets `no-new-privileges`, limits memory,
 //! memory-plus-swap, CPUs, open files, and process count, and runs as the
 //! invoking user (on Unix). It has no Docker socket, no host root, no host
-//! home, and no repository mount, and no host environment secrets are passed
-//! in.
+//! home, and no repository write mount, and no host environment secrets are
+//! passed in.
 //!
 //! All coding tools run **inside** that container. The file tools and the
 //! shell use a [`rig_tools::remote::Remote`] workspace whose transport is
@@ -98,5 +100,5 @@ mod container;
 mod tools;
 
 pub use backend::CodingBackend;
-pub use container::{ContainerConfig, TaskContainers, TaskRuntime};
+pub use container::{ContainerConfig, TaskContainers, TaskRuntime, prepare_project_task_dir};
 pub use tools::{CodingTools, SCOPE_MAC_FIELD, TASK_ID_FIELD, ToolDefinition, tool_definitions};

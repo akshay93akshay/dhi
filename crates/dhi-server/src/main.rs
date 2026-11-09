@@ -393,6 +393,14 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Validate the project folder list before touching the database: an
+    // invalid DHI_PROJECT_FOLDERS fails startup with the offending entry.
+    let project_folders = Arc::new(dhi_server::project_folders::ProjectFolders::from_env()?);
+    info!(
+        folders = ?project_folders.paths(),
+        "project folders configured"
+    );
+
     let app_dsn = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://dhi_app:dhi_app@127.0.0.1:5432/dhi".to_string());
     let migration_dsn = std::env::var("MIGRATION_DATABASE_URL").unwrap_or_else(|_| app_dsn.clone());
@@ -786,6 +794,7 @@ async fn main() -> anyhow::Result<()> {
         tool_control,
         web: web_runtime,
         task_runs,
+        project_folders,
     };
 
     let bind = std::env::var("DHI_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());

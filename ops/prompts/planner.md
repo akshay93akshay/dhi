@@ -88,6 +88,8 @@ or plan you add; worker prompts never include them. Lines are oldest first:
 
 {{instructions}}
 
+{{project_instructions}}
+
 Open goals follow. Each line carries the full goal id and its state:
 
 {{goals}}

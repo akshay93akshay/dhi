@@ -31,6 +31,7 @@ import {
   parseSwarmMessages,
   swarmKindLabel,
   swarmMessageCounts,
+  swarmRoundLabel,
   type SwarmMessageView,
 } from "@/lib/workTeam";
 import {
@@ -49,6 +50,7 @@ import {
 } from "@/components/ui/card";
 import { CopyButton } from "@/components/ui/copy-button";
 import { MarkdownMath } from "@/components/markdown-math";
+import { useColorMode } from "@/components/use-color-mode";
 
 /** Badge tone per persisted swarm kind; unknown kinds stay neutral. */
 function kindVariant(kind: string): "success" | "info" | "warning" | "muted" {
@@ -117,6 +119,14 @@ type WorkerNodeData = {
   recipient: boolean;
 };
 
+/**
+ * Fixed node box. The height fits the sender chip, the message count, and the
+ * optional sender/recipient line (with padding and border); the height is
+ * declared on the node as well as its style so the MiniMap can draw it.
+ */
+const SWARM_NODE_WIDTH = 176;
+const SWARM_NODE_HEIGHT = 88;
+
 /** Default React Flow nodes with worker labels and selected/recipient tone. */
 function buildFlowNodes(model: SwarmGraphModel): Node<WorkerNodeData>[] {
   return model.nodes.map((node) => {
@@ -126,13 +136,15 @@ function buildFlowNodes(model: SwarmGraphModel): Node<WorkerNodeData>[] {
     return {
       id: node.id,
       position: node.position,
+      width: SWARM_NODE_WIDTH,
+      height: SWARM_NODE_HEIGHT,
       data: {
         sender,
         count,
         selected,
         recipient,
         label: (
-          <div className="flex w-[150px] flex-col items-center gap-1">
+          <div className="flex h-full w-[150px] flex-col items-center justify-center gap-1">
             <span className="mono max-w-full truncate font-semibold leading-tight">
               {sender}
             </span>
@@ -151,7 +163,8 @@ function buildFlowNodes(model: SwarmGraphModel): Node<WorkerNodeData>[] {
         ),
       },
       style: {
-        width: 176,
+        width: SWARM_NODE_WIDTH,
+        height: SWARM_NODE_HEIGHT,
         cursor: "pointer",
         padding: "8px 10px",
         borderRadius: 12,
@@ -283,6 +296,7 @@ export function SwarmMessagesCard(props: { taskId: string }) {
   const [selectedMessageId, setSelectedMessageId] = useState<number | null>(
     null,
   );
+  const colorMode = useColorMode();
 
   const mounted = useRef(true);
   const seq = useRef(0);
@@ -486,7 +500,7 @@ export function SwarmMessagesCard(props: { taskId: string }) {
                           setSelectedMessageId(null);
                         }}
                       >
-                        {round.round === null ? "Round ?" : `Round ${round.round}`}
+                        {swarmRoundLabel(round.round)}
                       </SelectorButton>
                     ))}
                   </div>
@@ -539,9 +553,15 @@ export function SwarmMessagesCard(props: { taskId: string }) {
                       ))}
                     </div>
 
-                    <div className="h-[420px] w-full overflow-hidden rounded-lg border border-border bg-surface-subtle">
+                    <div
+                      aria-label={`${model.roundLabel} message graph`}
+                      className="h-[420px] w-full overflow-hidden rounded-lg border border-border bg-surface-subtle"
+                      role="group"
+                    >
                       <ReactFlow
                         key={selectedRun.runId || `run-${activeRunIndex}`}
+                        className="dhi-flow h-full w-full"
+                        colorMode={colorMode}
                         edges={flowEdges}
                         elementsSelectable={false}
                         fitView

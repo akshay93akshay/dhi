@@ -38,6 +38,7 @@ import {
 } from "@/components/dhi-brand-status";
 import { RecentActivityFeed } from "@/app/_components/ActivityLog";
 import { MarkdownMath } from "@/components/markdown-math";
+import { ProjectContext } from "@/components/project-context";
 import { SideQuestions } from "./SideQuestions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -372,6 +373,7 @@ function TaskDetail() {
           <span aria-hidden="true">·</span>
           <span>updated {formatLocalTimestamp(task.updated_at)}</span>
         </div>
+        <ProjectContext task={task} className="mt-2" />
         <div className="mt-5 flex flex-wrap items-center gap-2">
           <Button asChild size="sm" className="rounded-full">
             <Link href={`/tasks/${task.id}/work`}>

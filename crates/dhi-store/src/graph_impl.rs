@@ -4,11 +4,11 @@ use std::pin::Pin;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use dhi_core::{
-    Activity, AgentRun, Approval, ApprovalDecision, ApprovalId, Fact, FactId, Goal, GoalId,
-    GraphStore, GuardDecision, GuardDecisionId, GuardStore, GuardVerdict, Intent, IntentId,
-    IntentPlan, IntentState, NewSideQuestionRequest, ReopenOutcome, ResultRecord, ResultStatus,
-    SideQuestionRequest, SideQuestionSession, SideQuestionThread, SwarmMessageRecord, Task,
-    TaskCapacity, TaskId, TaskInstruction, TaskState, ToolCall, ToolCallId,
+    Activity, AgentRun, AgentsMdState, Approval, ApprovalDecision, ApprovalId, Fact, FactId, Goal,
+    GoalId, GraphStore, GuardDecision, GuardDecisionId, GuardStore, GuardVerdict, Intent, IntentId,
+    IntentPlan, IntentState, NewSideQuestionRequest, NewTask, ReopenOutcome, ResultRecord,
+    ResultStatus, SideQuestionRequest, SideQuestionSession, SideQuestionThread, SwarmMessageRecord,
+    Task, TaskCapacity, TaskId, TaskInstruction, TaskState, ToolCall, ToolCallId,
 };
 use uuid::Uuid;
 
@@ -20,23 +20,16 @@ impl GraphStore for Store {
         Ok(Store::create_task(self, &goal).await?)
     }
 
-    async fn create_task_with_pins(
+    async fn create_task_with_pins(&self, task: NewTask) -> anyhow::Result<Task> {
+        Ok(Store::create_task_with_pins(self, task).await?)
+    }
+
+    async fn set_task_agents_md_state(
         &self,
-        goal: String,
-        planner_pin: Option<i64>,
-        worker_pin: Option<i64>,
-        topology: Option<dhi_core::Topology>,
-        swarm_workers: Option<usize>,
-    ) -> anyhow::Result<Task> {
-        Ok(Store::create_task_with_pins(
-            self,
-            &goal,
-            planner_pin,
-            worker_pin,
-            topology,
-            swarm_workers,
-        )
-        .await?)
+        task_id: TaskId,
+        state: AgentsMdState,
+    ) -> anyhow::Result<()> {
+        Ok(Store::set_task_agents_md_state(self, task_id, state).await?)
     }
 
     async fn get_task(&self, id: TaskId) -> anyhow::Result<Option<Task>> {

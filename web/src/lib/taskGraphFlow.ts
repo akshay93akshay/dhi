@@ -24,8 +24,35 @@ import type { TaskWork } from "./types.ts";
 
 /** Neutral wires keep the five node colours and the proves mark dominant. */
 export const TASK_GRAPH_FLOW_EDGE_COLOR = "var(--muted-foreground)";
-export const TASK_GRAPH_FLOW_EDGE_LABEL_COLOR = "var(--muted-foreground)";
-export const TASK_GRAPH_FLOW_EDGE_LABEL_BG = "var(--surface-subtle)";
+/** Strong foreground ink on a card-coloured pill reads in both themes. */
+export const TASK_GRAPH_FLOW_EDGE_LABEL_COLOR = "var(--foreground)";
+export const TASK_GRAPH_FLOW_EDGE_LABEL_BG = "var(--card)";
+export const TASK_GRAPH_FLOW_EDGE_LABEL_BORDER = "var(--border)";
+export const TASK_GRAPH_FLOW_EDGE_LABEL_PADDING: [number, number] = [8, 4];
+export const TASK_GRAPH_FLOW_EDGE_LABEL_RADIUS = 6;
+
+/**
+ * Shared relation-label pill. The colors are DHI CSS variables, so the same
+ * graph model is readable in light and dark mode without re-running the
+ * mapper when the theme changes.
+ */
+export function taskGraphFlowEdgeLabelStyles() {
+  return {
+    labelStyle: {
+      fill: TASK_GRAPH_FLOW_EDGE_LABEL_COLOR,
+      fontSize: 13,
+      fontWeight: 600,
+    },
+    labelBgStyle: {
+      fill: TASK_GRAPH_FLOW_EDGE_LABEL_BG,
+      fillOpacity: 1,
+      stroke: TASK_GRAPH_FLOW_EDGE_LABEL_BORDER,
+      strokeWidth: 1,
+    },
+    labelBgPadding: TASK_GRAPH_FLOW_EDGE_LABEL_PADDING,
+    labelBgBorderRadius: TASK_GRAPH_FLOW_EDGE_LABEL_RADIUS,
+  };
+}
 
 /** Relation labels are the lowercase wire names with spaces. */
 export const TASK_GRAPH_RELATION_LABELS: Readonly<
@@ -292,17 +319,7 @@ export function buildTaskGraphFlow(
         strokeWidth: 1.5,
         strokeOpacity: 0.6,
       },
-      labelStyle: {
-        fill: TASK_GRAPH_FLOW_EDGE_LABEL_COLOR,
-        fontSize: 13,
-        fontWeight: 600,
-      },
-      labelBgStyle: {
-        fill: TASK_GRAPH_FLOW_EDGE_LABEL_BG,
-        fillOpacity: 0.92,
-      },
-      labelBgPadding: [5, 3],
-      labelBgBorderRadius: 4,
+      ...taskGraphFlowEdgeLabelStyles(),
       pathOptions: { offset: 20, borderRadius: 8 },
     };
   });

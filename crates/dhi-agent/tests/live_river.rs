@@ -38,6 +38,7 @@ async fn live_river_planner_smoke() {
             required_topology: None,
             swarm_workers: None,
             instructions: vec![],
+            project_instructions: None,
         })
         .await
         .expect("the live planner call must succeed");

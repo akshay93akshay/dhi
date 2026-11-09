@@ -11,10 +11,15 @@ use uuid::Uuid;
 
 pub mod graph;
 pub mod orchestration;
+pub mod project;
 pub mod side_question;
 pub use graph::{GraphStore, GuardStore};
 pub use orchestration::{
     CapabilityLimits, IntentPlan, OrchestrationError, Subtask, Topology, WorkerSpec,
+};
+pub use project::{
+    AGENTS_MD_FILE, AGENTS_MD_MAX_BYTES, AgentsMdContent, AgentsMdState, agents_md_path,
+    inspect_agents_md, read_agents_md,
 };
 pub use side_question::{
     NewSideQuestionRequest, SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus,
@@ -343,8 +348,92 @@ pub struct Task {
     /// count to the planner. Stored in `tasks.swarm_workers`.
     #[serde(default)]
     pub swarm_workers: Option<usize>,
+    /// Canonical project folder selected at creation. `None` is legacy mode:
+    /// the task keeps its isolated folder under `DHI_WORKSPACE_ROOT`.
+    #[serde(default)]
+    pub project_folder: Option<String>,
+    /// Derived host path of the task folder. Project mode is
+    /// `<project>/.dhi/<task-id>`; legacy mode leaves this `None` because the
+    /// folder is rooted at `DHI_WORKSPACE_ROOT` instead of the task row.
+    #[serde(default)]
+    pub task_folder: Option<String>,
+    /// Whether the planner receives the project's `AGENTS.md` instructions.
+    #[serde(default)]
+    pub load_agents_md: bool,
+    /// The instruction-file state computed at creation and refreshed when the
+    /// engine reads it at task start.
+    #[serde(default)]
+    pub agents_md_state: AgentsMdState,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Creation-time task fields the store writes as one row.
+///
+/// This is deliberately a small input struct: the store create call already
+/// carries pins, topology, and the project/instructions selection.
+#[derive(Debug, Clone, Default)]
+pub struct NewTask {
+    /// Optional preallocated id. The API uses it to create the project task
+    /// folder before the row exists; `None` lets the store allocate one.
+    pub id: Option<TaskId>,
+    pub goal: String,
+    pub planner_pin: Option<i64>,
+    pub worker_pin: Option<i64>,
+    pub topology: Option<Topology>,
+    pub swarm_workers: Option<usize>,
+    pub project_folder: Option<String>,
+    pub load_agents_md: bool,
+    pub agents_md_state: AgentsMdState,
+}
+
+impl NewTask {
+    pub fn new(goal: impl Into<String>) -> Self {
+        Self {
+            id: None,
+            goal: goal.into(),
+            planner_pin: None,
+            worker_pin: None,
+            topology: None,
+            swarm_workers: None,
+            project_folder: None,
+            load_agents_md: false,
+            agents_md_state: AgentsMdState::Disabled,
+        }
+    }
+
+    pub fn with_id(mut self, id: TaskId) -> Self {
+        self.id = Some(id);
+        self
+    }
+
+    pub fn with_pins(mut self, planner_pin: Option<i64>, worker_pin: Option<i64>) -> Self {
+        self.planner_pin = planner_pin;
+        self.worker_pin = worker_pin;
+        self
+    }
+
+    pub fn with_topology(mut self, topology: Option<Topology>) -> Self {
+        self.topology = topology;
+        self
+    }
+
+    pub fn with_swarm_workers(mut self, swarm_workers: Option<usize>) -> Self {
+        self.swarm_workers = swarm_workers;
+        self
+    }
+
+    pub fn with_project(
+        mut self,
+        project_folder: impl Into<String>,
+        load_agents_md: bool,
+        agents_md_state: AgentsMdState,
+    ) -> Self {
+        self.project_folder = Some(project_folder.into());
+        self.load_agents_md = load_agents_md;
+        self.agents_md_state = agents_md_state;
+        self
+    }
 }
 
 impl Task {
@@ -361,9 +450,32 @@ impl Task {
             capacity: TaskCapacity::default(),
             topology: None,
             swarm_workers: None,
+            project_folder: None,
+            task_folder: None,
+            load_agents_md: false,
+            agents_md_state: AgentsMdState::Disabled,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    /// The project-mode task folder for `project_folder` and `task_id`.
+    ///
+    /// Legacy tasks have no derived folder: their workspace is rooted under
+    /// `DHI_WORKSPACE_ROOT`, which the store does not own.
+    pub fn task_folder_for(project_folder: Option<&str>, task_id: TaskId) -> Option<String> {
+        project_folder.map(|project| {
+            std::path::Path::new(project)
+                .join(".dhi")
+                .join(task_id.to_string())
+                .to_string_lossy()
+                .into_owned()
+        })
+    }
+
+    /// Recomputes [`Task::task_folder`] from the current project selection.
+    pub fn refresh_task_folder(&mut self) {
+        self.task_folder = Self::task_folder_for(self.project_folder.as_deref(), self.id);
     }
 
     pub fn origin_fact(&self) -> Fact {
@@ -644,6 +756,25 @@ mod tests {
         assert_eq!(task.state, TaskState::Created);
         assert_eq!(task.origin_fact().state, FactState::Origin);
         assert!(!task.exploration_id.is_nil());
+    }
+
+    #[test]
+    fn new_task_defaults_to_legacy_mode() {
+        let task = Task::new("legacy");
+        assert_eq!(task.project_folder, None);
+        assert_eq!(task.task_folder, None);
+        assert!(!task.load_agents_md);
+        assert_eq!(task.agents_md_state, AgentsMdState::Disabled);
+
+        let mut project = Task::new("project");
+        project.project_folder = Some("/srv/project".to_string());
+        project.refresh_task_folder();
+        let expected = std::path::Path::new("/srv/project")
+            .join(".dhi")
+            .join(project.id.to_string())
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(project.task_folder.as_deref(), Some(expected.as_str()));
     }
 
     #[test]

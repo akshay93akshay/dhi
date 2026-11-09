@@ -13,7 +13,9 @@
 //! every tool goes through its [`Remote`](rig_tools::remote::Remote)
 //! workspace. The file tools use `/work` as their base and the shell starts
 //! in `/work`; the container sees the task folder there, with `.dhi` and
-//! `.dhi/spill` mounted read-only inside it.
+//! `.dhi/spill` mounted read-only inside it. A project task can also read its
+//! project root through `/project`; read-style tools are confined to that
+//! root, and writes stay confined to `/work`.
 //!
 //! Local test mode uses [`Local`] instead. There the file tools are confined
 //! to the host task directory and `write`/`edit` also refuse a target, or a
@@ -87,10 +89,15 @@ impl CodingBackend {
         let mut context = ToolContext::new();
         let output = match tool {
             "read" => {
-                let args: ReadArgs = parse_args(tool, input)?;
+                let mut args: ReadArgs = parse_args(tool, input)?;
+                self.containers
+                    .verify_project_read(task_id, &args.path)
+                    .await?;
+                let (base, path) = read_base_and_path(&runtime, &args.path);
+                args.path = path;
                 Read {
                     workspace: Arc::clone(&runtime.workspace),
-                    base: Some(runtime.base.clone()),
+                    base: Some(base),
                     confine: true,
                     seen: runtime.seen.clone(),
                 }
@@ -126,20 +133,30 @@ impl CodingBackend {
                 .await?
             }
             "search" => {
-                let args: SearchArgs = parse_args(tool, input)?;
+                let mut args: SearchArgs = parse_args(tool, input)?;
+                if let Some(path) = args.path.as_deref() {
+                    self.containers.verify_project_read(task_id, path).await?;
+                }
+                let (base, path) = read_base_and_path_option(&runtime, args.path);
+                args.path = path;
                 Search {
                     workspace: Arc::clone(&runtime.workspace),
-                    base: Some(runtime.base.clone()),
+                    base: Some(base),
                     confine: true,
                 }
                 .call(&mut context, args)
                 .await?
             }
             "list" => {
-                let args: ListArgs = parse_args(tool, input)?;
+                let mut args: ListArgs = parse_args(tool, input)?;
+                if let Some(path) = args.path.as_deref() {
+                    self.containers.verify_project_read(task_id, path).await?;
+                }
+                let (base, path) = read_base_and_path_option(&runtime, args.path);
+                args.path = path;
                 List {
                     workspace: Arc::clone(&runtime.workspace),
-                    base: Some(runtime.base.clone()),
+                    base: Some(base),
                     confine: true,
                 }
                 .call(&mut context, args)
@@ -233,6 +250,50 @@ impl ToolBackend for CodingBackend {
 /// Parses a tool's arguments, naming the tool when the shape is wrong.
 fn parse_args<T: DeserializeOwned>(tool: &str, input: serde_json::Value) -> anyhow::Result<T> {
     serde_json::from_value(input).map_err(|err| anyhow!("invalid arguments for {tool}: {err}"))
+}
+
+/// Maps a `/project/...` read path to the project root as this runtime names
+/// it, with a path relative to that root.
+///
+/// A legacy task has no project root. A path that merely starts with the same
+/// letters (`/project-x`) does not match. `..` stays in the relative path and
+/// is refused by the tool's confinement check, so it cannot escape the root.
+fn project_read_target(runtime: &TaskRuntime, requested: &str) -> Option<(PathBuf, String)> {
+    let root = runtime.project_dir.as_ref()?;
+    let rest = requested.strip_prefix("/project")?;
+    if !rest.is_empty() && !rest.starts_with('/') {
+        return None;
+    }
+    let relative = rest.trim_start_matches('/');
+    Some((
+        root.clone(),
+        if relative.is_empty() {
+            ".".to_string()
+        } else {
+            relative.to_string()
+        },
+    ))
+}
+
+/// The base and path a read-style tool uses. Reads inside `/project` are
+/// confined to the project root; every other read stays confined to `/work`.
+fn read_base_and_path(runtime: &TaskRuntime, requested: &str) -> (PathBuf, String) {
+    project_read_target(runtime, requested)
+        .unwrap_or_else(|| (runtime.base.clone(), requested.to_string()))
+}
+
+/// [`read_base_and_path`] for tools whose path is optional.
+fn read_base_and_path_option(
+    runtime: &TaskRuntime,
+    requested: Option<String>,
+) -> (PathBuf, Option<String>) {
+    match requested {
+        Some(requested) => {
+            let (base, path) = read_base_and_path(runtime, &requested);
+            (base, Some(path))
+        }
+        None => (runtime.base.clone(), None),
+    }
 }
 
 /// Resolves and validates a local `write` or `edit` target.
@@ -643,6 +704,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(guarded, serde_json::json!({ "output": read }));
+    }
+
+    #[tokio::test]
+    async fn project_reads_use_project_root_and_writes_stay_in_work() {
+        let (temp, containers, _tools, backend) = fixture();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("README.md"), "project text\n").unwrap();
+        let task = Uuid::new_v4();
+        containers.set_task_project(task, Some(&project)).unwrap();
+
+        let read = backend
+            .execute_for_task(
+                task,
+                "read",
+                serde_json::json!({ "path": "/project/README.md" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read, serde_json::json!("project text\n"));
+
+        let listed = backend
+            .execute_for_task(task, "list", serde_json::json!({ "path": "/project" }))
+            .await
+            .unwrap();
+        assert!(
+            listed.as_str().unwrap_or_default().contains("README.md"),
+            "{listed}"
+        );
+
+        let err = backend
+            .execute_for_task(
+                task,
+                "write",
+                serde_json::json!({ "path": "/project/new.txt", "content": "no\n" }),
+            )
+            .await
+            .expect_err("/project is read-only");
+        assert!(
+            err.to_string().contains("outside") || err.to_string().contains("permission"),
+            "{err}"
+        );
+        assert!(!project.join("new.txt").exists());
+
+        // A project read cannot escape upward through `..`.
+        let err = backend
+            .execute_for_task(
+                task,
+                "read",
+                serde_json::json!({ "path": "/project/../AGENTS.md" }),
+            )
+            .await
+            .expect_err("the project read is confined to /project");
+        assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_reads_reject_a_symlink_escape_before_the_tool_runs() {
+        use std::os::unix::fs::symlink;
+
+        let (temp, containers, _tools, backend) = fixture();
+        let project = temp.path().join("project");
+        let outside = temp.path().join("outside.txt");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(&outside, "secret\n").unwrap();
+        symlink(&outside, project.join("escape.txt")).unwrap();
+        let task = Uuid::new_v4();
+        containers.set_task_project(task, Some(&project)).unwrap();
+
+        let err = backend
+            .execute_for_task(
+                task,
+                "read",
+                serde_json::json!({ "path": "/project/escape.txt" }),
+            )
+            .await
+            .expect_err("the symlink target is outside /project");
+        assert!(err.to_string().contains("outside"), "{err}");
     }
 
     #[tokio::test]

@@ -67,6 +67,7 @@ async fn live_state(pool: sqlx::PgPool) -> (AppState, Arc<Store>, SharedPolicy) 
         tool_control: None,
         web: Arc::new(dhi_server::web_providers::WebProviderRuntime::empty()),
         task_runs: Arc::new(dhi_server::TaskRunRegistry::disabled()),
+        project_folders: Arc::new(dhi_server::project_folders::ProjectFolders::default()),
     };
     (state, store, guard)
 }
@@ -102,6 +103,7 @@ async fn bare_state(pool: sqlx::PgPool) -> (AppState, Arc<Store>) {
         tool_control: None,
         web: Arc::new(dhi_server::web_providers::WebProviderRuntime::empty()),
         task_runs: Arc::new(dhi_server::TaskRunRegistry::disabled()),
+        project_folders: Arc::new(dhi_server::project_folders::ProjectFolders::default()),
     };
     (state, store)
 }
@@ -944,6 +946,7 @@ async fn management_routes_degrade_without_mgmt_store(pg: sqlx::PgPool) {
         tool_control: None,
         web: Arc::new(dhi_server::web_providers::WebProviderRuntime::empty()),
         task_runs: Arc::new(dhi_server::TaskRunRegistry::disabled()),
+        project_folders: Arc::new(dhi_server::project_folders::ProjectFolders::default()),
     };
     let app = router(state);
 

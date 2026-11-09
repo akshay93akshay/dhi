@@ -545,6 +545,79 @@ async fn remove_and_shutdown_stop_the_containers() {
 #[tokio::test]
 #[ignore = "requires Docker"]
 #[serial_test::serial]
+async fn project_mounts_are_read_only_and_hide_dhi() {
+    let Some(fixture) = Fixture::docker().await else {
+        return;
+    };
+    let project = fixture._temp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("README.md"), "project text\n").unwrap();
+    let task = fixture.task();
+    fixture
+        .containers
+        .set_task_project(task, Some(&project))
+        .unwrap();
+
+    let command = format!(
+        "test -e /project/README.md && echo readme; \
+         touch /project/dhi-probe 2>/dev/null && echo project-writable || echo project-readonly; \
+         entries=$(ls -A /project/.dhi 2>/dev/null); \
+         [ -z \"$entries\" ] && echo dhi-hidden || echo dhi-visible; \
+         test -e /project/.dhi/{} && echo sibling-visible || echo sibling-hidden",
+        task
+    );
+    let text = fixture.shell(task, &command).await.unwrap();
+    assert!(text.contains("readme"), "{text}");
+    assert!(text.contains("project-readonly"), "{text}");
+    assert!(text.contains("dhi-hidden"), "{text}");
+    assert!(text.contains("sibling-hidden"), "{text}");
+
+    let info = inspect(task).await;
+    assert!(
+        info["HostConfig"]["Tmpfs"]["/project/.dhi"]
+            .as_str()
+            .is_some_and(|options| options.contains("ro")),
+        "the .dhi tmpfs is read-only: {}",
+        info["HostConfig"]["Tmpfs"]
+    );
+    let mounts = info["Mounts"].as_array().unwrap();
+    let project_mounts: Vec<&Value> = mounts
+        .iter()
+        .filter(|mount| mount["Destination"] == "/project")
+        .collect();
+    assert_eq!(project_mounts.len(), 1, "{mounts:?}");
+    assert_eq!(project_mounts[0]["Type"], "bind");
+    assert_eq!(project_mounts[0]["RW"], false);
+    assert_eq!(
+        project_mounts[0]["Source"],
+        std::fs::canonicalize(&project)
+            .unwrap()
+            .to_string_lossy()
+            .as_ref()
+    );
+
+    let read = fixture
+        .call(task, "read", json!({ "path": "/project/README.md" }))
+        .await
+        .unwrap();
+    assert!(output(&read).contains("project text"), "{read}");
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("/etc/hostname", project.join("escape.txt")).unwrap();
+        let err = fixture
+            .call(task, "read", json!({ "path": "/project/escape.txt" }))
+            .await
+            .expect_err("a project symlink escape is refused");
+        assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    fixture.containers.remove(task).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires Docker"]
+#[serial_test::serial]
 async fn a_container_cannot_replace_the_read_only_spill_mount() {
     let Some(fixture) = Fixture::docker().await else {
         return;

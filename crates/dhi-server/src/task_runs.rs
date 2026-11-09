@@ -6,10 +6,11 @@
 //! its own entry on exit, so the registry never keeps a stale worker.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use dhi_core::TaskId;
+use dhi_core::{Task, TaskId};
 use dhi_exec::TaskContainers;
 use dhi_pty::PtyTools;
 use tokio::task::AbortHandle;
@@ -173,6 +174,25 @@ impl TaskRunRegistry {
     /// The cleanup owners wired by `main.rs`, if any.
     pub fn cleanup_handles(&self) -> (Option<Arc<PtyTools>>, Option<Arc<TaskContainers>>) {
         (self.pty.clone(), self.containers.clone())
+    }
+
+    /// Tells the task container manager which project folder this task uses.
+    ///
+    /// A legacy task clears any earlier mapping. A project task's folder must
+    /// be an absolute real directory. A failure is logged: the engine loop
+    /// still starts, and the first coding-tool call surfaces the same error.
+    pub fn track_task_project(&self, task: &Task) {
+        let Some(containers) = &self.containers else {
+            return;
+        };
+        let project: Option<&Path> = task.project_folder.as_deref().map(Path::new);
+        if let Err(err) = containers.set_task_project(task.id, project) {
+            tracing::warn!(
+                task_id = %task.id,
+                error = %err,
+                "task project folder is unusable; container tools will fail"
+            );
+        }
     }
 
     #[cfg(test)]

@@ -9,7 +9,11 @@ import {
   swarmEdgeColor,
   swarmNodeId,
 } from "./swarmGraph.ts";
-import { groupSwarmRuns, parseSwarmMessages } from "./workTeam.ts";
+import {
+  groupSwarmRuns,
+  parseSwarmMessages,
+  swarmRoundLabel,
+} from "./workTeam.ts";
 import type { SwarmRoundGroup } from "./workTeam.ts";
 
 const RUN_ONE = "aaaaaaaa-1111-4111-8111-111111111111";
@@ -200,10 +204,45 @@ test("an unknown or cross-round selected id falls back to the first chip", () =>
   assert.equal(model.edges.length, 2);
 });
 
+test("seed and numbered rounds use the same list and graph labels", () => {
+  const views = parseSwarmMessages([
+    swarmRecord(1, RUN_ONE, "alice", "finding", {
+      type: "finding",
+      summary: "seed finding",
+    }),
+    swarmRecord(2, RUN_ONE, "bob", "finding", {
+      type: "finding",
+      summary: "peer finding",
+      subtask_id: "task:r2:peer:alice",
+    }),
+  ]);
+  const run = groupSwarmRuns(views)[0];
+  assert.ok(run);
+  // The seed turn runs before round 2 and stays first in the selector.
+  assert.deepEqual(
+    run.rounds.map((round) => round.round),
+    [null, 2],
+  );
+  assert.deepEqual(
+    run.rounds.map((round) => round.label),
+    ["Round 1 (seed)", "Round 2"],
+  );
+
+  const seed = buildSwarmGraph(run, run.rounds[0]!);
+  const roundTwo = buildSwarmGraph(run, run.rounds[1]!);
+  assert.equal(seed.roundLabel, run.rounds[0]!.label);
+  assert.equal(seed.roundLabel, swarmRoundLabel(null));
+  assert.equal(seed.roundLabel, "Round 1 (seed)");
+  assert.equal(roundTwo.roundLabel, run.rounds[1]!.label);
+  assert.equal(roundTwo.roundLabel, swarmRoundLabel(2));
+  assert.equal(roundTwo.roundLabel, "Round 2");
+});
+
 test("an empty round has no selection, chips, or broadcast edges", () => {
   const run = fixtureRuns()[0];
   const emptyRound: SwarmRoundGroup = {
     round: 1,
+    label: swarmRoundLabel(1),
     senders: [],
     counts: { total: 0, workers: 0, rounds: 0, byKind: {} },
   };

@@ -194,6 +194,16 @@ scripts/dhi-service.sh install && scripts/dhi-service.sh start
 
 The exported files are written to `web/out`, which the server serves on http://127.0.0.1:8080. Set `DHI_WEB_DIR` to serve an export from another directory. PostgreSQL must be running and migrated before the service starts.
 
+### Build cache
+
+Keep the Rust build cache between runs:
+
+- Do not delete `target/`.
+- Trim selectively with `cargo sweep --time 30` or `cargo clean -p <crate>`.
+- Use `cargo check -p <crate>` for daily work.
+- Run full `cargo test --workspace` and full clippy only before push.
+- CI caches Rust dependencies now. The first run after the change is cold; the second run shows the benefit.
+
 ## Configuration
 
 `.env.example` lists the runtime settings. Copy it to `.env` (ignored by Git) and fill in only the values you need. Docker Compose reads `.env` automatically.
@@ -212,9 +222,18 @@ Main settings:
 - `DHI_WEB_DIR` — static UI directory; when unset, `web/out` is used if present
 - `DHI_WORKSPACE_ROOT` — workspace root visible to the server; defaults to `workspace`
 - `DHI_WORKSPACE_HOST_ROOT` — host path of that root, used as the bind-mount source for task containers; set it when the server runs in a container
+- `DHI_PROJECT_FOLDERS` — comma-separated absolute paths of project folders; each must be mounted into the server at the same absolute path
 - `DHI_MCP_CONFIG` — MCP config path; when unset, the nearest `ops/mcp.json`
 - `DHI_LLM_BASE_URL`, `DHI_LLM_API_KEY`, `DHI_LLM_PLANNER_MODEL`, `DHI_LLM_WORKER_MODEL` — LLM endpoint and models; other OpenAI-compatible endpoints work
 - `TINYFISH_API_KEY`, `PARALLEL_API_KEY`, `FIRECRAWL_API_KEY`, `DHI_WEB_PROVIDER` — web tool providers
+
+### Project folders
+
+Set `DHI_PROJECT_FOLDERS` to a comma-separated list of absolute paths. Mount each folder into `dhi-server` at the same absolute path, read-write (for example `-v /path:/path` in `docker run`, or the equivalent compose volume), so the server and the task containers it creates resolve the same source. Each path must exist, be a directory, not be a symlink, and be writable by the server.
+
+DHI<sup>+</sup> creates `<project>/.dhi/<task-id>/` for each task in a project folder. The task container mounts the project root at `/project` read-only and the task folder at `/work` read-write. One configured folder is selected per task.
+
+`AGENTS.md` is read from the selected project root only. It is planner-only: no global or nested file is read, and the file is capped at 32 KiB.
 
 On first boot, DHI<sup>+</sup> seeds guard rules plus LLM profiles and settings when an LLM key is configured. After that, PostgreSQL is the source of truth and profiles and rules are managed from the settings UI or API.
 

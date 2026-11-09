@@ -160,6 +160,24 @@ export type TaskCapacityPatch = Partial<{
   max_parallel_workers: number;
 }>;
 
+/**
+ * Outcome of loading the selected project folder's `AGENTS.md` for a task.
+ * `disabled` means creation requested no load; `not_found` means the file
+ * disappeared between listing and creation; `truncated` means the file was
+ * cut to fit the prompt budget; `loaded` is the full-file case.
+ */
+export type AgentsMdState = "loaded" | "truncated" | "not_found" | "disabled";
+
+/** One selectable project folder (`GET /api/project-folders` `folders[]`). */
+export type ProjectFolder = {
+  /** Absolute path used as the `project_folder` create-task value. */
+  path: string;
+  /** Short display name (usually the final path segment). */
+  name: string;
+  /** True when the folder carries a readable `AGENTS.md`. */
+  agents_md_present: boolean;
+};
+
 export type Task = {
   id: string;
   goal: string;
@@ -187,6 +205,22 @@ export type Task = {
    * servers omit the field.
    */
   swarm_workers?: number | null;
+  /**
+   * Absolute project folder this task runs in, or `null`/omitted for a legacy
+   * workspace task. Older servers omit the field entirely.
+   */
+  project_folder?: string | null;
+  /** Per-task scratch folder inside `project_folder`, or `null`/omitted. */
+  task_folder?: string | null;
+  /**
+   * Whether creation requested the project folder's `AGENTS.md`. Older
+   * servers omit the field.
+   */
+  load_agents_md?: boolean;
+  /**
+   * How the `AGENTS.md` load resolved. Older servers omit the field.
+   */
+  agents_md_state?: AgentsMdState;
   created_at: string;
   updated_at: string;
 };
@@ -854,6 +888,11 @@ export type ProfilesResponse = {
   profiles: LlmProfile[];
 };
 
+/** `GET /api/project-folders` — the selectable project folders. */
+export type ProjectFoldersResponse = {
+  folders: ProjectFolder[];
+};
+
 /** `GET /api/intercept/rules` — every rule, evaluation order. */
 export type RulesResponse = {
   rules: GuardRule[];
@@ -916,6 +955,16 @@ export type CreateTaskInput = {
    * The server accepts this only together with `topology: "swarm"`.
    */
   swarm_workers?: number | null;
+  /**
+   * Absolute project folder selected for the task. Omitted (or `null`) keeps
+   * legacy workspace mode.
+   */
+  project_folder?: string | null;
+  /**
+   * Whether to load the project folder's `AGENTS.md`. Only meaningful (and
+   * only sent by the UI) together with `project_folder`.
+   */
+  load_agents_md?: boolean;
 };
 
 /**

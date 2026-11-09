@@ -3,9 +3,14 @@ import { test } from "node:test";
 import { ApiError } from "./api.ts";
 import {
   PIN_UNSET,
+  PROJECT_FOLDER_UNSET,
   SWARM_WORKERS_OPTIONS,
   TOPOLOGY_OPTIONS,
+  agentsMdDefaultOn,
+  agentsMdStateLabel,
+  agentsMdStateVariant,
   buildCreateTaskInput,
+  defaultProjectFolderPath,
   describeApiError,
   parsePin,
   parseSwarmWorkers,
@@ -20,6 +25,7 @@ import {
   topologyLabel,
   validateGoal,
 } from "./ui.ts";
+import type { ProjectFolder } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // shortenId
@@ -91,6 +97,54 @@ test("parsePin maps select values onto ids or null", () => {
   assert.equal(parsePin("abc"), null);
   assert.equal(parsePin("-2"), null);
   assert.equal(parsePin("2.5"), null);
+});
+
+const folderWithAgents: ProjectFolder = {
+  path: "/srv/projects/build",
+  name: "Build",
+  agents_md_present: true,
+};
+
+const folderWithoutAgents: ProjectFolder = {
+  path: "/srv/projects/other",
+  name: "Other",
+  agents_md_present: false,
+};
+
+test("defaultProjectFolderPath preselects exactly one folder", () => {
+  assert.equal(defaultProjectFolderPath([]), PROJECT_FOLDER_UNSET);
+  assert.equal(
+    defaultProjectFolderPath([folderWithAgents]),
+    folderWithAgents.path,
+  );
+  // Several folders require an explicit choice, so legacy stays the default.
+  assert.equal(
+    defaultProjectFolderPath([folderWithAgents, folderWithoutAgents]),
+    PROJECT_FOLDER_UNSET,
+  );
+});
+
+test("agentsMdDefaultOn follows the folder's presence flag", () => {
+  assert.equal(agentsMdDefaultOn(null), false);
+  assert.equal(agentsMdDefaultOn(undefined), false);
+  assert.equal(agentsMdDefaultOn(folderWithAgents), true);
+  assert.equal(agentsMdDefaultOn(folderWithoutAgents), false);
+});
+
+test("agentsMdStateLabel and variant map every state", () => {
+  assert.equal(agentsMdStateLabel("loaded"), "AGENTS.md loaded");
+  assert.equal(agentsMdStateLabel("truncated"), "AGENTS.md truncated");
+  assert.equal(agentsMdStateLabel("not_found"), "No AGENTS.md");
+  assert.equal(agentsMdStateLabel("disabled"), "AGENTS.md off");
+  // Legacy tasks / older servers omit the field entirely.
+  assert.equal(agentsMdStateLabel(null), null);
+  assert.equal(agentsMdStateLabel(undefined), null);
+
+  assert.equal(agentsMdStateVariant("loaded"), "success");
+  assert.equal(agentsMdStateVariant("truncated"), "warning");
+  assert.equal(agentsMdStateVariant("not_found"), "muted");
+  assert.equal(agentsMdStateVariant("disabled"), "muted");
+  assert.equal(agentsMdStateVariant(undefined), "muted");
 });
 
 test("buildCreateTaskInput always sends topology and swarm_workers, defaulting to null", () => {
@@ -252,6 +306,56 @@ test("buildCreateTaskInput carries numeric pins into the canonical fields", () =
     planner_profile_id: 7,
     worker_profile_id: 9,
   });
+});
+
+test("buildCreateTaskInput sends project_folder and load_agents_md together", () => {
+  const withAgents = buildCreateTaskInput({
+    goal: "g",
+    plannerPin: "",
+    workerPin: "",
+    projectFolder: " /srv/projects/build ",
+    loadAgentsMd: true,
+  });
+  assert.ok(withAgents.ok);
+  assert.deepEqual(withAgents.input, {
+    goal: "g",
+    topology: null,
+    swarm_workers: null,
+    project_folder: "/srv/projects/build",
+    load_agents_md: true,
+  });
+
+  const withoutAgents = buildCreateTaskInput({
+    goal: "g",
+    plannerPin: "",
+    workerPin: "",
+    projectFolder: "/srv/projects/build",
+    loadAgentsMd: false,
+  });
+  assert.ok(withoutAgents.ok);
+  assert.equal(
+    withoutAgents.input.project_folder,
+    "/srv/projects/build",
+  );
+  // Explicit false is sent, not omitted, once a folder is active.
+  assert.equal(withoutAgents.input.load_agents_md, false);
+});
+
+test("buildCreateTaskInput omits project fields in legacy workspace mode", () => {
+  for (const projectFolder of [undefined, "", "   "]) {
+    for (const loadAgentsMd of [undefined, true, false]) {
+      const result = buildCreateTaskInput({
+        goal: "g",
+        plannerPin: "",
+        workerPin: "",
+        projectFolder,
+        loadAgentsMd,
+      });
+      assert.ok(result.ok);
+      assert.equal("project_folder" in result.input, false);
+      assert.equal("load_agents_md" in result.input, false);
+    }
+  }
 });
 
 test("buildCreateTaskInput refuses an empty goal without submitting", () => {

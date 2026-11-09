@@ -19,6 +19,7 @@ import {
   swarmKindLabel,
   swarmPayloadFullText,
   swarmPayloadSummary,
+  swarmRoundLabel,
   taskUsesSwarm,
 } from "./workTeam.ts";
 import type { Activity, TaskCapacity } from "./types.ts";
@@ -382,6 +383,23 @@ test("swarm rounds come from payload.round or the react subtask id", () => {
   );
 });
 
+test("swarmRoundLabel names the seed turn and numbered peer rounds", () => {
+  assert.equal(swarmRoundLabel(null), "Round 1 (seed)");
+  assert.equal(swarmRoundLabel(undefined), "Round 1 (seed)");
+  assert.equal(swarmRoundLabel(1), "Round 1");
+  assert.equal(swarmRoundLabel(2), "Round 2");
+  assert.equal(
+    swarmRoundLabel(
+      parseSwarmMessage({
+        id: 2,
+        kind: "finding",
+        payload: { from: "a", summary: "s", subtask_id: "alpha:r2:peer:beta" },
+      })?.round,
+    ),
+    "Round 2",
+  );
+});
+
 test("swarmPayloadSummary and full text recognize done by persisted kind", () => {
   assert.equal(swarmPayloadSummary({}, "done"), "done");
   assert.equal(swarmPayloadSummary(null, "done"), "done");
@@ -485,36 +503,41 @@ test("groupSwarmRuns builds a single run with rounds then senders", () => {
   assert.equal(run.peerCount, 1);
   assert.deepEqual(
     run.rounds.map((round) => round.round),
-    [2, null],
+    [null, 2],
+  );
+  assert.deepEqual(
+    run.rounds.map((round) => round.label),
+    ["Round 1 (seed)", "Round 2"],
   );
 
-  const firstRound = run.rounds[0];
-  assert.ok(firstRound);
+  const seedRound = run.rounds[0];
+  assert.ok(seedRound);
   assert.deepEqual(
-    firstRound.senders.map((sender) => sender.sender),
+    seedRound.senders.map((sender) => sender.sender),
     ["alpha", "beta"],
   );
   assert.deepEqual(
-    firstRound.senders[0]?.messages.map((message) => message.id),
-    [2],
+    seedRound.senders[0]?.messages.map((message) => message.id),
+    [1],
   );
   assert.deepEqual(
-    firstRound.senders[1]?.messages.map((message) => message.id),
-    [4],
+    seedRound.senders[1]?.messages.map((message) => message.id),
+    [3],
   );
-  assert.equal(firstRound.counts.total, 2);
-  assert.equal(firstRound.counts.byKind.challenge, 1);
+  assert.equal(seedRound.counts.total, 2);
+  assert.equal(seedRound.counts.byKind.finding, 2);
 
-  const unknownRound = run.rounds[1];
-  assert.ok(unknownRound);
+  const roundTwo = run.rounds[1];
+  assert.ok(roundTwo);
   assert.deepEqual(
-    unknownRound.senders.map((sender) => sender.sender),
+    roundTwo.senders.map((sender) => sender.sender),
     ["alpha", "beta"],
   );
   assert.deepEqual(
-    unknownRound.senders.map((sender) => sender.messages[0]?.id),
-    [1, 3],
+    roundTwo.senders.map((sender) => sender.messages[0]?.id),
+    [2, 4],
   );
+  assert.equal(roundTwo.counts.byKind.challenge, 1);
 
   assert.equal(run.counts.total, 4);
   assert.equal(run.counts.workers, 2);
@@ -565,7 +588,15 @@ test("groupSwarmRuns numbers multiple runs by first message id", () => {
     ],
   );
   assert.equal(runs[0]?.peerCount, 0);
-  assert.equal(runs[1]?.rounds[0]?.round, 1);
+  // The round-less done message is the seed turn, so it stays first.
+  assert.deepEqual(
+    runs[1]?.rounds.map((round) => round.round),
+    [null, 1],
+  );
+  assert.deepEqual(
+    runs[1]?.rounds.map((round) => round.label),
+    ["Round 1 (seed)", "Round 1"],
+  );
 });
 
 test("groupSwarmRuns keeps messages without an intent id in one fallback run", () => {

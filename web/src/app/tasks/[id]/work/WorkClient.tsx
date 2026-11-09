@@ -36,6 +36,7 @@ import {
 import { Crumbs } from "@/app/_components/Crumbs";
 import { LiveActivityFeed } from "@/app/_components/ActivityLog";
 import { MarkdownMath } from "@/components/markdown-math";
+import { ProjectContext } from "@/components/project-context";
 import { CopyButton } from "@/components/ui/copy-button";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -359,6 +360,11 @@ function TaskWorkView() {
             </Button>
           </>
         }
+      />
+
+      <ProjectContext
+        task={work.task}
+        className="rounded-lg border border-border bg-surface-subtle px-3.5 py-2.5"
       />
 
       <GoalBlock text={work.task.goal} />

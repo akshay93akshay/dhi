@@ -13,6 +13,7 @@ use std::time::Duration;
 
 pub mod mcp;
 mod mcp_api;
+pub mod project_folders;
 pub mod side_questions;
 pub mod sources;
 pub mod static_web;
@@ -20,6 +21,7 @@ pub mod task_runs;
 mod tool_api;
 pub mod web_providers;
 
+pub use project_folders::{ProjectFolder, ProjectFolderInfo, ProjectFolders};
 pub use task_runs::TaskRunRegistry;
 
 use async_trait::async_trait;
@@ -32,8 +34,9 @@ use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use dhi_agent::{AgentRuntime, LlmPool, PoolSnapshot, RawProfile, ResolvedProfile};
 use dhi_core::{
-    AgentRole, AgentRun, Approval, ApprovalDecision, ApprovalStatus, GraphStore, GuardStore,
-    GuardVerdict, ReopenOutcome, Task, TaskCapacity, TaskId, TaskInstruction, TaskState, Topology,
+    AgentRole, AgentRun, AgentsMdState, Approval, ApprovalDecision, ApprovalStatus, GraphStore,
+    GuardStore, GuardVerdict, NewTask, ReopenOutcome, Task, TaskCapacity, TaskId, TaskInstruction,
+    TaskState, Topology,
 };
 use dhi_engine::Engine;
 use dhi_guard::ToolBackend;
@@ -94,6 +97,8 @@ pub struct AppState {
     /// The loops this process is running. Stop requests flip their flags; the
     /// hard-kill monitor aborts them after a grace period.
     pub task_runs: Arc<TaskRunRegistry>,
+    /// The validated project folders a task may select at creation.
+    pub project_folders: Arc<project_folders::ProjectFolders>,
 }
 
 /// Default page size of `GET /api/tasks`.
@@ -125,6 +130,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/tasks", get(list_tasks).post(create_task))
+        .route("/api/project-folders", get(list_project_folders))
         .route("/api/tasks/stop", post(stop_tasks))
         .route("/api/tasks/delete", post(delete_tasks_route))
         .route("/api/tasks/{id}", get(get_task).delete(delete_task_route))
@@ -262,6 +268,20 @@ async fn health() -> Json<Value> {
     }))
 }
 
+/// `GET /api/project-folders` output.
+#[derive(Debug, Serialize)]
+struct ProjectFoldersResponse {
+    folders: Vec<project_folders::ProjectFolderInfo>,
+}
+
+/// Lists the configured project folders, whether each has `AGENTS.md`, and
+/// their display names.
+async fn list_project_folders(State(state): State<AppState>) -> Json<ProjectFoldersResponse> {
+    Json(ProjectFoldersResponse {
+        folders: state.project_folders.info(),
+    })
+}
+
 /// The one API error shape: `{ "error": "message" }`.
 pub(crate) struct ApiError {
     status: StatusCode,
@@ -332,6 +352,11 @@ impl IntoResponse for ApiError {
 ///
 /// An optional `swarm_workers` count is valid only with `topology = "swarm"`
 /// and must be 2 to 8. It pins the exact team size for every swarm plan.
+///
+/// An optional `project_folder` must exactly match one configured
+/// `DHI_PROJECT_FOLDERS` path. `load_agents_md` defaults to true when a
+/// folder is selected and its `AGENTS.md` exists; omitting it otherwise leaves
+/// the toggle off.
 #[derive(Debug, Deserialize)]
 struct CreateTaskRequest {
     goal: String,
@@ -344,6 +369,10 @@ struct CreateTaskRequest {
     topology: Option<Topology>,
     #[serde(default)]
     swarm_workers: Option<usize>,
+    #[serde(default)]
+    project_folder: Option<String>,
+    #[serde(default)]
+    load_agents_md: Option<bool>,
 }
 
 /// `POST /api/tasks/{id}/goals` input.
@@ -494,6 +523,34 @@ async fn require_task(store: &dyn GraphStore, id: TaskId) -> Result<Task, ApiErr
         .ok_or_else(|| ApiError::not_found(format!("task not found: {id}")))
 }
 
+/// Removes a just-created project task folder if the create request fails
+/// before the task row exists.
+///
+/// It is armed only when the folder did not exist before this request, so a
+/// failed create can never delete an existing task folder. A successful store
+/// insert commits it: the folder then belongs to the persisted task.
+struct NewProjectTaskFolder {
+    path: Option<PathBuf>,
+}
+
+impl NewProjectTaskFolder {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn commit(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for NewProjectTaskFolder {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
 /// Creates a task, then runs it in the background.
 ///
 /// The response is the task as created (`created`), including any capacity
@@ -518,17 +575,88 @@ async fn create_task(
         validate_pin(mgmt, body.worker_profile_id, "worker_profile_id").await?;
     }
 
+    let project = match body.project_folder.as_deref() {
+        Some(folder) => Some(
+            state
+                .project_folders
+                .resolve(folder)
+                .map_err(ApiError::bad_request)?,
+        ),
+        None => None,
+    };
+    let (load_agents_md, agents_md_state) = match &project {
+        Some(folder) => {
+            let found = dhi_core::inspect_agents_md(folder).map_err(|err| {
+                ApiError::bad_request(format!(
+                    "cannot inspect {}/AGENTS.md: {err}",
+                    folder.display()
+                ))
+            })?;
+            match body.load_agents_md {
+                Some(true) => (true, found),
+                Some(false) => (false, AgentsMdState::Disabled),
+                None if found.has_instructions() => (true, found),
+                None => (false, AgentsMdState::Disabled),
+            }
+        }
+        None => {
+            if body.load_agents_md == Some(true) {
+                return Err(ApiError::bad_request(
+                    "load_agents_md requires project_folder",
+                ));
+            }
+            (false, AgentsMdState::Disabled)
+        }
+    };
+
+    // The id is allocated here so the project task folder exists before the
+    // row does; a folder failure must not leave a task behind.
+    let task_id = Uuid::new_v4();
+    let mut new_task_folder = None;
+    if let Some(folder) = &project {
+        let path = folder.join(".dhi").join(task_id.to_string());
+        let newly_created = matches!(
+            std::fs::symlink_metadata(&path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound
+        );
+        if newly_created {
+            new_task_folder = Some(NewProjectTaskFolder::new(path));
+        }
+        dhi_exec::prepare_project_task_dir(folder, task_id).map_err(|err| {
+            ApiError::bad_request(format!("cannot prepare the project task folder: {err}"))
+        })?;
+    }
+    let project_folder = project
+        .as_ref()
+        .map(|folder| {
+            folder
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| ApiError::bad_request("project_folder is not valid UTF-8"))
+        })
+        .transpose()?;
+
     let mut task = state
         .store
-        .create_task_with_pins(
-            body.goal,
-            body.planner_profile_id,
-            body.worker_profile_id,
-            body.topology,
+        .create_task_with_pins(NewTask {
+            id: Some(task_id),
+            goal: body.goal,
+            planner_pin: body.planner_profile_id,
+            worker_pin: body.worker_profile_id,
+            topology: body.topology,
             swarm_workers,
-        )
+            project_folder,
+            load_agents_md,
+            agents_md_state,
+        })
         .await
         .map_err(ApiError::internal)?;
+
+    // The row exists: the folder is no longer an orphan, even if a later
+    // capacity write fails.
+    if let Some(folder) = new_task_folder.as_mut() {
+        folder.commit();
+    }
 
     // The ledger must be durable before the engine snapshots it at run start.
     if let Some(capacity) = capacity {
@@ -539,7 +667,7 @@ async fn create_task(
             .map_err(ApiError::internal)?;
     }
 
-    spawn_task_loop(&state.store, &state.task_runs, &state.engine, task.id);
+    spawn_task_loop(&state.store, &state.task_runs, &state.engine, &task);
 
     Ok((StatusCode::CREATED, Json(task)))
 }
@@ -636,8 +764,10 @@ fn spawn_task_loop(
     store: &Arc<dyn GraphStore>,
     registry: &Arc<TaskRunRegistry>,
     engine: &Arc<Engine>,
-    task_id: TaskId,
+    task: &Task,
 ) {
+    let task_id = task.id;
+    registry.track_task_project(task);
     let stop = Arc::new(AtomicBool::new(false));
     let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
     let (token_tx, token_rx) = tokio::sync::oneshot::channel::<Option<u64>>();
@@ -706,7 +836,7 @@ async fn add_goal_route(
             "task {id} is {current}; only a done, failed, timeout, or cancelled task can be reopened"
         ))),
         ReopenOutcome::Reopened { task, goal } => {
-            spawn_task_loop(&state.store, &state.task_runs, &state.engine, task.id);
+            spawn_task_loop(&state.store, &state.task_runs, &state.engine, &task);
             Ok((StatusCode::OK, Json(AddGoalResponse { task, goal })))
         }
     }
@@ -758,7 +888,7 @@ async fn set_task_capacity_route(
         .map_err(ApiError::internal)?
     {
         updated.state = TaskState::Running;
-        spawn_task_loop(&state.store, &state.task_runs, &state.engine, id);
+        spawn_task_loop(&state.store, &state.task_runs, &state.engine, &updated);
     } else if updated.state == TaskState::Paused {
         // Another request won the resume; return its current state instead of
         // the stale paused snapshot.
@@ -2347,7 +2477,7 @@ async fn recover_inner(
             continue;
         }
         match registry {
-            Some(registry) => spawn_task_loop(store, registry, engine, task.id),
+            Some(registry) => spawn_task_loop(store, registry, engine, &task),
             None => {
                 let engine = engine.clone();
                 let store = store.clone();
@@ -2489,6 +2619,7 @@ mod tests {
             tool_control: None,
             web: Arc::new(crate::web_providers::WebProviderRuntime::empty()),
             task_runs: Arc::new(TaskRunRegistry::disabled()),
+            project_folders: Arc::new(crate::project_folders::ProjectFolders::default()),
         }
     }
 
@@ -3345,6 +3476,7 @@ mod tests {
             tool_control: None,
             web: Arc::new(crate::web_providers::WebProviderRuntime::empty()),
             task_runs: Arc::new(TaskRunRegistry::disabled()),
+            project_folders: Arc::new(crate::project_folders::ProjectFolders::default()),
         }
     }
 
@@ -3390,6 +3522,7 @@ mod tests {
             tool_control: None,
             web: Arc::new(crate::web_providers::WebProviderRuntime::empty()),
             task_runs: Arc::new(TaskRunRegistry::disabled()),
+            project_folders: Arc::new(crate::project_folders::ProjectFolders::default()),
         }
     }
 
@@ -3864,6 +3997,228 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_task_legacy_json_keeps_project_fields_null_and_off() {
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store.clone()));
+        let (status, json) = send(app.clone(), post_task("legacy task")).await;
+
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert!(json["project_folder"].is_null(), "{json}");
+        assert!(json["task_folder"].is_null(), "{json}");
+        assert_eq!(json["load_agents_md"], false, "{json}");
+        assert_eq!(json["agents_md_state"], "disabled", "{json}");
+
+        let id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
+        let (status, detail) = send(app, get_uri(&format!("/api/tasks/{id}"))).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert!(detail["project_folder"].is_null(), "{detail}");
+        assert!(detail["task_folder"].is_null(), "{detail}");
+        assert_eq!(detail["load_agents_md"], false, "{detail}");
+        assert_eq!(detail["agents_md_state"], "disabled", "{detail}");
+    }
+
+    fn state_with_project_folders(
+        store: Arc<MemoryStore>,
+        folders: &[&std::path::Path],
+    ) -> AppState {
+        let mut state = test_state_with_store(store);
+        let value = folders
+            .iter()
+            .map(|folder| folder.display().to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        state.project_folders = Arc::new(
+            project_folders::ProjectFolders::parse(Some(&value))
+                .expect("test project folders are valid"),
+        );
+        state
+    }
+
+    #[tokio::test]
+    async fn project_folders_route_lists_configured_folders() {
+        let temp = tempfile::tempdir().unwrap();
+        let with_agents = temp.path().join("with-agents");
+        let without_agents = temp.path().join("without-agents");
+        std::fs::create_dir_all(&with_agents).unwrap();
+        std::fs::create_dir_all(&without_agents).unwrap();
+        std::fs::write(with_agents.join("AGENTS.md"), "rules").unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let state =
+            state_with_project_folders(store, &[with_agents.as_path(), without_agents.as_path()]);
+        let (status, body) = send(router(state), get_uri("/api/project-folders")).await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let folders = body["folders"].as_array().expect("folders array");
+        assert_eq!(folders.len(), 2, "{body}");
+        assert_eq!(folders[0]["name"], "with-agents");
+        let canonical = std::fs::canonicalize(&with_agents).unwrap();
+        let canonical_text = canonical.display().to_string();
+        assert_eq!(folders[0]["path"].as_str(), Some(canonical_text.as_str()));
+        assert_eq!(folders[0]["agents_md_present"], true);
+        assert_eq!(folders[1]["name"], "without-agents");
+        assert_eq!(folders[1]["agents_md_present"], false);
+    }
+
+    #[tokio::test]
+    async fn create_task_selects_a_project_folder_and_creates_its_task_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("AGENTS.md"), "use the project style").unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let app = router(state_with_project_folders(
+            store.clone(),
+            &[project.as_path()],
+        ));
+
+        let (status, json) = send(
+            app.clone(),
+            post_json(
+                "/api/tasks",
+                json!({
+                    "goal": "read the project",
+                    "project_folder": project.display().to_string(),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        let canonical = std::fs::canonicalize(&project).unwrap();
+        let id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
+        let expected_folder = canonical.join(".dhi").join(id.to_string());
+        let canonical_text = canonical.display().to_string();
+        let folder_text = expected_folder.display().to_string();
+        assert_eq!(
+            json["project_folder"].as_str(),
+            Some(canonical_text.as_str())
+        );
+        assert_eq!(json["task_folder"].as_str(), Some(folder_text.as_str()));
+        assert_eq!(json["load_agents_md"], true, "{json}");
+        assert_eq!(json["agents_md_state"], "loaded", "{json}");
+        assert!(expected_folder.is_dir(), "the task folder exists at create");
+        assert_eq!(
+            std::fs::read_to_string(canonical.join(".dhi").join(".gitignore")).unwrap(),
+            "*\n"
+        );
+
+        let (status, detail) = send(app, get_uri(&format!("/api/tasks/{id}"))).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(
+            detail["project_folder"].as_str(),
+            Some(canonical_text.as_str())
+        );
+        assert_eq!(detail["task_folder"].as_str(), Some(folder_text.as_str()));
+        assert_eq!(detail["load_agents_md"], true);
+        assert_eq!(detail["agents_md_state"], "loaded");
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_an_unconfigured_project_folder() {
+        let temp = tempfile::tempdir().unwrap();
+        let configured = temp.path().join("configured");
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&configured).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let app = router(state_with_project_folders(
+            store.clone(),
+            &[configured.as_path()],
+        ));
+
+        for folder in [
+            other.display().to_string(),
+            configured.join("nested").display().to_string(),
+            configured
+                .join("..")
+                .join("configured")
+                .display()
+                .to_string(),
+            "relative/project".to_string(),
+            String::new(),
+        ] {
+            let (status, json) = send(
+                app.clone(),
+                post_json(
+                    "/api/tasks",
+                    json!({"goal": "bad folder", "project_folder": folder}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{folder} -> {json}");
+        }
+        assert!(
+            store.list_tasks(10).await.unwrap().is_empty(),
+            "no invalid create may persist a task"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_with_missing_agents_md_and_explicit_toggle_is_not_found() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let app = router(state_with_project_folders(
+            store.clone(),
+            &[project.as_path()],
+        ));
+
+        let (status, json) = send(
+            app,
+            post_json(
+                "/api/tasks",
+                json!({
+                    "goal": "no instructions",
+                    "project_folder": project.display().to_string(),
+                    "load_agents_md": true,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert_eq!(json["load_agents_md"], true, "{json}");
+        assert_eq!(json["agents_md_state"], "not_found", "{json}");
+    }
+
+    #[tokio::test]
+    async fn create_task_without_project_rejects_enabling_agents_md() {
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store));
+        let (status, json) = send(
+            app,
+            post_json(
+                "/api/tasks",
+                json!({"goal": "no folder", "load_agents_md": true}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("project_folder")
+        );
+    }
+
+    #[test]
+    fn a_new_project_task_folder_is_removed_unless_committed() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let abandoned = temp.path().join(".dhi").join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&abandoned).unwrap();
+        drop(NewProjectTaskFolder::new(abandoned.clone()));
+        assert!(!abandoned.exists(), "a failed create removes its folder");
+
+        let kept = temp.path().join(".dhi").join(Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&kept).unwrap();
+        let mut guard = NewProjectTaskFolder::new(kept.clone());
+        guard.commit();
+        drop(guard);
+        assert!(kept.is_dir(), "a committed folder belongs to the task");
+    }
+
+    #[tokio::test]
     async fn create_task_rejects_bad_input() {
         let app = router(test_state());
         let (status, json) = send(app, post_task("  ")).await;
@@ -4026,11 +4381,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let task = store
             .create_task_with_pins(
-                "keep my topology".to_string(),
-                None,
-                None,
-                Some(Topology::Single),
-                None,
+                dhi_core::NewTask::new("keep my topology").with_topology(Some(Topology::Single)),
             )
             .await
             .unwrap();
