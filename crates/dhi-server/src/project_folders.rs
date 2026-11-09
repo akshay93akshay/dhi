@@ -305,11 +305,13 @@ mod tests {
         let probe = first.join(".probe");
         let writable = fs::write(&probe, b"x").is_ok();
         let _ = fs::remove_file(&probe);
-        fs::set_permissions(&first, fs::Permissions::from_mode(0o700)).unwrap();
         if writable {
+            fs::set_permissions(&first, fs::Permissions::from_mode(0o700)).unwrap();
             return;
         }
+        // Validate while the folder is still read-only; restore afterwards.
         let err = ProjectFolders::parse(Some(&first.display().to_string())).unwrap_err();
+        fs::set_permissions(&first, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(err.to_string().contains("not writable"), "{err}");
     }
 
