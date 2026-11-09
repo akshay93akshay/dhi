@@ -82,6 +82,9 @@ jobs:
 
   publish:
     needs: [hygiene, rust, web]
+    # Branch pushes do not publish an image; fresh-image handles those. Skip
+    # the redundant untagged Docker build on every branch.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
