@@ -14,7 +14,10 @@ RUN rm -rf out && NEXT_EXPORT=1 npm run build
 # ---------------------------------------------------------------------------
 # Rust: build the release server binary.
 # ---------------------------------------------------------------------------
-FROM rust:1.99.1-bookworm AS builder
+# cargo-chef splits dependency compilation from source compilation. Docker
+# caches the dependency layer until Cargo.toml or Cargo.lock changes, so a
+# normal source edit only rebuilds the DHI crates.
+FROM rust:1.99.1-bookworm AS chef
 
 # aws-lc-sys (pulled in by rustls) builds C sources and needs cmake; onig_sys
 # and other native dependencies probe with pkg-config.
@@ -24,14 +27,22 @@ RUN apt-get update \
         cmake \
         perl \
         pkg-config \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && cargo install cargo-chef --locked
 
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY crates/ ./crates/
-COPY ops/ ./ops/
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
 
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+COPY rust-toolchain.toml ./
+RUN cargo chef cook --release --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ ./crates/
 RUN cargo build --release -p dhi-server
 
 # ---------------------------------------------------------------------------

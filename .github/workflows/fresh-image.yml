@@ -30,9 +30,12 @@ jobs:
         with:
           context: .
           push: true
-          no-cache: true
           pull: true
           tags: ghcr.io/${{ github.repository }}:${{ steps.tag.outputs.tag }}
+          # Layer cache across runs. Combined with cargo-chef in the
+          # Dockerfile, a source-only change reuses the dependency build.
+          cache-from: type=gha,scope=dhi-image
+          cache-to: type=gha,mode=max,scope=dhi-image
 
   verify-pull:
     needs: build
