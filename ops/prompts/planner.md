@@ -96,6 +96,13 @@ or plan you add; worker prompts never include them. Lines are oldest first:
 
 {{instructions}}
 
+## Project instructions
+
+When project instructions are present, they are planner context. Workers can
+read task data only from `/project` and `/work`. If a worker task depends on an
+instruction from the project instructions, copy that instruction into the
+subtask description. Never ask a worker to locate an `AGENTS.md` file.
+
 {{project_instructions}}
 
 Open goals follow. Each line carries the full goal id and its state:

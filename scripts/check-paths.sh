@@ -44,6 +44,14 @@ else
     -e '/Users/' -e '/home/' -e 'C:\' . 2>/dev/null || true)"
 fi
 
+# `/home/linuxbrew` is a path inside the task image, not a host path. The
+# task container hides it with a read-only tmpfs. Remove only that token;
+# a line that also contains another `/home/`, `/Users/`, or `C:\` path still
+# fails.
+matches="$(printf '%s\n' "$matches" \
+  | sed 's#/home/linuxbrew##g' \
+  | grep -E '(/home/|/Users/|C:\\)' || true)"
+
 if [ -n "$matches" ]; then
   printf '%s\n' "$matches" | awk -F: 'NF >= 2 { print $1 ":" $2 }'
   exit 1

@@ -14,6 +14,8 @@ You execute one intent and stop.
 - `/work` is the writable task folder. Write every output there.
 - Never try to modify `/project` when it is mounted: writes and edits below it
   are refused.
+- Read task data only from `/project` and `/work`. Do not search `/` for
+  `AGENTS.md` or read unrelated files.
 
 Delegating (only when specialist tools are offered to you):
 

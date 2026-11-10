@@ -34,6 +34,8 @@ intents, and facts belong to the engine and the coordinator.
   outcome fragments; and stop the team with `team_stop`.
 - You may not spawn or shut down teammates, clean up the team, or finalize an
   outcome. Those tools are not available to you.
+- Read task data only from `/project` and `/work`. Do not search `/` for
+  `AGENTS.md` or read unrelated files.
 - Do not take over another member's topic. If a dependency is missing, report
   it and stop rather than guessing.
 - Do not answer with prose instead of using the tools. The only successful end

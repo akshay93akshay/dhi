@@ -74,6 +74,20 @@ const CONTAINER_PROJECT: &str = "/project";
 /// task can never see another task's folder through the project mount.
 const PROJECT_DHI_TMPFS: &str = "/project/.dhi:ro,noexec,nosuid,size=64k";
 
+/// Empty read-only tmpfs mounts that hide image-only paths from every task
+/// process. The task data plane is `/project` and `/work`; these paths are
+/// part of the task image, not task data. The Gitpod toolchain directories
+/// stay visible because they hold the Node, Cargo, and Python tools. The
+/// Homebrew source directory is hidden because it contains an unrelated
+/// `AGENTS.md`; Homebrew packages and the Cellar stay visible, but the `brew`
+/// symlink into the source directory is gone.
+const HIDDEN_IMAGE_TMPFS: [&str; 4] = [
+    "/home/linuxbrew/.linuxbrew/Homebrew:ro,noexec,nosuid,size=64k",
+    "/root:ro,noexec,nosuid,size=64k",
+    "/workspace:ro,noexec,nosuid,size=64k",
+    "/opt:ro,noexec,nosuid,size=64k",
+];
+
 /// Where the task's spill directory is mounted read-only inside a container.
 const CONTAINER_SPILL: &str = "/work/.dhi/spill";
 
@@ -837,36 +851,11 @@ impl TaskContainers {
         })
     }
 
-    /// Starts the task container, reusing it only when it is a running
-    /// container this manager started for this task, root, and configuration.
+    /// Builds the one `docker run` command for a task container.
     ///
-    /// A container with the expected name that is not managed, belongs to
-    /// another task, or was started for another root is refused: it is never
-    /// removed. A managed container for this task and root whose
-    /// configuration differs is removed and started again.
-    async fn start_container(&self, task_id: Uuid, mounts: &TaskMounts) -> anyhow::Result<()> {
-        let name = container_name(task_id);
-        if let Some(container) = self.inspect_container(&name).await? {
-            if !is_managed_for(&container.labels, task_id) {
-                bail!(
-                    "container {name} already exists but is not managed for task {task_id}; \
-                     refusing to reuse or remove it"
-                );
-            }
-            if container.labels.get(ROOT_LABEL) != Some(&self.root_hash) {
-                bail!(
-                    "container {name} belongs to a different task root; refusing to reuse \
-                     or remove it"
-                );
-            }
-            if container.running && container.labels.get(CONFIG_LABEL) == Some(&self.config_hash) {
-                return Ok(());
-            }
-            // It is ours, for this task and root, but stopped or started
-            // with another configuration: replace it.
-            self.remove_container(task_id, &name).await?;
-        }
-
+    /// The command is separate from [`Self::start_container`] so tests can
+    /// inspect the exact mounts, including the hidden image masks.
+    fn docker_run_command(&self, name: &str, task_id: Uuid, mounts: &TaskMounts) -> Command {
         let mut command = Command::new("docker");
         command
             .arg("run")
@@ -874,7 +863,7 @@ impl TaskContainers {
             .arg("--rm")
             .arg("--init")
             .arg("--name")
-            .arg(&name)
+            .arg(name)
             .arg("--label")
             .arg(format!("{MANAGED_LABEL}=1"))
             .arg("--label")
@@ -892,7 +881,9 @@ impl TaskContainers {
         command
             .arg("--read-only")
             .arg("--tmpfs")
-            .arg("/tmp:rw,noexec,nosuid,size=512m")
+            .arg("/tmp:rw,noexec,nosuid,size=512m");
+        append_hidden_image_tmpfs(&mut command);
+        command
             .arg("--cap-drop")
             .arg("ALL")
             .arg("--security-opt")
@@ -937,6 +928,40 @@ impl TaskContainers {
             .arg(&self.config.image)
             .arg("-c")
             .arg("trap : TERM INT; sleep infinity & wait");
+        command
+    }
+
+    /// Starts the task container, reusing it only when it is a running
+    /// container this manager started for this task, root, and configuration.
+    ///
+    /// A container with the expected name that is not managed, belongs to
+    /// another task, or was started for another root is refused: it is never
+    /// removed. A managed container for this task and root whose
+    /// configuration differs is removed and started again.
+    async fn start_container(&self, task_id: Uuid, mounts: &TaskMounts) -> anyhow::Result<()> {
+        let name = container_name(task_id);
+        if let Some(container) = self.inspect_container(&name).await? {
+            if !is_managed_for(&container.labels, task_id) {
+                bail!(
+                    "container {name} already exists but is not managed for task {task_id}; \
+                     refusing to reuse or remove it"
+                );
+            }
+            if container.labels.get(ROOT_LABEL) != Some(&self.root_hash) {
+                bail!(
+                    "container {name} belongs to a different task root; refusing to reuse \
+                     or remove it"
+                );
+            }
+            if container.running && container.labels.get(CONFIG_LABEL) == Some(&self.config_hash) {
+                return Ok(());
+            }
+            // It is ours, for this task and root, but stopped or started
+            // with another configuration: replace it.
+            self.remove_container(task_id, &name).await?;
+        }
+
+        let command = self.docker_run_command(&name, task_id, mounts);
 
         let output =
             match run_docker(command, RUN_TIMEOUT, &format!("start container {name}")).await {
@@ -1121,8 +1146,26 @@ fn container_user() -> Option<String> {
     }
 }
 
+/// Adds the image-only path masks to one `docker run` command.
+fn append_hidden_image_tmpfs(command: &mut Command) {
+    for hidden in HIDDEN_IMAGE_TMPFS {
+        command.arg("--tmpfs").arg(hidden);
+    }
+}
+
 /// The hash of the configuration that changes what a container is.
+///
+/// The hidden image masks are part of the hash: an upgrade that adds a mask
+/// must replace a reused container started by the old configuration.
 fn config_hash(config: &ContainerConfig, user: Option<&str>, mount_root: &Path) -> String {
+    sha256_hex(&config_hash_material(config, user, mount_root))
+}
+
+fn config_hash_material(
+    config: &ContainerConfig,
+    user: Option<&str>,
+    mount_root: &Path,
+) -> Vec<u8> {
     let mut material = format!(
         "image={}\nnetwork={}\nmemory={}\ncpus={}\npids={}\nuser={}\n",
         config.image,
@@ -1133,8 +1176,14 @@ fn config_hash(config: &ContainerConfig, user: Option<&str>, mount_root: &Path) 
         user.unwrap_or("")
     )
     .into_bytes();
+    material.extend_from_slice(b"hidden_image_tmpfs=\n");
+    for hidden in HIDDEN_IMAGE_TMPFS {
+        material.extend_from_slice(hidden.as_bytes());
+        material.push(b'\n');
+    }
+    material.extend_from_slice(b"mount_root=");
     material.extend_from_slice(mount_root.as_os_str().as_encoded_bytes());
-    sha256_hex(&material)
+    material
 }
 
 /// The lowercase hexadecimal SHA-256 of `bytes`.
@@ -1770,6 +1819,63 @@ mod tests {
             host.join(task.to_string()),
             "project mode never falls back to the legacy workspace root"
         );
+    }
+
+    #[test]
+    fn image_only_paths_are_hidden_with_read_only_tmpfs() {
+        let paths: Vec<&str> = HIDDEN_IMAGE_TMPFS
+            .iter()
+            .map(|spec| spec.split(':').next().expect("path before options"))
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/home/linuxbrew/.linuxbrew/Homebrew",
+                "/root",
+                "/workspace",
+                "/opt"
+            ]
+        );
+        for spec in HIDDEN_IMAGE_TMPFS {
+            assert!(spec.contains(":ro,"), "must be read-only: {spec}");
+            assert!(spec.contains("noexec"), "must not execute: {spec}");
+            assert!(spec.contains("nosuid"), "must not use suid: {spec}");
+        }
+    }
+
+    #[test]
+    fn docker_run_command_includes_hidden_image_masks() {
+        let temp = tempfile::tempdir().unwrap();
+        let containers = TaskContainers::local(temp.path().join("tasks")).unwrap();
+        let task = Uuid::new_v4();
+        let mounts = task_mounts(containers.root(), None, task, None);
+        let command = containers.docker_run_command(&container_name(task), task, &mounts);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        for spec in HIDDEN_IMAGE_TMPFS {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--tmpfs" && pair[1] == spec),
+                "missing {spec} in {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_hash_includes_the_hidden_image_masks() {
+        let material = config_hash_material(
+            &ContainerConfig::default(),
+            None,
+            Path::new("/app/workspace"),
+        );
+        let text = String::from_utf8_lossy(&material);
+        assert!(text.contains("hidden_image_tmpfs="));
+        for spec in HIDDEN_IMAGE_TMPFS {
+            assert!(text.contains(spec), "missing {spec}");
+        }
     }
 
     #[cfg(unix)]
