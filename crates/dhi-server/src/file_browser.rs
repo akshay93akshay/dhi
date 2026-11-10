@@ -392,12 +392,12 @@ fn read_entries(dir: &Path) -> Result<Vec<FileEntry>, String> {
     for entry in reader {
         let entry =
             entry.map_err(|err| format!("path {} cannot be listed: {err}", dir.display()))?;
-        let file_type = entry.file_type().map_err(|err| {
-            format!(
-                "entry {} cannot be inspected: {err}",
-                entry.path().display()
-            )
-        })?;
+        // One unreadable entry must not hide the rest of the directory. macOS
+        // home roots, for example, can contain `.Trash` entries that cannot be
+        // inspected by the server's user. Skip them.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         if file_type.is_symlink() {
             continue;
         }
@@ -408,12 +408,9 @@ fn read_entries(dir: &Path) -> Result<Vec<FileEntry>, String> {
         } else {
             continue;
         };
-        let metadata = entry.metadata().map_err(|err| {
-            format!(
-                "entry {} cannot be inspected: {err}",
-                entry.path().display()
-            )
-        })?;
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
         entries.push(FileEntry {
             name: entry.file_name().to_string_lossy().into_owned(),
             path: entry.path().to_string_lossy().into_owned(),
