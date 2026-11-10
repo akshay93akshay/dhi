@@ -2266,6 +2266,51 @@ impl TeamStore for MemoryTeamStore {
     }
 }
 
+impl MemoryTeamStore {
+    fn store_message(&self, message: &NewTeamMessage) -> Result<TeamMessage, TeamError> {
+        if message.body.trim().is_empty() {
+            return Err(TeamError::validation(
+                message.team_id,
+                "message body must not be empty",
+            ));
+        }
+        let mut state = self.lock();
+        if let Some(task_id) = message.task_id
+            && !state
+                .tasks
+                .get(&task_id)
+                .is_some_and(|task| task.team_id == message.team_id)
+        {
+            return Err(TeamError::validation(
+                message.team_id,
+                format!("unknown team task {task_id}"),
+            ));
+        }
+        if let Some(to) = &message.to_agent_id
+            && !state.members.contains_key(&(message.team_id, to.clone()))
+        {
+            return Err(TeamError::validation(
+                message.team_id,
+                format!("unknown recipient {to}"),
+            ));
+        }
+        state.next_message_id += 1;
+        let stored = TeamMessage {
+            id: state.next_message_id,
+            team_id: message.team_id,
+            from_agent_id: message.from_agent_id.clone(),
+            to_agent_id: message.to_agent_id.clone(),
+            subject: message.subject.trim().to_string(),
+            body: message.body.clone(),
+            task_id: message.task_id,
+            sent_at: Utc::now(),
+            read_at: None,
+        };
+        state.messages.push(stored.clone());
+        Ok(stored)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2279,7 +2324,6 @@ mod tests {
 
     #[test]
     fn ready_and_blocked_follow_dependencies() {
-        let team_id = Uuid::new_v4();
         let first = task(Uuid::new_v4(), TeamTaskStatus::Completed);
         let mut second = task(Uuid::new_v4(), TeamTaskStatus::Pending);
         second.depends_on = vec![first.id];
@@ -2379,7 +2423,7 @@ mod tests {
         let mut outcome = TeamOutcome::new(team_id, "report", "lead");
         outcome.required_sections = vec!["summary".into(), "evidence".into()];
 
-        let mut fragment = TeamOutcomeFragment {
+        let fragment = TeamOutcomeFragment {
             id: Uuid::new_v4(),
             team_id,
             outcome_id: outcome.id,
@@ -2459,50 +2503,5 @@ mod tests {
         ] {
             assert_eq!(MissionLogKind::parse(kind.as_str()), Some(kind));
         }
-    }
-}
-
-impl MemoryTeamStore {
-    fn store_message(&self, message: &NewTeamMessage) -> Result<TeamMessage, TeamError> {
-        if message.body.trim().is_empty() {
-            return Err(TeamError::validation(
-                message.team_id,
-                "message body must not be empty",
-            ));
-        }
-        let mut state = self.lock();
-        if let Some(task_id) = message.task_id
-            && !state
-                .tasks
-                .get(&task_id)
-                .is_some_and(|task| task.team_id == message.team_id)
-        {
-            return Err(TeamError::validation(
-                message.team_id,
-                format!("unknown team task {task_id}"),
-            ));
-        }
-        if let Some(to) = &message.to_agent_id
-            && !state.members.contains_key(&(message.team_id, to.clone()))
-        {
-            return Err(TeamError::validation(
-                message.team_id,
-                format!("unknown recipient {to}"),
-            ));
-        }
-        state.next_message_id += 1;
-        let stored = TeamMessage {
-            id: state.next_message_id,
-            team_id: message.team_id,
-            from_agent_id: message.from_agent_id.clone(),
-            to_agent_id: message.to_agent_id.clone(),
-            subject: message.subject.trim().to_string(),
-            body: message.body.clone(),
-            task_id: message.task_id,
-            sent_at: Utc::now(),
-            read_at: None,
-        };
-        state.messages.push(stored.clone());
-        Ok(stored)
     }
 }
