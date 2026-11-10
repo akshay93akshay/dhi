@@ -2909,7 +2909,7 @@ mod tests {
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("coordinator script exhausted"))?;
             for (name, args) in &script.calls {
-                call_team_tool(&team_tools, *name, args.clone()).await?;
+                call_team_tool(&team_tools, name, args.clone()).await?;
             }
             let output = execute_output(script.summary, vec![]);
             if !script.record {
@@ -2941,7 +2941,7 @@ mod tests {
                 .take()
                 .ok_or_else(|| anyhow::anyhow!("teammate script exhausted"))?;
             for (name, args) in &script.calls {
-                call_team_tool(&team_tools, *name, args.clone()).await?;
+                call_team_tool(&team_tools, name, args.clone()).await?;
             }
             let output = execute_output(script.summary, vec![]);
             if !script.record {
