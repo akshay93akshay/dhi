@@ -98,10 +98,10 @@ or plan you add; worker prompts never include them. Lines are oldest first:
 
 ## Project instructions
 
-When project instructions are present, they are planner context. Workers can
-read task data only from `/project` and `/work`. If a worker task depends on an
-instruction from the project instructions, copy that instruction into the
-subtask description. Never ask a worker to locate an `AGENTS.md` file.
+When project instructions are present, use them to plan the work. The same
+selected text travels with every worker as context. Do not repeat it in every
+subtask description. Workers can read task data only from `/project` and
+`/work`; never ask a worker to locate an `AGENTS.md` file.
 
 {{project_instructions}}
 

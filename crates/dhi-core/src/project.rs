@@ -1,4 +1,4 @@
-//! Project folders and planner-only `AGENTS.md` instructions.
+//! Project folders and `AGENTS.md` instructions.
 //!
 //! A project folder is an absolute directory the user selected at task
 //! creation. The task's instruction file is the selected `agents_md_path`,
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 /// The one instruction file name inside a project folder.
 pub const AGENTS_MD_FILE: &str = "AGENTS.md";
 
-/// Largest number of `AGENTS.md` bytes a planner prompt may receive.
+/// Largest number of `AGENTS.md` bytes one prompt context may receive.
 pub const AGENTS_MD_MAX_BYTES: usize = 32 * 1024;
 
 /// What happened when DHI looked for a project's `AGENTS.md` at creation.

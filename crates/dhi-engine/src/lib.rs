@@ -168,6 +168,26 @@ fn team_fact_context(facts: &[Fact]) -> Vec<String> {
         .collect()
 }
 
+/// Adds the selected `AGENTS.md` text to one worker's context.
+///
+/// The selected file may live outside `/project`, so the worker cannot read
+/// it from the task container. The engine gives the worker the same bounded
+/// text the planner received.
+fn append_project_instructions(context: &mut Vec<String>, project_instructions: Option<&str>) {
+    if let Some(text) = project_instructions
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        context.push(format!("Project instructions (AGENTS.md):\n{text}"));
+    }
+}
+
+fn worker_context(facts: &[Fact], project_instructions: Option<&str>) -> Vec<String> {
+    let mut context = team_fact_context(facts);
+    append_project_instructions(&mut context, project_instructions);
+    context
+}
+
 /// True when a store rejected a second fact for one intent.
 ///
 /// Both stores surface `CoreError::FactAlreadyRecordedForIntent`; the
@@ -889,6 +909,7 @@ impl Engine {
         intent: &Intent,
         plan: &IntentPlan,
         facts: &[Fact],
+        project_instructions: Option<&str>,
         model_calls: &Arc<AtomicUsize>,
         stop: Option<&Arc<AtomicBool>>,
     ) -> anyhow::Result<(IntentResult, IntentPlan, bool)> {
@@ -898,7 +919,7 @@ impl Engine {
             agent: Arc::clone(&self.agent),
             task_id,
             intent_id: intent.id,
-            context: team_fact_context(facts),
+            context: worker_context(facts, project_instructions),
             worker_profile_id: task.pinned_worker_profile_id,
         });
         let (result, allow_empty_result) = match plan.topology {
@@ -952,6 +973,7 @@ impl Engine {
                     let teammate_cap = Self::effective_teammate_cap(task, &plan);
                     let config = Self::team_run_config(task_id, intent.id, &plan, teammate_cap);
                     let mut context = team_fact_context(facts);
+                    append_project_instructions(&mut context, project_instructions);
                     context.push(format!(
                         "Coordinator id: {} (the persisted team role is `lead`; it is the coordinator)",
                         config.lead.agent_id
@@ -1567,7 +1589,9 @@ impl Engine {
         }
 
         // Project instructions are read exactly once per task start. The
-        // worker never receives them: only PlanInput carries the text.
+        // planner receives them in PlanInput; workers receive the same
+        // bounded text in their context so a selected file outside /project
+        // can still guide the work.
         let project_instructions = load_project_instructions(self.store.as_ref(), &mut task).await;
 
         let mut rounds = 0;
@@ -2079,6 +2103,7 @@ impl Engine {
                         &claimed,
                         &plan,
                         &facts,
+                        project_instructions.as_deref(),
                         &plan_model_calls,
                         stop.as_ref(),
                     )
@@ -2426,7 +2451,12 @@ impl Engine {
                     // runtime stamps is recorded under exactly this intent.
                     intent_id: claimed.id,
                     intent: claimed.description.clone(),
-                    context: facts.iter().map(|f| f.claim.clone()).collect(),
+                    context: {
+                        let mut context: Vec<String> =
+                            facts.iter().map(|f| f.claim.clone()).collect();
+                        append_project_instructions(&mut context, project_instructions.as_deref());
+                        context
+                    },
                     worker_profile_id: task.pinned_worker_profile_id,
                     max_turns: None,
                     agent_id: None,
@@ -2705,6 +2735,7 @@ mod tests {
         plans: Mutex<Vec<ScriptedPlan>>,
         executes: Mutex<Vec<dhi_agent::ExecuteOutput>>,
         plan_inputs: Mutex<Vec<PlanInput>>,
+        execute_inputs: Mutex<Vec<ExecuteInput>>,
     }
 
     impl ScriptedAgent {
@@ -2728,11 +2759,16 @@ mod tests {
                 plans: Mutex::new(plans),
                 executes: Mutex::new(executes),
                 plan_inputs: Mutex::new(Vec::new()),
+                execute_inputs: Mutex::new(Vec::new()),
             }
         }
 
         fn plan_inputs(&self) -> Vec<PlanInput> {
             self.plan_inputs.lock().unwrap().clone()
+        }
+
+        fn execute_inputs(&self) -> Vec<ExecuteInput> {
+            self.execute_inputs.lock().unwrap().clone()
         }
     }
 
@@ -2775,8 +2811,9 @@ mod tests {
 
         async fn execute(
             &self,
-            _input: ExecuteInput,
+            input: ExecuteInput,
         ) -> anyhow::Result<dhi_agent::AgentCall<dhi_agent::ExecuteOutput>> {
+            self.execute_inputs.lock().unwrap().push(input);
             Ok(unrecorded(self.executes.lock().unwrap().pop().ok_or_else(
                 || anyhow::anyhow!("execute script exhausted"),
             )?))
@@ -3917,6 +3954,76 @@ mod tests {
                 .expect("task exists")
                 .agents_md_state,
             AgentsMdState::Loaded
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_receives_the_selected_agents_md_in_context() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("AGENTS.md"),
+            "PROJECT-DEFAULT: this file was not selected",
+        )
+        .unwrap();
+        let selected = temp.path().join("shared").join("AGENTS.md");
+        std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        std::fs::write(&selected, "SELECTED-MARKER: keep the public API stable").unwrap();
+
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new("project task")
+                .with_project(
+                    project.display().to_string(),
+                    false,
+                    AgentsMdState::Disabled,
+                )
+                .with_agents_md(selected.display().to_string(), AgentsMdState::Loaded),
+        )
+        .await
+        .unwrap();
+        let goal = seed_goal(&store, &task).await;
+        let plan = IntentPlan {
+            intent: "use the selected instructions".to_string(),
+            topology: Topology::Single,
+            workers: Vec::new(),
+            subtasks: Vec::new(),
+            limits: CapabilityLimits::default(),
+        };
+        let agent = Arc::new(ScriptedAgent::with_plans(
+            vec![
+                ScriptedPlan::Outcome(planned_intent("use the selected instructions", plan)),
+                ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+            ],
+            vec![execute_output(
+                "worker used the selected instructions",
+                vec![],
+            )],
+        ));
+        let engine = Engine::new(store.clone(), Arc::clone(&agent) as Arc<dyn AgentRuntime>);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        let inputs = agent.execute_inputs();
+        assert_eq!(inputs.len(), 1, "the worker ran once");
+        assert!(
+            inputs[0]
+                .context
+                .iter()
+                .any(|line| line.contains("SELECTED-MARKER")),
+            "the worker receives the selected AGENTS.md text: {:?}",
+            inputs[0].context
+        );
+        assert!(
+            inputs[0]
+                .context
+                .iter()
+                .all(|line| !line.contains("PROJECT-DEFAULT")),
+            "the unselected project AGENTS.md never reaches the worker: {:?}",
+            inputs[0].context
         );
     }
 

@@ -101,8 +101,8 @@ pub struct PlanInput {
     #[serde(default)]
     pub instructions: Vec<String>,
     /// The project's bounded `AGENTS.md` text, read once when the task starts.
-    /// Planner-only: [`ExecuteInput`] deliberately has no such field, so a
-    /// worker prompt can never receive project instructions.
+    /// The planner receives it here; the engine also copies it into the
+    /// worker context so a selected file outside `/project` can guide the work.
     #[serde(default)]
     pub project_instructions: Option<String>,
 }
@@ -1646,7 +1646,7 @@ fn instruction_lines(instructions: &[String]) -> String {
     }
 }
 
-/// The conditional planner-only `AGENTS.md` section.
+/// The conditional planner prompt section for `AGENTS.md`.
 ///
 /// The whole section is empty when the task has no project instructions, so
 /// a missing file adds no prompt section at all. The text is already capped by

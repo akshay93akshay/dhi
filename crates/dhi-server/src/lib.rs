@@ -673,10 +673,10 @@ impl IntoResponse for ApiError {
 /// `DHI_FILE_BROWSER_ROOT`; the host is used directly, with no upload copy.
 /// An optional `web_project_id` selects one uploaded browser-folder project
 /// instead; the two fields are mutually exclusive. An optional
-/// `agents_md_path` selects the one `AGENTS.md` the planner may read: an
-/// absolute regular file named exactly `AGENTS.md`, at most 32 KiB, below the
-/// same root. Omitting it loads no instructions, and the legacy
-/// `load_agents_md` request toggle is ignored.
+/// `agents_md_path` selects the one `AGENTS.md` for the task: an absolute
+/// regular file named exactly `AGENTS.md`, at most 32 KiB, below the same
+/// root. Omitting it loads no instructions, and the legacy `load_agents_md`
+/// request toggle is ignored.
 #[derive(Debug, Deserialize)]
 struct CreateTaskRequest {
     goal: String,

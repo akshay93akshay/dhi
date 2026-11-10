@@ -73,8 +73,8 @@ pub struct PlannerVars {
     pub swarm_workers: String,
     /// Pending human instructions, one bullet each, or `none`.
     pub instructions: String,
-    /// The conditional planner-only `AGENTS.md` section, or empty when no
-    /// project instructions were loaded.
+    /// The conditional planner prompt section for `AGENTS.md`, or empty when
+    /// no project instructions were loaded.
     pub project_instructions: String,
 }
 

@@ -17,8 +17,9 @@ those host paths directly. There is no upload or copied snapshot.
    browser. It must live under `DHI_FILE_BROWSER_ROOT` and be named exactly
    `AGENTS.md`. It may be inside or outside the selected project folder.
    Its absolute host path becomes `agents_md_path`, or `null` when no file is
-   selected. The file is planner context, must be at most 32 KiB, and the
-   server reads that exact file without searching for another `AGENTS.md`.
+   selected. The file is planner context and the same text travels with the
+   work, must be at most 32 KiB, and the server reads that exact file without
+   searching for another `AGENTS.md`.
 4. **Create the task folder.** The server creates
    `<project>/.dhi/<task-id>` for task state and outputs.
 5. **Start the task container.** The project root is mounted at `/project`

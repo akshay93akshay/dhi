@@ -109,7 +109,7 @@ flowchart TD
 
 The user selects one absolute project folder on the DHI<sup>+</sup> host. The server-side file browser lists host folders through `GET /api/fs`. DHI<sup>+</sup> uses the selected folder directly. There is no upload copy.
 
-The user selects one `AGENTS.md` file when the task needs it. The planner reads that file. DHI<sup>+</sup> does not change the selected `AGENTS.md`. The file must be named exactly `AGENTS.md`, live under `DHI_FILE_BROWSER_ROOT`, and be at most 32 KiB. It may be inside or outside the selected project folder.
+The user selects one `AGENTS.md` file when the task needs it. The planner reads that file. The selected rules also travel with the work as context, so the work can use a file outside the project folder. DHI<sup>+</sup> does not change the selected `AGENTS.md`. The file must be named exactly `AGENTS.md`, live under `DHI_FILE_BROWSER_ROOT`, and be at most 32 KiB. It may be inside or outside the selected project folder.
 
 The task folder is `<project>/.dhi/<task-id>`. The task container mounts `<project>` at `/project` read-only and the task folder at `/work` read-write. Existing project files do not change. DHI<sup>+</sup> writes only in `/work`.
 
