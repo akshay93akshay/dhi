@@ -8,103 +8,159 @@ DHI<sup>+</sup> is the team-execution upgrade to DHI. A goal still becomes a tas
 
 | | DHI | DHI<sup>+</sup> |
 | --- | --- | --- |
-| Execution | One planner, one worker. | Planner-selected `manager_worker` or `swarm`. |
-| Fact | One planner, one worker, one fact. | One deterministic aggregated fact per intent. |
+| Execution | One planner, one worker. | Single, manager-worker, or swarm. You can pin a topology at task creation; otherwise the planner chooses one per intent. |
+| Fact | One planner, one worker, one fact. | One deterministic fact per intent, from any topology. |
 | Capacity | Engine round and no-progress budgets. | Visible, extendable capacity ledger; exhaustion pauses and extension resumes. |
-| UI | Individual work view. | Team UI for team runs, capacity, and swarm messages. |
+| UI | Individual work view. | Team UI for swarm state, team messages, capacity, and approvals. |
 
-## Core architecture
+DHI<sup>+</sup> is the default line. Legacy DHI is preserved as branch `DHI` and tag `DHI-v1.0.1`.
+
+### Historical DHI baseline
+
+Legacy DHI is the historical single-worker baseline. It is unchanged. The shared foundations below still apply to DHI<sup>+</sup>.
+
+### Shared DHI foundations
+
+The unit of work is a task with a goal. The planner can add one intent, prove one open goal with a confirmed fact, or give up on a goal. Each intent runs through the selected topology and records one fact through tools. Every tool call is recorded, evaluated against guard rules, and then allowed, denied, or held for human approval. PostgreSQL is the system of record for tasks, goals, intents, facts, results, approvals, tool calls, agent runs, and activity.
+
+## Core loop
+
+Every topology uses the same engine contract:
+
+```text
+planner -> add_intent -> engine claim -> [INTENT EXECUTION]
+        -> IntentResult(one fact) -> engine records fact -> planner
+```
+
+1. The planner calls `add_intent` with one intent and an optional plan.
+2. The engine claims the intent.
+3. The selected topology executes the intent.
+4. Execution returns one `IntentResult` with one fact.
+5. The engine records the fact.
+6. The planner reviews the fact. It proves a goal or adds the next intent.
+
+The engine is the only writer of task state. A team never proves a goal.
+
+## Topologies
+
+DHI<sup>+</sup> has three topologies: `single`, `manager_worker`, and `swarm`. They are separate. The task form can pin one, or let the planner choose.
+
+### Single
+
+```mermaid
+flowchart LR
+    I[Claimed intent] --> A[agent.execute]
+    A --> O[ExecuteOutput.fact]
+    O --> R[IntentResult]
+```
+
+- One worker.
+- No team.
+- No shared state.
+- The worker executes the intent and returns one fact.
+
+### Manager-worker
 
 ```mermaid
 flowchart TD
-    G[Goal] --> P[Planner]
-    P -->|add intent + IntentPlan| T{Topology}
-
-    T -->|manager_worker| M[Manager selects workers]
-    M --> W[Workers]
-    T -->|swarm| S[Coordinator agent + shared team]
-    S --> W
-
-    W --> GU[Guard + audit]
-    GU --> R{Worker results}
-
-    R -->|success or partial success| AG[Deterministic aggregate]
-    AG --> F[One confirmed fact]
-    F --> PR[Planner reviews fact]
-
-    R -->|all workers failed| RJ[Rejected result + team_failed]
-    RJ --> PF[Planner reviews failure]
-
-    PR -->|add next intent| P
-    PR -->|prove goal| DONE[Goal met; task done]
-
-    PF -->|retry with new plan or higher max_turns| P
-    PF -->|give up| STOP[Goal abandoned; task stops]
-
-    C[Capacity ledger] -. pause / resume .-> P
-    H[Host guards: no-progress, rounds] -. stop .-> P
+    I[Claimed intent] --> M[Manager]
+    M -->|direct assignment| W1[Worker 1]
+    M -->|direct assignment| W2[Worker 2]
+    W1 -->|result| M
+    W2 -->|result| M
+    M -->|final| R[IntentResult: one fact]
 ```
 
-A zero-success team run becomes a rejected result and a `team_failed` row.
-The planner reviews that failure and can retry with a different plan or a
-larger worker `max_turns`, change approach, or give up. Host guards still
-cap the loop.
+- A manager with a fixed team of workers.
+- The manager does not do the work.
+- The manager reads the results and says what each worker does next.
+- Workers do not talk to each other.
+- Workers do not share a board.
+- Workers never coordinate.
+- Workers do not claim tasks.
+- Workers do not message peers.
+- Workers execute the assigned task.
+- The manager returns one final fact.
+- Manager-worker is a direct-assignment hierarchy.
+- Swarm is a shared-state team.
+- They are separate topologies.
+- They do not share the same coordinator implementation.
 
-A DHI<sup>+</sup> intent still follows the DHI lifecycle. The difference is the execution layer: the planner can expand one intent into a team, and the engine still records one fact.
+### Swarm
 
-## DHI<sup>+</sup> orchestration
-
-The planner selects the topology for each intent: `single`, `manager_worker`, or `swarm`. The team topologies, `manager_worker` and `swarm`, are planner-selected. `manager_worker` uses a manager to choose workers and subtasks within the planner's limits, then runs independent workers in parallel. `swarm` is the Cline Teams model: one coordinator agent receives the claimed intent and works with domain tools plus team tools over a shared task board, mailbox, mission log, outcome fragments, and sync/async runs. The coordinator calls tools directly; there is no JSON decision loop in the Swarm path. Its one `record_fact` becomes the intent fact. Teammates are normal agent runs with the same team tools except spawn, shutdown, cleanup, and outcome finalization. A `team_stop` returns to the planner without a fact.
-
-The persisted team role string remains `lead` so existing state needs no migration; `TeamRole::Lead` is the coordinator role. Manager-worker keeps its separate no-tools lead loop and `LeadDecision` contract.
-
-Swarm team tools:
-
-```text
-team_spawn_teammate  team_shutdown_teammate  team_status
-team_task            team_run_task           team_list_runs
-team_await_runs      team_cancel_run         team_send_message
-team_broadcast       team_read_mailbox       team_mission_log
-team_create_outcome  team_attach_outcome_fragment
-team_review_outcome_fragment  team_finalize_outcome
-team_list_outcomes   team_cleanup            team_stop
+```mermaid
+flowchart TD
+    I[Claimed intent] --> C[Coordinator agent]
+    C -->|team tools| S[Shared team state]
+    S -->|work| T[Teammates]
+    T -->|same team tools, role-scoped| S
+    C -->|record_fact| R[IntentResult: one fact]
 ```
 
-The coordinator may call every tool. A teammate gets the same set except
-`team_spawn_teammate`, `team_shutdown_teammate`, `team_cleanup`, and
-`team_finalize_outcome`; teammates can create and review outcomes but not
-finalize them. The host enforces the `max_teammates` cap at spawn.
+- Shared team state: task board, mailbox, mission log, outcomes, runs.
+- The coordinator decides how to split work.
+- The coordinator decides which agents to create.
+- The coordinator decides how to combine results.
+- The coordinator calls `record_fact` once for the intent.
+- Teammates get the same team tools except `team_spawn_teammate`, `team_shutdown_teammate`, `team_cleanup`, and `team_finalize_outcome`.
+- Only the coordinator can spawn, shut down, clean up, or finalize an outcome.
 
-Each task has a visible capacity ledger: `max_rounds`, `max_model_calls`, `max_wall_secs`, and `max_parallel_workers`. Omitted limits use the engine defaults. `POST /api/tasks` accepts the ledger at creation, `POST /api/tasks/{id}/capacity` extends it, and the Work view shows and edits it. Exhaustion pauses the task (never fails it); an extension resumes a paused task. Swarm broadcasts are durable and readable at `GET /api/tasks/{id}/swarm-messages`.
+## Project folder and AGENTS.md
 
-The host keeps compiled engine safety ceilings for rounds and no-progress
-rounds. They are internal defaults, not task settings.
+The user selects one absolute project folder on the DHI<sup>+</sup> host. The server-side file browser lists host folders through `GET /api/fs`. DHI<sup>+</sup> uses the selected folder directly. There is no upload copy.
 
-- DHI<sup>+</sup> is the default line; legacy DHI is preserved as branch `DHI` and tag `DHI-v1.0.1`.
-- CI builds the container image on GitHub Actions; no local Docker build is required.
+The user selects one `AGENTS.md` file when the task needs it. The planner reads that file. DHI<sup>+</sup> does not change the selected `AGENTS.md`. The file must be named exactly `AGENTS.md`, live under `DHI_FILE_BROWSER_ROOT`, and be at most 32 KiB. It may be inside or outside the selected project folder.
 
-## Historical DHI baseline
+The task folder is `<project>/.dhi/<task-id>`. The task container mounts `<project>` at `/project` read-only and the task folder at `/work` read-write. Existing project files do not change. DHI<sup>+</sup> writes only in `/work`.
 
-Legacy DHI is the historical single-worker baseline, preserved unchanged on the
-branch and tag above. The shared foundations below still apply to DHI<sup>+</sup>.
+`DHI_FILE_BROWSER_ROOT` sets the host root. The server and the Docker daemon must see the same absolute path. Mount the root into `dhi-server` at the same path, read-write:
 
-## Shared DHI foundations
+```bash
+docker compose -f docker-compose.yml -f docker-compose.fs.yml up -d
+```
 
-The unit of work is a task with a goal. The planner can add one intent, prove one open goal with a confirmed fact, or give up on a goal. Each intent is executed by a worker that records facts through tools. Every tool call is recorded, evaluated against guard rules, and then allowed, denied, or held for human approval. PostgreSQL is the system of record for tasks, goals, intents, facts, results, approvals, tool calls, agent runs, and activity.
+```yaml
+services:
+  dhi-server:
+    volumes:
+      - ${DHI_FILE_BROWSER_ROOT}:${DHI_FILE_BROWSER_ROOT}
+```
+
+`DHI_PROJECT_FOLDERS` is legacy only. It keeps tasks created before the file browser working. New tasks use the file browser.
+
+## Task container and isolation
+
+DHI<sup>+</sup> starts one task container per task through the host Docker socket. The DHI<sup>+</sup> container mounts the socket and includes the Docker CLI. A task container does not get the socket. The DHI<sup>+</sup> container can control Docker on the host. Use isolation on a host with other important services.
+
+The task container has a read-only root filesystem. The selected project is mounted at `/project` read-only. The task folder is mounted at `/work` read-write. DHI<sup>+</sup> writes only under `/work`, which maps to `<project>/.dhi/<task-id>` on the host. Existing project files do not change. The container also has dropped capabilities, `no-new-privileges`, and memory, CPU, and PID caps.
+
+Tasks created before the file browser can still use the workspace root.
 
 ## Features
 
+### Current changes
+
+- **Worker count** — 2–64, plus Auto. N counts teammates; the coordinator is one extra agent. All N run in parallel. A fixed N needs no approval. Auto uses up to 8 workers without approval. Auto above 8 needs a `swarm_scale` approval, up to 64.
+- **Swarm workspace** — Task board (default), Mailbox (Inbox/Sent), Mission log, Outcomes, Runs, and Graph.
+- **Team messages** — `GET /api/tasks/{id}/team/messages` returns direct and broadcast messages. The Graph tab shows the message routes.
+- **Manager-worker lead loop** — the manager reads worker results and assigns each next task. It returns one final fact.
+- **File browser** — the user selects a host project folder and an optional `AGENTS.md` through `GET /api/fs`. DHI<sup>+</sup> uses the folder in place.
+
+### Core features
+
 - **Task lifecycle** — create a task from a goal with optional capacity and profile pins, follow its planner/worker loop, stop or delete it, and restart recovery for unfinished work. Adding a goal to a finished task reopens it.
-- **Graph and work views** — each task has a work graph and a work view, with its activity log and live activity stream.
+- **Three topologies** — single, manager-worker, and swarm. A task can pin one, or let the planner choose per intent.
+- **Capacity ledger** — each task has visible `max_rounds`, `max_model_calls`, `max_wall_secs`, and `max_parallel_workers`. You can extend capacity from the Work view or the API. Exhaustion pauses the task; an extension resumes it. The host also keeps internal safety ceilings for rounds and no-progress rounds.
+- **Graph and work views** — each task has a work graph, a work view, its activity log, and a live activity stream.
 - **Approvals** — a guard rule may return `ask`. The call waits for a human decision or expires on its approval deadline.
 - **MCP tools** — standard `mcpServers` configuration, guarded tool names of the form `mcp__<server>__<tool>`, live server management, refresh, reload, and deferred schemas above a tool threshold.
 - **Web tools** — `web_search`, `web_read`, and `web_research` behind one provider router with fallback across TinyFish, Parallel, and Firecrawl. `web_read` also handles PDF and DOCX documents.
-- **Coding tools** — `read`, `write`, `edit`, `search`, `list`, and `shell` run in a task container created through the host Docker socket and rooted at the workspace.
-- **Persistent terminals** — `shell_open`, `shell_send`, `shell_read`, `shell_close`, and `shell_list` keep a long-lived shell in the task container created through the host Docker socket.
+- **Coding tools** — `read`, `write`, `edit`, `search`, `list`, and `shell` run in a task container created through the host Docker socket. The project is at `/project` read-only; writes go to `/work`.
+- **Persistent terminals** — `shell_open`, `shell_send`, `shell_read`, `shell_close`, and `shell_list` keep a long-lived shell in the task container.
 - **Skills** — `skills/<name>/SKILL.md` instruction packs loaded through the guarded `load_skill` tool, with role visibility.
 - **Custom tools** — file-defined tools backed by HTTP calls or direct commands, registered behind the same guard.
 - **Profiles and pool** — OpenAI-compatible and Anthropic-format LLM profiles, active planner and worker profiles, an ordered failover pool with per-profile breakers, and optional per-task profile pins.
-- **Specialists** — named sub-agents with scoped tool lists and turn limits, used for delegation.
+- **Specialists** — named sub-agents with scoped tool lists and turn budgets, used for delegation.
 - **Tool control** — one catalog for every tool source, with enablement and role visibility.
 - **Embedded UI** — the static Next.js export is served by the Rust process on the same origin as the API.
 
@@ -114,16 +170,16 @@ One Rust process, `dhi-server`, serves the JSON API under `/api` and the exporte
 
 Workspace crates:
 
-- `dhi-core` — domain types, task and intent state machines, graph store traits
-- `dhi-store` — PostgreSQL schema, store implementation, management tables
-- `dhi-engine` — planner/worker task loop and proof-based completion
-- `dhi-orchestrator` — manager-worker and swarm runners, plan validation, deterministic aggregation
+- `dhi-core` — domain types, task and intent state machines, team state, graph store traits
+- `dhi-store` — PostgreSQL schema, store implementation, team state, scale approvals, management tables
+- `dhi-engine` — planner/worker task loop, intent claim, and proof-based completion
+- `dhi-orchestrator` — manager-worker lead loop, swarm coordinator and team runners, plan validation, deterministic aggregation
 - `dhi-guard` — allow, deny, and ask policy plus the guarded tool executor
-- `dhi-agent` — Rig runtime, prompts, LLM profiles, failover pool, specialists
-- `dhi-exec` — coding tools and per-task containers
+- `dhi-agent` — Rig runtime, prompts, LLM profiles, failover pool, coordinator and teammate runs, specialists
+- `dhi-exec` — coding tools, task containers, project read-only and task write mounts
 - `dhi-pty` — persistent terminal sessions inside task containers
 - `dhi-followups` — side-question snapshots and task reopening rules
-- `dhi-server` — Axum API, static UI hosting, wiring, and the binary
+- `dhi-server` — Axum API, static UI hosting, file browser, team routes, scale approvals, wiring, and the binary
 - `dhi-testkit` — in-memory store and test fixtures
 - `dhi-mcp` — MCP configuration model and `dhi mcp` CLI
 - `dhi-mcp-runtime` — guarded MCP connections, discovery, registration, dispatch
@@ -138,10 +194,6 @@ Workspace crates:
 The web app lives in `web/` (Next.js, React, Tailwind). Operational files live in `ops/` (prompts, specialists, MCP examples, custom-tool examples). Database roles and grants live in `docker/initdb/` and `docker/grants/`.
 
 Every model tool call passes through one `GuardedExecutor`: record, evaluate the current policy snapshot, allow/deny/ask, then audit. The backend chain is persistent terminals → coding tools → web tools → skills → custom tools → MCP → the closed sources delegate. Unknown tool names fail closed.
-
-### Docker socket
-
-The DHI<sup>+</sup> container mounts the host Docker socket and includes the Docker CLI. It starts one task container per task through that socket. Task containers do not get the socket. The DHI<sup>+</sup> container can control Docker on the host; do not use this on a host with other important services without isolation.
 
 ## Requirements
 
@@ -165,11 +217,13 @@ docker compose up -d --no-build
 
 Copy `.env.example` to `.env` if you need LLM or web provider keys, and authenticate to GHCR first if you have not already (see [Container image](#container-image)). The published image contains the static UI; Compose starts PostgreSQL and `dhi-server`. `scripts/dhi-health.sh` checks the API, UI, PostgreSQL, disk space, and the optional chess board.
 
+To use the project file browser, set `DHI_FILE_BROWSER_ROOT` and add `docker-compose.fs.yml` as shown in [Project folder and AGENTS.md](#project-folder-and-agentsmd).
+
 `docker compose up --build` is only for local image development, not the deployment path.
 
 ## Container image
 
-GitHub Actions builds the container image on every push and pull request. It pushes to GHCR only on `master` and `v*` tags; feature-branch and pull-request builds are validation-only.
+GitHub Actions builds and pushes the container image on `master` and `v*` tags. Feature branches and pull requests run code, web, and hygiene checks only.
 
 - Registry: `ghcr.io/akshay93akshay/dhi`
 - Tags: `sha-<short>` on every master build and the tag name on each `v*` release, such as `v1.0.0`. There is no `latest` tag.
@@ -186,9 +240,7 @@ docker compose up -d --no-build
 
 To roll back, set `DHI_IMAGE` to the previous `sha-...` tag, then pull and start again. The image contains the Rust server, the static UI, `ops/`, the Docker CLI, and the pinned chess MCP runtime; it has no Rust or Node compiler.
 
-For a final no-cache build, run the `fresh-image` workflow manually. It builds
-without BuildKit cache, pulls fresh base images, publishes `fresh-<short-sha>`,
-and verifies the pulled image. Use this for final deployment checks.
+For a final build, run the `fresh-image` workflow manually. It pulls fresh base images, uses the shared build cache, publishes `fresh-<short-sha>`, and verifies the pulled image. Use this for final deployment checks.
 
 ## Local development
 
@@ -239,38 +291,11 @@ Main settings:
 - `DHI_WEB_DIR` — static UI directory; when unset, `web/out` is used if present
 - `DHI_WORKSPACE_ROOT` — workspace root visible to the server; defaults to `workspace`
 - `DHI_WORKSPACE_HOST_ROOT` — host path of that root, used as the bind-mount source for task containers; set it when the server runs in a container
-- `DHI_PROJECT_FOLDERS` — legacy comma-separated absolute paths kept for tasks created before the host file browser; each must remain mounted into the server at the same absolute path
-- `DHI_FILE_BROWSER_ROOT` — absolute host root listed by the task file browser; the server creates it when missing and refuses a symlink, and the server and Docker daemon must see the same path; unset disables the browser
+- `DHI_FILE_BROWSER_ROOT` — absolute host root listed by the project file browser; the server creates it when missing and refuses a symlink, and the server and Docker daemon must see the same path; unset disables the browser
+- `DHI_PROJECT_FOLDERS` — legacy only: comma-separated absolute paths kept for tasks created before the file browser; each must remain mounted into the server at the same absolute path
 - `DHI_MCP_CONFIG` — MCP config path; when unset, the nearest `ops/mcp.json`
 - `DHI_LLM_BASE_URL`, `DHI_LLM_API_KEY`, `DHI_LLM_PLANNER_MODEL`, `DHI_LLM_WORKER_MODEL` — LLM endpoint and models; other OpenAI-compatible endpoints work
 - `TINYFISH_API_KEY`, `PARALLEL_API_KEY`, `FIRECRAWL_API_KEY`, `DHI_WEB_PROVIDER` — web tool providers
-
-### Project folders and AGENTS.md
-
-Set `DHI_FILE_BROWSER_ROOT` to an absolute host directory. The server creates it when missing and requires a real directory rather than a symlink. The task form's file browser lists directories and files under that root through `GET /api/fs`. The user selects a project folder and, optionally, an `AGENTS.md` under the same root; the selected absolute host paths become the task's `project_folder` and `agents_md_path` (`null` when no file is selected). The `AGENTS.md` may be inside or outside the selected project folder. DHI<sup>+</sup> uses the selected folder directly, with no upload or copied snapshot.
-
-Mount the root into `dhi-server` at the same absolute path, read-write. `docker-compose.fs.yml` adds exactly that mount:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.fs.yml up -d
-```
-
-```yaml
-services:
-  dhi-server:
-    volumes:
-      - ${DHI_FILE_BROWSER_ROOT}:${DHI_FILE_BROWSER_ROOT}
-```
-
-The same absolute path must be visible to the server process and to the Docker daemon, because each task's project bind-mount source is the selected host path exactly as the server sees it. On Docker Desktop, share the root with the daemon; on a remote daemon, create the same path on that host.
-
-DHI<sup>+</sup> creates `<project>/.dhi/<task-id>/` for each task. The task container mounts the project root at `/project` read-only and the task folder at `/work` read-write. Existing files in the project are left unchanged; agent writes stay under `/work` and land in `.dhi/<task-id>` on the host.
-
-The selected `AGENTS.md` must be named exactly `AGENTS.md`, live under `DHI_FILE_BROWSER_ROOT`, and be at most 32 KiB. It may be inside or outside the selected project folder. It is planner context: the server reads that exact file and does not search global or nested locations for another one. When no file is selected, `agents_md_path` is `null` and the task starts without `AGENTS.md` context.
-
-`GET /api/fs` answers `404` when `DHI_FILE_BROWSER_ROOT` is unset, and task creation rejects a selected project folder or `AGENTS.md`.
-
-`DHI_PROJECT_FOLDERS` is no longer the task-creation selector. It and the same-path mounts for each listed folder remain supported so tasks created before the file browser still resolve their projects. Keep those mounts while such tasks exist.
 
 On first boot, DHI<sup>+</sup> seeds guard rules plus LLM profiles and settings when an LLM key is configured. After that, PostgreSQL is the source of truth and profiles and rules are managed from the settings UI or API.
 
@@ -306,11 +331,14 @@ Keep `ops/mcp.json` local. `ops/mcp.example.json` and `ops/mcp.docker.json` are 
 All API routes are under `/api`. Most return JSON; `/api/stream` is a server-sent event stream. The static UI is the fallback for non-API paths.
 
 - **Health** — `GET /api/health`
-- **Tasks** — `GET|POST /api/tasks`; `GET|DELETE /api/tasks/{id}`; `POST /api/tasks/{id}/stop`; bulk `POST /api/tasks/stop` and `POST /api/tasks/delete`; `GET /api/tasks/{id}/work`, `/activity`, and `/usage`; `GET /api/tasks/{id}/outputs` for legacy web-project tasks
-- **File browser** — `GET /api/fs?path=…` lists host files and directories under `DHI_FILE_BROWSER_ROOT` for project and `AGENTS.md` selection
+- **Tasks** — `GET|POST /api/tasks`; `GET|DELETE /api/tasks/{id}`; `POST /api/tasks/{id}/stop`; `POST /api/tasks/{id}/capacity`; bulk `POST /api/tasks/stop` and `POST /api/tasks/delete`; `GET /api/tasks/{id}/work`, `/activity`, and `/usage`. `POST /api/tasks` accepts `goal`, `project_folder`, `agents_md_path`, `topology`, `swarm_workers`, capacity, and optional profile pins.
+- **File browser** — `GET /api/fs` and `GET /api/fs?path=…` list host files and directories under `DHI_FILE_BROWSER_ROOT` for project and `AGENTS.md` selection
+- **Team** — `GET /api/tasks/{id}/team`; `/team/tasks`; `/team/mailbox?box=inbox|sent`; `/team/messages`; `/team/mission`; `/team/runs`; `/team/outcomes`. Team state is read-only for the UI; agents change it through tools.
 - **Goals** — `POST /api/tasks/{id}/goals`
+- **Instructions** — `GET|POST /api/tasks/{id}/instructions`
 - **Side questions** — `GET|POST /api/tasks/{id}/side-questions`
 - **Approvals** — `GET /api/approvals`; `POST /api/approvals/{id}/decision`
+- **Scale approvals** — `GET /api/scale-approvals`; `POST /api/scale-approvals/{id}/decision`. A `swarm_scale` row lets an Auto swarm rise above 8 workers.
 - **Activity** — `GET /api/stream`
 - **Settings and LLM profiles** — `GET|PUT /api/settings`; `GET|POST /api/llm/profiles`; `DELETE /api/llm/profiles/{id}`; `POST /api/llm/profiles/active`; `GET /api/llm/models`; `GET /api/llm/pool/status`; `POST /api/llm/pool/reset`
 - **Guard rules** — `GET|POST /api/intercept/rules`; `PUT|DELETE /api/intercept/rules/{id}`; `POST /api/intercept/rules/{id}/toggle`
@@ -322,15 +350,20 @@ All API routes are under `/api`. Most return JSON; `/api/stream` is a server-sen
 
 DHI<sup>+</sup> has no login or authentication layer. Keep the default localhost bind, or put the server behind a protected tunnel or reverse proxy. Do not expose port 8080 directly to an untrusted network.
 
+- The DHI<sup>+</sup> container mounts the host Docker socket. It can control Docker on the host. A task container does not get the socket, but the DHI<sup>+</sup> container is still a host-level control point. Use isolation on a shared host.
+- Task containers have a read-only root filesystem. The selected project is read-only at `/project`. Only `/work` is writable, and it maps to `<project>/.dhi/<task-id>`.
+- The file browser rejects paths outside `DHI_FILE_BROWSER_ROOT` and paths through a symlink. Task creation accepts an `AGENTS.md` only with the exact name.
 - Keep `.env`, `ops/mcp.json`, `config/dhi.config.json`, and other key files out of Git and at mode 600.
 - `ops/mcp.json` is ignored. The example and Docker configs contain no secrets.
 - Use the database roles as designed: `dhi_owner` for migrations and `dhi_app` for runtime. The runtime role cannot modify or delete activity rows.
 - The guard defaults to deny. Rules can allow, deny, or require approval, and every decision is recorded.
-- Coding tools and persistent terminals run in task containers created through the host Docker socket, with the workspace as the only writable mount.
 - The compose passwords are for local development. Use distinct strong credentials on any shared host.
 
 ## Troubleshooting
 
+- **File browser is disabled** — `DHI_FILE_BROWSER_ROOT` is unset. Set it in `.env`, add `docker-compose.fs.yml`, and recreate `dhi-server`. `GET /api/fs` returns `404` while the browser is disabled.
+- **Selected path is rejected** — the path is missing, is outside `DHI_FILE_BROWSER_ROOT`, passes through a symlink, or is not a directory. For `AGENTS.md`, use the exact name, keep it under the root, and keep it at or below 32 KiB.
+- **Task container cannot mount the project** — the server and the Docker daemon do not see the same absolute path. Share the root with Docker Desktop, or create the same path on a remote daemon.
 - **Missing `web/out`** — the server logs a warning and serves the API only. Build the export with `cd web && npm ci && NEXT_EXPORT=1 npm run build`, or point `DHI_WEB_DIR` at a directory that contains `index.html`.
 - **Missing `uvx`** — host chess fails to start. Install `uv`, which provides `uvx`, or use the Docker image, which has the chess server installed at `/opt/chess`.
 - **PostgreSQL is unhealthy** — check `docker compose ps`, then run `docker compose exec postgres pg_isready -U dhi_owner -d dhi`. Re-run `scripts/migrate.sh` if the schema is missing.
