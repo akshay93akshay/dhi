@@ -563,10 +563,8 @@ mod tests {
 
     #[test]
     fn coordinator_gets_every_team_tool() {
-        let names: Vec<&str> = team_tool_specs(TeamRole::Lead)
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect();
+        let specs = team_tool_specs(TeamRole::Lead);
+        let names: Vec<&str> = specs.iter().map(|tool| tool.name.as_str()).collect();
         for expected in [
             "team_spawn_teammate",
             "team_shutdown_teammate",
@@ -597,10 +595,8 @@ mod tests {
 
     #[test]
     fn teammate_tools_exclude_coordinator_only_tools() {
-        let names: Vec<&str> = team_tool_specs(TeamRole::Teammate)
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect();
+        let specs = team_tool_specs(TeamRole::Teammate);
+        let names: Vec<&str> = specs.iter().map(|tool| tool.name.as_str()).collect();
         for coordinator_only in [
             "team_spawn_teammate",
             "team_shutdown_teammate",
