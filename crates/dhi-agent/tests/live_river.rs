@@ -87,6 +87,9 @@ async fn live_river_worker_smoke() {
             ],
             worker_profile_id: None,
             max_turns: None,
+            agent_id: None,
+            role: None,
+            task: None,
         })
         .await
         .expect("the live worker call must succeed");

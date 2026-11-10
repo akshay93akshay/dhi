@@ -15,6 +15,7 @@ import type {
   JsonObject,
   ProjectFolder,
   TaskTopology,
+  WebProject,
 } from "./types.ts";
 
 /** The three visual states of the DHI brand-status block. */
@@ -201,6 +202,30 @@ export const PIN_UNSET = "";
 export const PROJECT_FOLDER_UNSET = "";
 
 /**
+ * Prefix of the create-form project `<select>` value for an uploaded web
+ * project. Absolute Docker-folder paths start with `/`, so the prefix is
+ * unambiguous.
+ */
+export const WEB_PROJECT_SELECT_PREFIX = "web:";
+
+/** Select value for one uploaded web project. */
+export function webProjectSelectValue(id: string): string {
+  return `${WEB_PROJECT_SELECT_PREFIX}${id}`;
+}
+
+/** Web project id carried by a project-selector value, or `null`. */
+export function webProjectIdFromSelection(
+  value: string | null | undefined,
+): string | null {
+  const trimmed = (value ?? "").trim();
+  if (!trimmed.startsWith(WEB_PROJECT_SELECT_PREFIX)) {
+    return null;
+  }
+  const id = trimmed.slice(WEB_PROJECT_SELECT_PREFIX.length).trim();
+  return id === "" ? null : id;
+}
+
+/**
  * Validates the goal field: trimmed non-empty text is required (the server
  * rejects empty-after-trim goals with `400`). Returns an error message, or
  * `null` when the goal is usable.
@@ -230,13 +255,43 @@ export function defaultProjectFolderPath(
 }
 
 /**
+ * Selector default for the project picker: exactly one available option (a
+ * Docker folder or an uploaded web project) is preselected; zero or several
+ * leave the picker on legacy workspace mode so the active project is an
+ * explicit choice.
+ */
+export function defaultProjectSelection(
+  folders: readonly ProjectFolder[],
+  webProjects: readonly WebProject[],
+): string {
+  const total = folders.length + webProjects.length;
+  if (total !== 1) {
+    return PROJECT_FOLDER_UNSET;
+  }
+  return folders.length === 1
+    ? folders[0].path
+    : webProjectSelectValue(webProjects[0].id);
+}
+
+/**
  * Default of the "Load AGENTS.md" toggle for a selected folder: on only when
  * the folder actually carries the file.
  */
 export function agentsMdDefaultOn(
-  folder: ProjectFolder | null | undefined,
+  folder:
+    | Pick<ProjectFolder, "agents_md_present">
+    | Pick<WebProject, "agents_md_present">
+    | null
+    | undefined,
 ): boolean {
   return folder?.agents_md_present === true;
+}
+
+/** Presence label for an uploaded web project's `AGENTS.md`. */
+export function webProjectAgentsMdLabel(
+  present: boolean | null | undefined,
+): string {
+  return present === true ? "AGENTS.md present" : "No AGENTS.md";
 }
 
 /**
@@ -281,10 +336,21 @@ export type CreateFormValues = {
   workerPin: string;
   /** Create-form topology value; omitted/blank means "let the planner decide". */
   topology?: string;
-  /** Create-form Workers value; blank means Auto (send `null`). */
+  /** Create-form worker count; blank means Auto (send `null`). */
   swarmWorkers?: string;
+  /**
+   * Create-form Auto toggle. Defaults to `true` when omitted, so a caller that
+   * does not mention Auto gets the planner-decides width.
+   */
+  swarmWorkersAuto?: boolean;
   /** Selected project folder path; blank means legacy workspace mode. */
   projectFolder?: string;
+  /**
+   * Selected uploaded web project id. Takes precedence over
+   * `projectFolder`: the request sends `web_project_id` and omits
+   * `project_folder` entirely.
+   */
+  webProjectId?: string;
   /** Create-form Load AGENTS.md toggle. */
   loadAgentsMd?: boolean;
 };
@@ -298,31 +364,81 @@ export const TOPOLOGY_OPTIONS = [
 ] as const;
 
 /**
- * Swarm-width options for the create-task form. The empty value is "Auto"
- * (send `null` and let the planner decide); the server accepts 2 through 8.
+ * Swarm width bounds. `N` counts teammates only; the coordinator is one extra
+ * agent. A fixed N is exact and needs no approval. Auto lets the coordinator
+ * choose up to
+ * {@link SWARM_WORKERS_AUTO_MAX} without a scale approval.
  */
-export const SWARM_WORKERS_OPTIONS = [
-  { value: "", label: "Auto (planner decides)" },
-  { value: "2", label: "2" },
-  { value: "3", label: "3" },
-  { value: "4", label: "4" },
-  { value: "5", label: "5" },
-  { value: "6", label: "6" },
-  { value: "7", label: "7" },
-  { value: "8", label: "8" },
-] as const;
+export const SWARM_WORKERS_MIN = 2;
+export const SWARM_WORKERS_MAX = 64;
+export const SWARM_WORKERS_AUTO_MAX = 8;
 
-/** Human label for a stored swarm width, or `null` when the planner decides. */
-export function swarmWorkersLabel(
-  value: number | null | undefined,
-): string | null {
-  return value === null || value === undefined ? null : String(value);
+/** Create-form help line shown under the swarm worker controls. */
+export const SWARM_WORKERS_HELP_TEXT =
+  "N teammates + 1 coordinator. All N run in parallel.";
+
+/** Task-header text for a swarm that lets the coordinator choose its width. */
+export const SWARM_WORKERS_AUTO_LABEL =
+  `Auto (coordinator decides, max ${SWARM_WORKERS_AUTO_MAX} without approval)`;
+
+/** Whether the create form must show the swarm worker controls. */
+export function showsSwarmWorkersField(
+  topology: string | null | undefined,
+): boolean {
+  return parseTopology(topology) === "swarm";
 }
 
 /**
- * Maps the create-form Workers `<select>` value onto a swarm width. Blank
- * (and `auto`) means "the planner decides" → `null`; only whole numbers 2–8
- * are accepted, everything else degrades to `null`.
+ * Human label for a stored swarm width. `N` counts teammates, so the coordinator is
+ * always shown as an extra agent. Returns `null` when no width is pinned.
+ */
+export function swarmWorkersLabel(
+  value: number | null | undefined,
+): string | null {
+  return value === null || value === undefined ? null : `${value} + coordinator`;
+}
+
+/**
+ * Full swarm-width description for a task header: `N + coordinator` for a pinned
+ * count (including legacy 2–8 tasks), the Auto explanation for a swarm with no
+ * pinned count, and `null` for non-swarm tasks with no pinned count.
+ */
+export function swarmWorkersSummary(
+  topology: TaskTopology | null,
+  value: number | null | undefined,
+): string | null {
+  if (value !== null && value !== undefined) {
+    return swarmWorkersLabel(value);
+  }
+  return topology === "swarm" ? SWARM_WORKERS_AUTO_LABEL : null;
+}
+
+/**
+ * Validation for the create-form worker count. Blank and `auto` are valid
+ * (Auto sends `null`); anything else must be a whole number from 2 to 64.
+ * Returns a user-facing message, or `null` when the value is accepted.
+ */
+export function validateSwarmWorkers(
+  raw: string | null | undefined,
+): string | null {
+  const trimmed = (raw ?? "").trim();
+  if (trimmed === "" || trimmed.toLowerCase() === "auto") {
+    return null;
+  }
+  if (/^\d+$/.test(trimmed)) {
+    const value = Number(trimmed);
+    if (value >= SWARM_WORKERS_MIN && value <= SWARM_WORKERS_MAX) {
+      return null;
+    }
+  }
+  return `Swarm workers must be a whole number between ${SWARM_WORKERS_MIN} and ${SWARM_WORKERS_MAX}, or Auto.`;
+}
+
+/**
+ * Maps the create-form worker input onto a swarm width. Blank (and `auto`)
+ * means "the planner decides" → `null`; only whole numbers 2–64 are accepted,
+ * everything else degrades to `null` (use {@link validateSwarmWorkers} to
+ * reject out-of-range input before submitting).
  */
 export function parseSwarmWorkers(
   raw: string | null | undefined,
@@ -332,7 +448,9 @@ export function parseSwarmWorkers(
     return null;
   }
   const value = Number(trimmed);
-  return value >= 2 && value <= 8 ? value : null;
+  return value >= SWARM_WORKERS_MIN && value <= SWARM_WORKERS_MAX
+    ? value
+    : null;
 }
 
 /** Human label for a task topology (or `null` for "planner decides"). */
@@ -381,10 +499,13 @@ export type CreateFormResult =
  *   fields" behavior covered in api.test.ts);
  * - topology is ALWAYS sent: `null` for "let the planner decide", otherwise
  *   the selected enum value;
- * - `swarm_workers` is ALWAYS sent: the selected 2–8 count only when the
- *   topology is `swarm`, otherwise (and for Auto) `null`.
+ * - `swarm_workers` is ALWAYS sent: a fixed 2–64 count only when the topology
+ *   is `swarm` and Auto is off; otherwise (non-swarm, Auto, or blank) `null`.
+ *   Out-of-range fixed counts refuse submission with a validation error.
  * - `project_folder` and `load_agents_md` are sent together only when a
- *   folder is selected; legacy workspace mode omits both fields entirely.
+ *   Docker folder is selected; legacy workspace mode omits both fields.
+ * - a selected web project sends `web_project_id` and `load_agents_md` and
+ *   omits `project_folder`, even when a folder value is also present.
  */
 export function buildCreateTaskInput(
   values: CreateFormValues,
@@ -394,11 +515,18 @@ export function buildCreateTaskInput(
     return { ok: false, error: goalError };
   }
   const topology = parseTopology(values.topology);
+  let swarmWorkers: number | null = null;
+  if (topology === "swarm" && values.swarmWorkersAuto === false) {
+    const workersError = validateSwarmWorkers(values.swarmWorkers);
+    if (workersError !== null) {
+      return { ok: false, error: workersError };
+    }
+    swarmWorkers = parseSwarmWorkers(values.swarmWorkers);
+  }
   const input: CreateTaskInput = {
     goal: values.goal.trim(),
     topology,
-    swarm_workers:
-      topology === "swarm" ? parseSwarmWorkers(values.swarmWorkers) : null,
+    swarm_workers: swarmWorkers,
   };
   const planner = parsePin(values.plannerPin);
   if (planner !== null) {
@@ -407,6 +535,12 @@ export function buildCreateTaskInput(
   const worker = parsePin(values.workerPin);
   if (worker !== null) {
     input.worker_profile_id = worker;
+  }
+  const webProjectId = (values.webProjectId ?? "").trim();
+  if (webProjectId !== "") {
+    input.web_project_id = webProjectId;
+    input.load_agents_md = values.loadAgentsMd === true;
+    return { ok: true, input };
   }
   const projectFolder = (values.projectFolder ?? "").trim();
   if (projectFolder !== PROJECT_FOLDER_UNSET) {

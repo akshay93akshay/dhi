@@ -6,7 +6,8 @@
 //! wiring is testable without a database.
 
 use std::convert::Infallible;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path as FsPath, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
@@ -19,24 +20,31 @@ pub mod sources;
 pub mod static_web;
 pub mod task_runs;
 mod tool_api;
+pub mod web_projects;
 pub mod web_providers;
 
 pub use project_folders::{ProjectFolder, ProjectFolderInfo, ProjectFolders};
 pub use task_runs::TaskRunRegistry;
 
 use async_trait::async_trait;
+use axum::body::Bytes;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{Path, Query, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use dhi_agent::{AgentRuntime, LlmPool, PoolSnapshot, RawProfile, ResolvedProfile};
+use dhi_core::team::{
+    MissionLogEntry, TeamMember, TeamMemberStatus, TeamMessage, TeamMessageId, TeamOutcome,
+    TeamOutcomeFragment, TeamRole, TeamRun, TeamStore, TeamTask, TeamTaskId,
+};
 use dhi_core::{
     AgentRole, AgentRun, AgentsMdState, Approval, ApprovalDecision, ApprovalStatus, GraphStore,
-    GuardStore, GuardVerdict, NewTask, ReopenOutcome, Task, TaskCapacity, TaskId, TaskInstruction,
-    TaskState, Topology,
+    GuardStore, GuardVerdict, NewTask, ReopenOutcome, ScaleApproval, ScaleApprovalGate,
+    ScaleApprovalId, ScaleApprovalStatus, Task, TaskCapacity, TaskId, TaskInstruction, TaskState,
+    Topology,
 };
 use dhi_engine::Engine;
 use dhi_guard::ToolBackend;
@@ -44,6 +52,7 @@ use dhi_guard::{CompiledPolicy, GuardedExecutor, RuleSpec, SharedPolicy, ToolExe
 use dhi_store::mgmt::{
     DEFAULT_APPROVAL_TIMEOUT_SECS, GuardRuleInput, GuardRuleRow, LlmProfileUpsert, SettingPatch,
 };
+use dhi_store::web_projects::WebProjectRecord;
 use dhi_store::{Store, StoreError};
 use futures::StreamExt;
 use futures::stream::{self, Stream};
@@ -99,6 +108,19 @@ pub struct AppState {
     pub task_runs: Arc<TaskRunRegistry>,
     /// The validated project folders a task may select at creation.
     pub project_folders: Arc<project_folders::ProjectFolders>,
+    /// Browser-folder web project storage configuration. Disabled when
+    /// `DHI_WEB_PROJECTS_ROOT` is unset.
+    pub web_projects: Arc<web_projects::WebProjects>,
+    /// Metadata for uploaded web projects. `None` in memory-only tests; the
+    /// routes that need row persistence answer `500` until a store is wired.
+    pub web_project_store: Option<Arc<dyn web_projects::WebProjectStore>>,
+    /// Cline Teams shared state. `None` in memory-only tests; the board,
+    /// mailbox, mission, runs, and outcomes routes answer `503` until a team
+    /// store is wired.
+    pub team_store: Option<Arc<dyn TeamStore>>,
+    /// The `swarm_scale` approval gate the team runner waits on. `None` keeps
+    /// an Auto swarm at the approval-free cap.
+    pub scale_gate: Option<Arc<dyn ScaleApprovalGate>>,
 }
 
 /// Default page size of `GET /api/tasks`.
@@ -119,6 +141,11 @@ const MAX_SWARM_MESSAGE_LIMIT: i64 = 1_000;
 /// How often the `GET /api/stream` handler polls the activity log.
 pub const STREAM_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Request-body ceiling for one raw web-project upload. The per-file limit is
+/// 8 MB; the extra megabyte lets the handler return its own clear 400 for an
+/// over-limit file while rejecting anything larger at the route boundary.
+const WEB_PROJECT_UPLOAD_BODY_LIMIT: usize = 9 * 1024 * 1024;
+
 /// Largest accepted goal description, after trimming.
 pub const ADD_GOAL_MAX_CHARS: usize = 500;
 
@@ -131,6 +158,16 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/tasks", get(list_tasks).post(create_task))
         .route("/api/project-folders", get(list_project_folders))
+        .route(
+            "/api/web-projects",
+            get(list_web_projects).post(create_web_project),
+        )
+        .route("/api/web-projects/{id}", get(get_web_project))
+        .route(
+            "/api/web-projects/{id}/files",
+            put(upload_web_project_file)
+                .layer(DefaultBodyLimit::max(WEB_PROJECT_UPLOAD_BODY_LIMIT)),
+        )
         .route("/api/tasks/stop", post(stop_tasks))
         .route("/api/tasks/delete", post(delete_tasks_route))
         .route("/api/tasks/{id}", get(get_task).delete(delete_task_route))
@@ -144,16 +181,29 @@ pub fn router(state: AppState) -> Router {
         .route("/api/tasks/{id}/work", get(get_task_work))
         .route("/api/tasks/{id}/activity", get(get_task_activity))
         .route("/api/tasks/{id}/usage", get(get_task_usage))
+        .route("/api/tasks/{id}/outputs", get(get_task_outputs))
         .route(
             "/api/tasks/{id}/swarm-messages",
             get(get_task_swarm_messages),
         )
+        .route("/api/tasks/{id}/team", get(get_task_team))
+        .route("/api/tasks/{id}/team/tasks", get(get_task_team_tasks))
+        .route("/api/tasks/{id}/team/mailbox", get(get_task_team_mailbox))
+        .route("/api/tasks/{id}/team/messages", get(get_task_team_messages))
+        .route("/api/tasks/{id}/team/mission", get(get_task_team_mission))
+        .route("/api/tasks/{id}/team/runs", get(get_task_team_runs))
+        .route("/api/tasks/{id}/team/outcomes", get(get_task_team_outcomes))
         .route(
             "/api/tasks/{id}/side-questions",
             get(side_questions::list_side_questions).post(side_questions::ask_side_question),
         )
         .route("/api/approvals", get(list_approvals))
         .route("/api/approvals/{id}/decision", post(decide_approval))
+        .route("/api/scale-approvals", get(list_scale_approvals))
+        .route(
+            "/api/scale-approvals/{id}/decision",
+            post(decide_scale_approval),
+        )
         .route("/api/stream", get(stream_activity))
         // MCP health/status and live management (live reload).
         // Writes persist through the standard `mcpServers` config first, then
@@ -282,6 +332,226 @@ async fn list_project_folders(State(state): State<AppState>) -> Json<ProjectFold
     })
 }
 
+/// `POST /api/web-projects` input.
+#[derive(Debug, Deserialize)]
+struct CreateWebProjectRequest {
+    name: String,
+}
+
+/// `GET /api/web-projects` output.
+#[derive(Debug, Serialize)]
+struct WebProjectsResponse {
+    projects: Vec<web_projects::WebProjectInfo>,
+}
+
+/// `POST /api/web-projects` and `GET /api/web-projects/{id}` output.
+#[derive(Debug, Serialize)]
+struct WebProjectResponse {
+    project: web_projects::WebProjectInfo,
+}
+
+/// `PUT /api/web-projects/{id}/files?path=…` output.
+#[derive(Debug, Serialize)]
+struct WebProjectFileResponse {
+    path: String,
+    size: u64,
+}
+
+/// `PUT /api/web-projects/{id}/files` query string.
+#[derive(Debug, Deserialize)]
+struct WebProjectFileQuery {
+    path: String,
+}
+
+/// `GET /api/tasks/{id}/outputs` output.
+#[derive(Debug, Serialize)]
+struct TaskOutputsResponse {
+    files: Vec<web_projects::TaskOutputFile>,
+}
+
+/// Refuses every web-project route when `DHI_WEB_PROJECTS_ROOT` is unset.
+fn require_web_projects_enabled(state: &AppState) -> Result<(), ApiError> {
+    if state.web_projects.enabled() {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "web projects are disabled; set DHI_WEB_PROJECTS_ROOT",
+        ))
+    }
+}
+
+/// The metadata store, or `500` in a process that wired no database.
+///
+/// The dedicated handle wins so tests can substitute an in-memory table. A
+/// process that wired only the management store still serves the routes: the
+/// same `Store` implements both surfaces.
+fn require_web_project_store(
+    state: &AppState,
+) -> Result<&dyn web_projects::WebProjectStore, ApiError> {
+    if let Some(store) = state.web_project_store.as_deref() {
+        return Ok(store);
+    }
+    if let Some(store) = state.mgmt.as_deref() {
+        return Ok(store as &dyn web_projects::WebProjectStore);
+    }
+    Err(ApiError::internal("web project storage is unavailable"))
+}
+
+/// Creates one browser-folder project and its directory.
+async fn create_web_project(
+    State(state): State<AppState>,
+    payload: Result<Json<CreateWebProjectRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<WebProjectResponse>), ApiError> {
+    let Json(body) = payload.map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
+    require_web_projects_enabled(&state)?;
+    let name = web_projects::validate_name(&body.name).map_err(ApiError::bad_request)?;
+    let store = require_web_project_store(&state)?;
+    let id = Uuid::new_v4();
+    let dir = state
+        .web_projects
+        .create_project_dir(id)
+        .map_err(ApiError::internal)?;
+    let root = state
+        .web_projects
+        .root()
+        .and_then(|path| path.to_str())
+        .ok_or_else(|| ApiError::internal("web project root is not valid UTF-8"))?;
+    let record = match store.create_web_project(id, &name, root).await {
+        Ok(record) => record,
+        Err(err) => {
+            let _ = fs::remove_dir(&dir);
+            return Err(ApiError::internal(err));
+        }
+    };
+    Ok((
+        StatusCode::CREATED,
+        Json(WebProjectResponse {
+            project: web_projects::project_info(&record),
+        }),
+    ))
+}
+
+/// Lists every project, newest first. Disabled mode is `404`: the route does
+/// not exist for this deployment, so the UI never renders a dead section.
+async fn list_web_projects(
+    State(state): State<AppState>,
+) -> Result<Json<WebProjectsResponse>, ApiError> {
+    if !state.web_projects.enabled() {
+        return Err(ApiError::not_found(
+            "web projects are unavailable; set DHI_WEB_PROJECTS_ROOT",
+        ));
+    }
+    let store = require_web_project_store(&state)?;
+    let records = store
+        .list_web_projects()
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(WebProjectsResponse {
+        projects: records.iter().map(web_projects::project_info).collect(),
+    }))
+}
+
+/// Reads one project plus its derived counts.
+async fn get_web_project(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<WebProjectResponse>, ApiError> {
+    require_web_projects_enabled(&state)?;
+    let store = require_web_project_store(&state)?;
+    let record = store
+        .get_web_project(id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("web project not found: {id}")))?;
+    Ok(Json(WebProjectResponse {
+        project: web_projects::project_info(&record),
+    }))
+}
+
+/// Stores one raw snapshot file. Path safety and both size limits are
+/// enforced here, regardless of what the browser checked.
+async fn upload_web_project_file(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(query): Query<WebProjectFileQuery>,
+    body: Bytes,
+) -> Result<Json<WebProjectFileResponse>, ApiError> {
+    require_web_projects_enabled(&state)?;
+    let store = require_web_project_store(&state)?;
+    let record = store
+        .get_web_project(id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("web project not found: {id}")))?;
+    let path = web_projects::validate_upload_path(&query.path).map_err(ApiError::bad_request)?;
+    let dir = web_projects::record_project_dir(&record);
+    let size = state
+        .web_projects
+        .upload_file(&dir, &path, &body)
+        .map_err(|err| match err {
+            web_projects::UploadError::Rejected(message) => ApiError::bad_request(message),
+            web_projects::UploadError::Io(err) => ApiError::internal(err),
+        })?;
+    Ok(Json(WebProjectFileResponse {
+        path: path.display,
+        size,
+    }))
+}
+
+/// Reads the task's `.dhi/<task-id>` outputs. Only web-project tasks have this
+/// folder; host-folder and legacy tasks are a request error.
+///
+/// The folder is revalidated at read time: it must be a real directory below
+/// the configured web-project root, and the canonical path is what is read.
+/// A task row cannot point the reader at another project or an arbitrary host
+/// directory.
+async fn get_task_outputs(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<TaskOutputsResponse>, ApiError> {
+    let task = require_task(state.store.as_ref(), id).await?;
+    if task.web_project_id.is_none() {
+        return Err(ApiError::bad_request("task has no web project outputs"));
+    }
+    let project = task
+        .project_folder
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("task has no project folder"))?;
+    let canonical_root = state.web_projects.root().ok_or_else(|| {
+        ApiError::bad_request("web projects are unavailable; set DHI_WEB_PROJECTS_ROOT")
+    })?;
+    let project_path = FsPath::new(project);
+    let metadata = fs::symlink_metadata(project_path).map_err(|err| {
+        ApiError::bad_request(format!(
+            "task project folder {} cannot be inspected: {err}",
+            project_path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "task project folder is not a real directory: {}",
+            project_path.display()
+        )));
+    }
+    let canonical_project = fs::canonicalize(project_path).map_err(|err| {
+        ApiError::bad_request(format!(
+            "task project folder {} cannot be resolved: {err}",
+            project_path.display()
+        ))
+    })?;
+    if canonical_project.as_path() == canonical_root
+        || !canonical_project.starts_with(canonical_root)
+    {
+        return Err(ApiError::bad_request(format!(
+            "task project folder {} is outside the configured web project root",
+            project_path.display()
+        )));
+    }
+    let files =
+        web_projects::read_task_outputs(&canonical_project, id).map_err(ApiError::internal)?;
+    Ok(Json(TaskOutputsResponse { files }))
+}
+
 /// The one API error shape: `{ "error": "message" }`.
 pub(crate) struct ApiError {
     status: StatusCode,
@@ -351,12 +621,14 @@ impl IntoResponse for ApiError {
 /// it can only be set here, never changed through the capacity route.
 ///
 /// An optional `swarm_workers` count is valid only with `topology = "swarm"`
-/// and must be 2 to 8. It pins the exact team size for every swarm plan.
+/// and must be 2 to 64. `null` means Auto. It pins the exact team size for
+/// every swarm plan.
 ///
 /// An optional `project_folder` must exactly match one configured
-/// `DHI_PROJECT_FOLDERS` path. `load_agents_md` defaults to true when a
-/// folder is selected and its `AGENTS.md` exists; omitting it otherwise leaves
-/// the toggle off.
+/// `DHI_PROJECT_FOLDERS` path. An optional `web_project_id` selects one
+/// uploaded browser-folder project instead; the two fields are mutually
+/// exclusive. `load_agents_md` defaults to true when a folder is selected and
+/// its `AGENTS.md` exists; omitting it otherwise leaves the toggle off.
 #[derive(Debug, Deserialize)]
 struct CreateTaskRequest {
     goal: String,
@@ -371,6 +643,8 @@ struct CreateTaskRequest {
     swarm_workers: Option<usize>,
     #[serde(default)]
     project_folder: Option<String>,
+    #[serde(default)]
+    web_project_id: Option<Uuid>,
     #[serde(default)]
     load_agents_md: Option<bool>,
 }
@@ -494,6 +768,122 @@ struct ApprovalItem {
     input: Option<Value>,
 }
 
+/// `GET /api/scale-approvals` output.
+#[derive(Debug, Serialize)]
+struct ScaleApprovalsResponse {
+    approvals: Vec<ScaleApproval>,
+}
+
+/// `POST /api/scale-approvals/{id}/decision` input.
+#[derive(Debug, Deserialize)]
+struct ScaleApprovalDecisionRequest {
+    decision: ApprovalDecision,
+}
+
+/// `POST /api/scale-approvals/{id}/decision` output.
+#[derive(Debug, Serialize)]
+struct ScaleApprovalDecisionResponse {
+    approval: ScaleApproval,
+}
+
+/// `GET /api/tasks/{id}/team` output.
+#[derive(Debug, Serialize)]
+struct TeamSummary {
+    team_id: TaskId,
+    task_id: TaskId,
+    status: String,
+    lead: Option<String>,
+    members: Vec<TeamMember>,
+    /// Teammates only; the lead is extra and never counted.
+    worker_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamSummaryResponse {
+    team: TeamSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamTasksResponse {
+    tasks: Vec<TeamTask>,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamMailboxResponse {
+    messages: Vec<TeamMessage>,
+}
+
+/// One message on `GET /api/tasks/{id}/team/messages`.
+///
+/// The durable column is `sent_at`; this read-only view exposes it as
+/// `created_at` so every team collection shares one timestamp name.
+#[derive(Debug, Serialize)]
+struct TeamMessageItem {
+    id: TeamMessageId,
+    team_id: TaskId,
+    from_agent_id: String,
+    to_agent_id: Option<String>,
+    subject: String,
+    body: String,
+    task_id: Option<TeamTaskId>,
+    read_at: Option<chrono::DateTime<chrono::Utc>>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<TeamMessage> for TeamMessageItem {
+    fn from(message: TeamMessage) -> Self {
+        Self {
+            id: message.id,
+            team_id: message.team_id,
+            from_agent_id: message.from_agent_id,
+            to_agent_id: message.to_agent_id,
+            subject: message.subject,
+            body: message.body,
+            task_id: message.task_id,
+            read_at: message.read_at,
+            created_at: message.sent_at,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct TeamMessagesResponse {
+    messages: Vec<TeamMessageItem>,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamMissionResponse {
+    mission: Vec<MissionLogEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamRunsResponse {
+    runs: Vec<TeamRun>,
+}
+
+/// One outcome plus every fragment attached to it.
+#[derive(Debug, Serialize)]
+struct TeamOutcomeItem {
+    #[serde(flatten)]
+    outcome: TeamOutcome,
+    fragments: Vec<TeamOutcomeFragment>,
+}
+
+#[derive(Debug, Serialize)]
+struct TeamOutcomesResponse {
+    outcomes: Vec<TeamOutcomeItem>,
+}
+
+/// `GET /api/tasks/{id}/team/mailbox` query string.
+#[derive(Debug, Default, Deserialize)]
+struct TeamMailboxQuery {
+    /// `inbox` (default) or `sent`.
+    #[serde(rename = "box")]
+    mailbox: Option<String>,
+    /// Defaults to the team's lead member.
+    agent_id: Option<String>,
+}
+
 /// `GET /api/tasks/{id}/work` output.
 #[derive(Debug, Serialize)]
 struct TaskWork {
@@ -575,16 +965,38 @@ async fn create_task(
         validate_pin(mgmt, body.worker_profile_id, "worker_profile_id").await?;
     }
 
-    let project = match body.project_folder.as_deref() {
-        Some(folder) => Some(
-            state
-                .project_folders
-                .resolve(folder)
-                .map_err(ApiError::bad_request)?,
-        ),
+    if body.project_folder.is_some() && body.web_project_id.is_some() {
+        return Err(ApiError::bad_request(
+            "project_folder and web_project_id are mutually exclusive",
+        ));
+    }
+
+    let web_project = match body.web_project_id {
+        Some(id) => Some(resolve_web_project(&state, id).await?),
         None => None,
     };
-    let (load_agents_md, agents_md_state) = match &project {
+    // Host-folder selection still goes through the configured allowlist. A
+    // web project skips that validation: its folder is server-managed below
+    // the validated DHI_WEB_PROJECTS_ROOT.
+    let project = if web_project.is_some() {
+        None
+    } else {
+        match body.project_folder.as_deref() {
+            Some(folder) => Some(
+                state
+                    .project_folders
+                    .resolve(folder)
+                    .map_err(ApiError::bad_request)?,
+            ),
+            None => None,
+        }
+    };
+    let selected_folder = match (&project, &web_project) {
+        (Some(folder), None) => Some(folder.clone()),
+        (None, Some(record)) => Some(web_projects::record_project_dir(record)),
+        _ => None,
+    };
+    let (load_agents_md, agents_md_state) = match &selected_folder {
         Some(folder) => {
             let found = dhi_core::inspect_agents_md(folder).map_err(|err| {
                 ApiError::bad_request(format!(
@@ -602,7 +1014,7 @@ async fn create_task(
         None => {
             if body.load_agents_md == Some(true) {
                 return Err(ApiError::bad_request(
-                    "load_agents_md requires project_folder",
+                    "load_agents_md requires project_folder or web_project_id",
                 ));
             }
             (false, AgentsMdState::Disabled)
@@ -613,7 +1025,7 @@ async fn create_task(
     // row does; a folder failure must not leave a task behind.
     let task_id = Uuid::new_v4();
     let mut new_task_folder = None;
-    if let Some(folder) = &project {
+    if let Some(folder) = &selected_folder {
         let path = folder.join(".dhi").join(task_id.to_string());
         let newly_created = matches!(
             std::fs::symlink_metadata(&path),
@@ -626,7 +1038,7 @@ async fn create_task(
             ApiError::bad_request(format!("cannot prepare the project task folder: {err}"))
         })?;
     }
-    let project_folder = project
+    let project_folder = selected_folder
         .as_ref()
         .map(|folder| {
             folder
@@ -646,6 +1058,8 @@ async fn create_task(
             topology: body.topology,
             swarm_workers,
             project_folder,
+            web_project_id: web_project.as_ref().map(|record| record.id),
+            web_project_name: web_project.as_ref().map(|record| record.name.clone()),
             load_agents_md,
             agents_md_state,
         })
@@ -670,6 +1084,31 @@ async fn create_task(
     spawn_task_loop(&state.store, &state.task_runs, &state.engine, &task);
 
     Ok((StatusCode::CREATED, Json(task)))
+}
+
+/// Loads one web project for task creation and proves its directory is real.
+async fn resolve_web_project(state: &AppState, id: Uuid) -> Result<WebProjectRecord, ApiError> {
+    require_web_projects_enabled(state)?;
+    let store = require_web_project_store(state)?;
+    let record = store
+        .get_web_project(id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::bad_request(format!("web project not found: {id}")))?;
+    let dir = web_projects::record_project_dir(&record);
+    let metadata = fs::symlink_metadata(&dir).map_err(|err| {
+        ApiError::bad_request(format!(
+            "web project directory {} cannot be inspected: {err}",
+            dir.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(ApiError::bad_request(format!(
+            "web project directory is not a real directory: {}",
+            dir.display()
+        )));
+    }
+    Ok(record)
 }
 
 /// Refuses a create-time capacity with any zero field. Negative values never
@@ -697,8 +1136,10 @@ fn validate_create_capacity(capacity: TaskCapacity) -> Result<TaskCapacity, ApiE
 /// Validates the create-time swarm worker count.
 ///
 /// The count is meaningless without a pinned swarm topology, so a count on any
-/// other task shape is a `400` instead of being silently ignored. The user
-/// contract fixes the range at 2 to 8.
+/// other topology is a request error. `None` is Auto: the planner may use up
+/// to [`dhi_core::SWARM_AUTO_WORKERS`] teammates, and anything wider needs a
+/// `swarm_scale` approval. A fixed count is exactly 2..=64 and needs no
+/// approval.
 fn validate_swarm_workers(
     topology: Option<Topology>,
     swarm_workers: Option<usize>,
@@ -711,10 +1152,12 @@ fn validate_swarm_workers(
             "swarm_workers is only valid with topology \"swarm\"",
         ));
     }
-    if !(2..=8).contains(&count) {
-        return Err(ApiError::bad_request(
-            "swarm_workers must be between 2 and 8",
-        ));
+    if !dhi_core::valid_swarm_worker_count(count) {
+        return Err(ApiError::bad_request(format!(
+            "swarm_workers must be between {} and {}",
+            dhi_core::SWARM_MIN_WORKERS,
+            dhi_core::SWARM_MAX_WORKERS
+        )));
     }
     Ok(Some(count))
 }
@@ -1982,6 +2425,183 @@ async fn get_task_swarm_messages(
     Ok(Json(json!({ "messages": messages })))
 }
 
+/// The team store, or `503` in a memory-only app state.
+fn require_team_store(state: &AppState) -> Result<&Arc<dyn TeamStore>, ApiError> {
+    state
+        .team_store
+        .as_ref()
+        .ok_or_else(|| ApiError::service_unavailable("no team store configured for this app state"))
+}
+
+/// Loads the task and its team members; a missing task or an empty team is
+/// `404`. Team state is keyed by task id, so one task has at most one team.
+async fn require_team(
+    state: &AppState,
+    task_id: TaskId,
+) -> Result<(Task, Vec<TeamMember>), ApiError> {
+    let task = require_task(state.store.as_ref(), task_id).await?;
+    let store = require_team_store(state)?;
+    let members = store
+        .team_members(task_id)
+        .await
+        .map_err(ApiError::internal)?;
+    if members.is_empty() {
+        return Err(ApiError::not_found(format!("task {task_id} has no team")));
+    }
+    Ok((task, members))
+}
+
+/// `GET /api/tasks/{id}/team`: the team header and roster.
+async fn get_task_team(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<TeamSummaryResponse>, ApiError> {
+    let (task, members) = require_team(&state, id).await?;
+    let lead = members
+        .iter()
+        .find(|member| member.role == TeamRole::Lead)
+        .map(|member| member.agent_id.clone());
+    let worker_count = members
+        .iter()
+        .filter(|member| member.role == TeamRole::Teammate)
+        .count();
+    let status = if members
+        .iter()
+        .all(|member| member.status == TeamMemberStatus::Stopped)
+    {
+        "stopped"
+    } else {
+        "active"
+    };
+    Ok(Json(TeamSummaryResponse {
+        team: TeamSummary {
+            team_id: task.id,
+            task_id: task.id,
+            status: status.to_string(),
+            lead,
+            members,
+            worker_count,
+        },
+    }))
+}
+
+/// `GET /api/tasks/{id}/team/tasks`: the shared task board.
+async fn get_task_team_tasks(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<TeamTasksResponse>, ApiError> {
+    let _ = require_team(&state, id).await?;
+    let tasks = require_team_store(&state)?
+        .team_tasks(id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(TeamTasksResponse { tasks }))
+}
+
+/// `GET /api/tasks/{id}/team/mailbox?box=inbox|sent`: the lead's mailbox by
+/// default, or another member's with `agent_id`.
+async fn get_task_team_mailbox(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+    Query(query): Query<TeamMailboxQuery>,
+) -> Result<Json<TeamMailboxResponse>, ApiError> {
+    let (_, members) = require_team(&state, id).await?;
+    let viewer = match query.agent_id.filter(|agent| !agent.trim().is_empty()) {
+        Some(agent_id) => agent_id,
+        None => members
+            .iter()
+            .find(|member| member.role == TeamRole::Lead)
+            .map(|member| member.agent_id.clone())
+            .ok_or_else(|| ApiError::not_found(format!("task {id} has no team lead")))?,
+    };
+    let store = require_team_store(&state)?;
+    let messages = match query.mailbox.as_deref().unwrap_or("inbox") {
+        "inbox" => store
+            .team_inbox(id, &viewer)
+            .await
+            .map_err(ApiError::internal)?,
+        "sent" => store
+            .team_sent(id, &viewer)
+            .await
+            .map_err(ApiError::internal)?,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "box must be \"inbox\" or \"sent\", got {other:?}"
+            )));
+        }
+    };
+    Ok(Json(TeamMailboxResponse { messages }))
+}
+
+/// `GET /api/tasks/{id}/team/messages`: every message in either direction,
+/// oldest first.
+async fn get_task_team_messages(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<TeamMessagesResponse>, ApiError> {
+    let _ = require_team(&state, id).await?;
+    let messages = require_team_store(&state)?
+        .team_messages(id)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
+        .map(TeamMessageItem::from)
+        .collect();
+    Ok(Json(TeamMessagesResponse { messages }))
+}
+
+/// `GET /api/tasks/{id}/team/mission`: the append-only mission log.
+async fn get_task_team_mission(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<TeamMissionResponse>, ApiError> {
+    let _ = require_team(&state, id).await?;
+    let mission = require_team_store(&state)?
+        .team_mission_log(id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(TeamMissionResponse { mission }))
+}
+
+/// `GET /api/tasks/{id}/team/runs`: every teammate run, terminal or active.
+async fn get_task_team_runs(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<TeamRunsResponse>, ApiError> {
+    let _ = require_team(&state, id).await?;
+    let runs = require_team_store(&state)?
+        .team_runs(id)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(TeamRunsResponse { runs }))
+}
+
+/// `GET /api/tasks/{id}/team/outcomes`: outcomes with all attached fragments.
+async fn get_task_team_outcomes(
+    State(state): State<AppState>,
+    Path(id): Path<TaskId>,
+) -> Result<Json<TeamOutcomesResponse>, ApiError> {
+    let _ = require_team(&state, id).await?;
+    let store = require_team_store(&state)?;
+    let outcomes = store.team_outcomes(id).await.map_err(ApiError::internal)?;
+    let fragments = store
+        .team_outcome_fragments(id, None)
+        .await
+        .map_err(ApiError::internal)?;
+    let outcomes = outcomes
+        .into_iter()
+        .map(|outcome| TeamOutcomeItem {
+            fragments: fragments
+                .iter()
+                .filter(|fragment| fragment.outcome_id == outcome.id)
+                .cloned()
+                .collect(),
+            outcome,
+        })
+        .collect();
+    Ok(Json(TeamOutcomesResponse { outcomes }))
+}
+
 /// `GET /api/approvals`: the pending approval queue of every task, enriched
 /// with the tool name and input of each linked tool call.
 ///
@@ -2074,6 +2694,140 @@ async fn decide_approval(
 
     let task = require_task(state.store.as_ref(), task_id).await?;
     Ok(Json(ApprovalDecisionResponse { approval, task }))
+}
+
+/// Records the activity row for one `swarm_scale` outcome. Pending rows never
+/// produce one. The payload carries the scale decision, never a secret.
+async fn log_scale_approval_activity(
+    store: &dyn GraphStore,
+    approval: &ScaleApproval,
+) -> anyhow::Result<()> {
+    let (kind, verb) = match approval.status {
+        ScaleApprovalStatus::Granted => ("scale_approval_granted", "granted"),
+        ScaleApprovalStatus::Denied => ("scale_approval_denied", "denied"),
+        ScaleApprovalStatus::Expired => ("scale_approval_expired", "expired"),
+        ScaleApprovalStatus::Pending => return Ok(()),
+    };
+    store
+        .append_activity(
+            approval.task_id,
+            kind,
+            format!("swarm_scale approval {} {verb}", approval.id),
+            json!({
+                "approval_id": approval.id,
+                "team_id": approval.team_id,
+                "requested_workers": approval.requested_workers,
+                "current_cap": approval.current_cap,
+                "status": approval.status.as_str(),
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Expires overdue `swarm_scale` rows and records each outcome as activity.
+async fn expire_scale_approvals(state: &AppState, mgmt: &Store) -> Result<usize, ApiError> {
+    let expired = mgmt
+        .expire_pending_scale_approvals(chrono::Utc::now())
+        .await
+        .map_err(ApiError::internal)?;
+    for approval in &expired {
+        log_scale_approval_activity(state.store.as_ref(), approval)
+            .await
+            .map_err(ApiError::internal)?;
+    }
+    Ok(expired.len())
+}
+
+/// `GET /api/scale-approvals`: the pending `swarm_scale` queue of every task.
+///
+/// Overdue rows are expired before the read, so the queue never shows a
+/// request whose deadline passed. Expiry counts as a denial and is recorded in
+/// task activity.
+async fn list_scale_approvals(
+    State(state): State<AppState>,
+) -> Result<Json<ScaleApprovalsResponse>, ApiError> {
+    let mgmt = require_mgmt(&state)?.clone();
+    expire_scale_approvals(&state, mgmt.as_ref()).await?;
+    let approvals = mgmt
+        .list_pending_scale_approvals()
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(ScaleApprovalsResponse { approvals }))
+}
+
+/// `POST /api/scale-approvals/{id}/decision`: allow or deny one pending
+/// `swarm_scale` request.
+///
+/// Allow grants the requested cap (already validated at creation, at most 64);
+/// deny keeps the current cap. A request that ran out while pending becomes
+/// `expired`, which is a denial. `404` means the request is unknown and `409`
+/// means it is no longer pending.
+async fn decide_scale_approval(
+    State(state): State<AppState>,
+    Path(id): Path<ScaleApprovalId>,
+    payload: Result<Json<ScaleApprovalDecisionRequest>, JsonRejection>,
+) -> Result<Json<ScaleApprovalDecisionResponse>, ApiError> {
+    let Json(body) = payload.map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
+    let mgmt = require_mgmt(&state)?.clone();
+
+    let approval = mgmt
+        .get_scale_approval(id)
+        .await
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("scale approval not found: {id}")))?;
+    if approval.status != ScaleApprovalStatus::Pending {
+        return Err(ApiError::conflict(format!(
+            "scale approval {id} is not pending: {}",
+            approval.status.as_str()
+        )));
+    }
+
+    let resolved = mgmt
+        .decide_scale_approval(id, body.decision)
+        .await
+        .map_err(ApiError::internal)?;
+    let Some(approval) = resolved else {
+        // Another decision or the expiry timer won between the read and the
+        // write. Report the row's current state instead of pretending the
+        // decision applied.
+        return match mgmt
+            .get_scale_approval(id)
+            .await
+            .map_err(ApiError::internal)?
+        {
+            None => Err(ApiError::not_found(format!(
+                "scale approval not found: {id}"
+            ))),
+            Some(current) => Err(ApiError::conflict(format!(
+                "scale approval {id} is not pending: {}",
+                current.status.as_str()
+            ))),
+        };
+    };
+    if approval.status == ScaleApprovalStatus::Expired {
+        log_scale_approval_activity(state.store.as_ref(), &approval)
+            .await
+            .map_err(ApiError::internal)?;
+        return Err(ApiError::conflict(format!(
+            "scale approval {id} is not pending: {}",
+            approval.status.as_str()
+        )));
+    }
+    if !matches!(
+        approval.status,
+        ScaleApprovalStatus::Granted | ScaleApprovalStatus::Denied
+    ) {
+        return Err(ApiError::conflict(format!(
+            "scale approval {id} is not pending: {}",
+            approval.status.as_str()
+        )));
+    }
+
+    log_scale_approval_activity(state.store.as_ref(), &approval)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(ScaleApprovalDecisionResponse { approval }))
 }
 
 /// `GET /api/stream?task_id=<uuid>&after=<id>`: the task's activity as it lands.
@@ -2552,12 +3306,41 @@ pub(crate) async fn reconcile_running_tasks(
     Ok(failed)
 }
 
+/// Expires every overdue `swarm_scale` request and records each outcome as
+/// activity. One pass is idempotent: a row leaves `pending` once.
+pub async fn sweep_scale_approvals(
+    store: &Arc<dyn GraphStore>,
+    mgmt: &Store,
+) -> anyhow::Result<usize> {
+    let expired = mgmt
+        .expire_pending_scale_approvals(chrono::Utc::now())
+        .await?;
+    for approval in &expired {
+        log_scale_approval_activity(store.as_ref(), approval).await?;
+    }
+    Ok(expired.len())
+}
+
 /// Runs the approval supervisor on a fixed interval until the process exits.
 ///
 /// Every [`SUPERVISOR_INTERVAL`] it sweeps each non-terminal task, so an
 /// overdue approval expires without a human decision and without anyone
 /// checking the queue. Errors are logged, never fatal.
+///
+/// This older entry point has no management store, so it cannot expire
+/// `swarm_scale` rows. `main` uses [`run_supervisor_with_scale`].
 pub async fn run_supervisor(store: Arc<dyn GraphStore>, engine: Arc<Engine>, interval: Duration) {
+    run_supervisor_with_scale(store, engine, None, interval).await
+}
+
+/// The supervisor used by the binary: guard approvals per task plus the
+/// global `swarm_scale` queue when a management store is wired.
+pub async fn run_supervisor_with_scale(
+    store: Arc<dyn GraphStore>,
+    engine: Arc<Engine>,
+    mgmt: Option<Arc<Store>>,
+    interval: Duration,
+) {
     let mut ticker = tokio::time::interval(interval);
     // The first tick fires immediately; skip work there and wait a full
     // interval so startup is not delayed by a sweep.
@@ -2567,6 +3350,16 @@ pub async fn run_supervisor(store: Arc<dyn GraphStore>, engine: Arc<Engine>, int
         match sweep_all(&store, &engine).await {
             Ok(swept) => tracing::debug!(swept, "approval supervisor pass complete"),
             Err(err) => tracing::warn!(error = %err, "approval supervisor pass failed"),
+        }
+        if let Some(mgmt) = &mgmt {
+            match sweep_scale_approvals(&store, mgmt).await {
+                Ok(expired) => {
+                    tracing::debug!(expired, "swarm scale approval supervisor pass complete");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "swarm scale approval supervisor pass failed");
+                }
+            }
         }
     }
 }
@@ -2590,8 +3383,14 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use dhi_agent::{MockAgentRuntime, RuntimeSink as _, ToolSink as _};
+    use dhi_core::team::{
+        MemoryTeamStore, MissionLogKind, NewMissionLogEntry, NewTeamMessage, NewTeamOutcome,
+        NewTeamOutcomeFragment, NewTeamRun, NewTeamTask, TeamMember, TeamRole, TeamRunStatus,
+        TeamStore,
+    };
     use dhi_core::{ApprovalDecision, ApprovalStatus, GuardStore, TaskState, Topology};
     use dhi_guard::{GuardedExecutor, Policy};
+    use dhi_store::Store;
     use dhi_testkit::MemoryStore;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
@@ -2620,6 +3419,10 @@ mod tests {
             web: Arc::new(crate::web_providers::WebProviderRuntime::empty()),
             task_runs: Arc::new(TaskRunRegistry::disabled()),
             project_folders: Arc::new(crate::project_folders::ProjectFolders::default()),
+            web_projects: Arc::new(crate::web_projects::WebProjects::default()),
+            web_project_store: None,
+            team_store: None,
+            scale_gate: None,
         }
     }
 
@@ -3477,6 +4280,10 @@ mod tests {
             web: Arc::new(crate::web_providers::WebProviderRuntime::empty()),
             task_runs: Arc::new(TaskRunRegistry::disabled()),
             project_folders: Arc::new(crate::project_folders::ProjectFolders::default()),
+            web_projects: Arc::new(crate::web_projects::WebProjects::default()),
+            web_project_store: None,
+            team_store: None,
+            scale_gate: None,
         }
     }
 
@@ -3523,6 +4330,10 @@ mod tests {
             web: Arc::new(crate::web_providers::WebProviderRuntime::empty()),
             task_runs: Arc::new(TaskRunRegistry::disabled()),
             project_folders: Arc::new(crate::project_folders::ProjectFolders::default()),
+            web_projects: Arc::new(crate::web_projects::WebProjects::default()),
+            web_project_store: None,
+            team_store: None,
+            scale_gate: None,
         }
     }
 
@@ -4004,6 +4815,8 @@ mod tests {
 
         assert_eq!(status, StatusCode::CREATED, "{json}");
         assert!(json["project_folder"].is_null(), "{json}");
+        assert!(json["web_project_id"].is_null(), "{json}");
+        assert!(json["web_project_name"].is_null(), "{json}");
         assert!(json["task_folder"].is_null(), "{json}");
         assert_eq!(json["load_agents_md"], false, "{json}");
         assert_eq!(json["agents_md_state"], "disabled", "{json}");
@@ -4201,6 +5014,511 @@ mod tests {
         );
     }
 
+    /// In-memory `web_projects` table for route tests.
+    #[derive(Default)]
+    struct FakeWebProjectStore {
+        records: std::sync::Mutex<Vec<WebProjectRecord>>,
+    }
+
+    impl FakeWebProjectStore {
+        fn insert(&self, record: WebProjectRecord) {
+            self.records.lock().unwrap().push(record);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::web_projects::WebProjectStore for FakeWebProjectStore {
+        async fn create_web_project(
+            &self,
+            id: Uuid,
+            name: &str,
+            root_path: &str,
+        ) -> Result<WebProjectRecord, StoreError> {
+            let now = chrono::Utc::now();
+            let record = WebProjectRecord {
+                id,
+                name: name.to_string(),
+                root_path: root_path.to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            self.insert(record.clone());
+            Ok(record)
+        }
+
+        async fn list_web_projects(&self) -> Result<Vec<WebProjectRecord>, StoreError> {
+            let records = self.records.lock().unwrap();
+            Ok(records.iter().rev().cloned().collect())
+        }
+
+        async fn get_web_project(&self, id: Uuid) -> Result<Option<WebProjectRecord>, StoreError> {
+            Ok(self
+                .records
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|record| record.id == id)
+                .cloned())
+        }
+    }
+
+    fn state_with_web_projects(
+        store: Arc<MemoryStore>,
+        root: &std::path::Path,
+        projects: Arc<FakeWebProjectStore>,
+    ) -> AppState {
+        let mut state = test_state_with_store(store);
+        state.web_projects = Arc::new(
+            crate::web_projects::WebProjects::parse(Some(root.to_str().unwrap()))
+                .expect("test web project root is valid"),
+        );
+        state.web_project_store = Some(projects as Arc<dyn crate::web_projects::WebProjectStore>);
+        state
+    }
+
+    fn web_project_record(root: &std::path::Path, id: Uuid, name: &str) -> WebProjectRecord {
+        let now = chrono::Utc::now();
+        WebProjectRecord {
+            id,
+            name: name.to_string(),
+            root_path: root.display().to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn put_bytes(uri: &str, bytes: &[u8]) -> Request<Body> {
+        Request::builder()
+            .method("PUT")
+            .uri(uri)
+            .body(Body::from(bytes.to_vec()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn web_project_routes_create_list_get_and_upload_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = Arc::new(FakeWebProjectStore::default());
+        let store = Arc::new(MemoryStore::new());
+        let app = router(state_with_web_projects(
+            store,
+            temp.path(),
+            projects.clone(),
+        ));
+
+        let (status, created) = send(
+            app.clone(),
+            post_json("/api/web-projects", json!({"name": "  My App  "})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let project = &created["project"];
+        assert_eq!(project["name"], "My App");
+        assert_eq!(project["agents_md_present"], false);
+        assert_eq!(project["file_count"], 0);
+        assert_eq!(project["total_bytes"], 0);
+        assert!(project["created_at"].is_string(), "{created}");
+        let id: Uuid = project["id"].as_str().unwrap().parse().unwrap();
+
+        let (status, uploaded) = send(
+            app.clone(),
+            put_bytes(
+                &format!("/api/web-projects/{id}/files?path=src%2Fapp.ts"),
+                b"export const app = 1;\n",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{uploaded}");
+        assert_eq!(uploaded["path"], "src/app.ts");
+        assert_eq!(uploaded["size"], 22);
+
+        let (status, uploaded) = send(
+            app.clone(),
+            put_bytes(
+                &format!("/api/web-projects/{id}/files?path=assets%2Flogo.bin"),
+                &[0, 159, 146, 150],
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{uploaded}");
+        assert_eq!(uploaded["size"], 4);
+
+        let (status, uploaded) = send(
+            app.clone(),
+            put_bytes(
+                &format!("/api/web-projects/{id}/files?path=AGENTS.md"),
+                b"project rules",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{uploaded}");
+
+        let (status, listed) = send(app.clone(), get_uri("/api/web-projects")).await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        let rows = listed["projects"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["id"], id.to_string());
+        assert_eq!(rows[0]["agents_md_present"], true);
+        assert_eq!(rows[0]["file_count"], 3);
+        assert_eq!(rows[0]["total_bytes"], 22 + 4 + 13);
+
+        let (status, fetched) = send(app, get_uri(&format!("/api/web-projects/{id}"))).await;
+        assert_eq!(status, StatusCode::OK, "{fetched}");
+        assert_eq!(fetched["project"]["name"], "My App");
+        assert_eq!(fetched["project"]["file_count"], 3);
+
+        let records = projects.records.lock().unwrap();
+        let stored = &records[0];
+        assert_eq!(
+            std::fs::read_to_string(
+                std::path::Path::new(&stored.root_path)
+                    .join(id.to_string())
+                    .join("src/app.ts")
+            )
+            .unwrap(),
+            "export const app = 1;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_projects_are_disabled_without_a_root() {
+        let app = router(test_state());
+        let (status, body) = send(app.clone(), get_uri("/api/web-projects")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unavailable"),
+            "{body}"
+        );
+
+        let (status, body) = send(
+            app.clone(),
+            post_json("/api/web-projects", json!({"name": "app"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("disabled"),
+            "{body}"
+        );
+
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store.clone()));
+        let (status, body) = send(
+            app,
+            post_json(
+                "/api/tasks",
+                json!({"goal": "web task", "web_project_id": Uuid::new_v4()}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(store.list_tasks(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn web_project_names_are_validated() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = Arc::new(FakeWebProjectStore::default());
+        let app = router(state_with_web_projects(
+            Arc::new(MemoryStore::new()),
+            temp.path(),
+            projects,
+        ));
+        for name in ["", "   ", "bad\nname"] {
+            let (status, body) = send(
+                app.clone(),
+                post_json("/api/web-projects", json!({"name": name})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{name:?} -> {body}");
+        }
+        let long = "a".repeat(crate::web_projects::WEB_PROJECT_NAME_MAX_CHARS + 1);
+        let (status, body) = send(app, post_json("/api/web-projects", json!({"name": long}))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn web_project_uploads_reject_unsafe_paths_and_oversized_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let projects = Arc::new(FakeWebProjectStore::default());
+        let app = router(state_with_web_projects(
+            Arc::new(MemoryStore::new()),
+            temp.path(),
+            projects,
+        ));
+        let (_, created) = send(
+            app.clone(),
+            post_json("/api/web-projects", json!({"name": "app"})),
+        )
+        .await;
+        let id = created["project"]["id"].as_str().unwrap();
+
+        for path in ["..%2Fescape", ".dhi%2Fstate", "%2Fetc%2Fpasswd", ""] {
+            let (status, body) = send(
+                app.clone(),
+                put_bytes(&format!("/api/web-projects/{id}/files?path={path}"), b"x"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} -> {body}");
+        }
+
+        let too_big = vec![0u8; crate::web_projects::WEB_PROJECT_MAX_FILE_BYTES as usize + 1];
+        let (status, body) = send(
+            app,
+            put_bytes(
+                &format!("/api/web-projects/{id}/files?path=too-big.bin"),
+                &too_big,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn create_task_with_a_web_project_sets_folder_and_agents_md() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let projects = Arc::new(FakeWebProjectStore::default());
+        let project_id = Uuid::new_v4();
+        let project_dir = root.join(project_id.to_string());
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("AGENTS.md"), "use the snapshot").unwrap();
+        projects.insert(web_project_record(root, project_id, "Snapshot App"));
+
+        let store = Arc::new(MemoryStore::new());
+        let app = router(state_with_web_projects(
+            store.clone(),
+            root,
+            projects.clone(),
+        ));
+        let (status, json) = send(
+            app.clone(),
+            post_json(
+                "/api/tasks",
+                json!({"goal": "work on the snapshot", "web_project_id": project_id}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        let task_id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(json["web_project_id"], project_id.to_string());
+        assert_eq!(json["web_project_name"], "Snapshot App");
+        let expected_project = project_dir.display().to_string();
+        assert_eq!(
+            json["project_folder"].as_str(),
+            Some(expected_project.as_str())
+        );
+        assert_eq!(json["load_agents_md"], true, "{json}");
+        assert_eq!(json["agents_md_state"], "loaded", "{json}");
+        assert!(project_dir.join(".dhi").join(task_id.to_string()).is_dir());
+
+        let persisted = store.get_task(task_id).await.unwrap().expect("task row");
+        assert_eq!(persisted.web_project_id, Some(project_id));
+        assert_eq!(persisted.web_project_name.as_deref(), Some("Snapshot App"));
+
+        // Missing projects are a request error, not a silent host-folder task.
+        let (status, body) = send(
+            app.clone(),
+            post_json(
+                "/api/tasks",
+                json!({"goal": "missing", "web_project_id": Uuid::new_v4()}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        // `project_folder` and `web_project_id` are mutually exclusive.
+        let (status, body) = send(
+            app,
+            post_json(
+                "/api/tasks",
+                json!({
+                    "goal": "both",
+                    "project_folder": "/tmp/host-project",
+                    "web_project_id": project_id,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("mutually exclusive"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_project_outputs_return_text_base64_and_nested_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let projects = Arc::new(FakeWebProjectStore::default());
+        let project_id = Uuid::new_v4();
+        std::fs::create_dir_all(root.join(project_id.to_string())).unwrap();
+        projects.insert(web_project_record(root, project_id, "Outputs"));
+
+        let store = Arc::new(MemoryStore::new());
+        let app = router(state_with_web_projects(store.clone(), root, projects));
+        let (_, created) = send(
+            app.clone(),
+            post_json(
+                "/api/tasks",
+                json!({"goal": "produce outputs", "web_project_id": project_id}),
+            ),
+        )
+        .await;
+        let task_id: Uuid = created["id"].as_str().unwrap().parse().unwrap();
+        let task_dir = root
+            .join(project_id.to_string())
+            .join(".dhi")
+            .join(task_id.to_string());
+
+        let (status, empty) = send(
+            app.clone(),
+            get_uri(&format!("/api/tasks/{task_id}/outputs")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{empty}");
+        assert_eq!(empty["files"], json!([]));
+
+        std::fs::create_dir_all(task_dir.join("nested")).unwrap();
+        std::fs::write(task_dir.join("summary.md"), "# done\n").unwrap();
+        std::fs::write(task_dir.join("nested/data.bin"), [0, 255, 1]).unwrap();
+        std::fs::write(
+            task_dir.join("too-big.bin"),
+            vec![0u8; crate::web_projects::OUTPUT_MAX_FILE_BYTES as usize + 1],
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("secret.txt"), task_dir.join("linked.txt"))
+                .unwrap();
+        }
+
+        let (status, body) = send(app, get_uri(&format!("/api/tasks/{task_id}/outputs"))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let files = body["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2, "{body}");
+        assert_eq!(files[0]["path"], format!(".dhi/{task_id}/nested/data.bin"));
+        assert_eq!(files[0]["encoding"], "base64");
+        assert_eq!(files[0]["content"], "AP8B");
+        assert_eq!(files[1]["path"], format!(".dhi/{task_id}/summary.md"));
+        assert_eq!(files[1]["encoding"], "utf8");
+        assert_eq!(files[1]["content"], "# done\n");
+    }
+
+    #[tokio::test]
+    async fn outputs_reject_a_project_folder_outside_the_web_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("web-projects");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let projects = Arc::new(FakeWebProjectStore::default());
+        let app = router(state_with_web_projects(store.clone(), &root, projects));
+        let web_project_id = Uuid::new_v4();
+        let task = store
+            .create_task_with_pins(
+                dhi_core::NewTask::new("outside outputs")
+                    .with_project(
+                        outside.display().to_string(),
+                        false,
+                        AgentsMdState::Disabled,
+                    )
+                    .with_web_project(web_project_id, "Outside"),
+            )
+            .await
+            .unwrap();
+        let task_dir = outside.join(".dhi").join(task.id.to_string());
+        std::fs::create_dir_all(&task_dir).unwrap();
+        std::fs::write(task_dir.join("secret.txt"), "secret").unwrap();
+
+        let (status, body) = send(app, get_uri(&format!("/api/tasks/{}/outputs", task.id))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("outside"),
+            "{body}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn outputs_reject_a_project_folder_replaced_by_a_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("web-projects");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let projects = Arc::new(FakeWebProjectStore::default());
+        let app = router(state_with_web_projects(store, &root, projects));
+
+        let (status, created) = send(
+            app.clone(),
+            post_json("/api/web-projects", json!({"name": "Symlinked"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        let project_id: Uuid = created["project"]["id"].as_str().unwrap().parse().unwrap();
+        let (status, json) = send(
+            app.clone(),
+            post_json(
+                "/api/tasks",
+                json!({"goal": "symlinked outputs", "web_project_id": project_id}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        let task_id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
+
+        let outside_task = outside.join(".dhi").join(task_id.to_string());
+        std::fs::create_dir_all(&outside_task).unwrap();
+        std::fs::write(outside_task.join("leak.txt"), "secret").unwrap();
+        let project_dir = std::fs::canonicalize(&root)
+            .unwrap()
+            .join(project_id.to_string());
+        std::fs::remove_dir_all(&project_dir).unwrap();
+        std::os::unix::fs::symlink(&outside, &project_dir).unwrap();
+
+        let (status, body) = send(app, get_uri(&format!("/api/tasks/{task_id}/outputs"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("real directory"),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn outputs_are_rejected_for_a_task_without_a_web_project() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("legacy task");
+        let app = router(test_state_with_store(store));
+        let (status, body) = send(app, get_uri(&format!("/api/tasks/{}/outputs", task.id))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("web project"),
+            "{body}"
+        );
+    }
+
     #[test]
     fn a_new_project_task_folder_is_removed_unless_committed() {
         let temp = tempfile::tempdir().unwrap();
@@ -4322,7 +5640,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let app = router(test_state_with_store(store.clone()));
 
-        for count in [2, 4, 8] {
+        for count in [2, 8, 64] {
             let (status, json) = send(
                 app.clone(),
                 post_json(
@@ -4347,6 +5665,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_task_accepts_auto_swarm_workers() {
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store.clone()));
+
+        let (status, json) = send(
+            app,
+            post_json(
+                "/api/tasks",
+                json!({
+                    "goal": "let the lead size the swarm",
+                    "topology": "swarm",
+                    "swarm_workers": null,
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert!(json["swarm_workers"].is_null(), "{json}");
+        let id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
+        assert_eq!(
+            store.get_task(id).await.unwrap().unwrap().swarm_workers,
+            None,
+            "null pins Auto, not a fixed team"
+        );
+    }
+
+    #[tokio::test]
     async fn create_task_rejects_invalid_swarm_worker_counts() {
         let store = Arc::new(MemoryStore::new());
         let app = router(test_state_with_store(store.clone()));
@@ -4356,7 +5702,7 @@ mod tests {
             json!({"goal": "not a swarm", "topology": "manager_worker", "swarm_workers": 4}),
             json!({"goal": "too small", "topology": "swarm", "swarm_workers": 1}),
             json!({"goal": "too small", "topology": "swarm", "swarm_workers": 0}),
-            json!({"goal": "too big", "topology": "swarm", "swarm_workers": 9}),
+            json!({"goal": "too big", "topology": "swarm", "swarm_workers": 65}),
             json!({"goal": "negative", "topology": "swarm", "swarm_workers": -2}),
         ] {
             let (status, json) = send(app.clone(), post_json("/api/tasks", body.clone())).await;
@@ -5560,6 +6906,227 @@ mod tests {
         assert!(stored.decided_at.is_none());
     }
 
+    /// An app state backed by the real PostgreSQL store, for the routes that
+    /// only exist with a management store (`scale_approvals`).
+    fn store_state(pool: sqlx::PgPool) -> (Arc<Store>, AppState) {
+        let store = Arc::new(Store::new(pool));
+        let graph_store: Arc<dyn GraphStore> = store.clone();
+        let guard_store: Arc<dyn GuardStore> = store.clone();
+        let agent: Arc<dyn AgentRuntime> = Arc::new(MockAgentRuntime);
+        let engine = Arc::new(Engine::new(graph_store.clone(), agent.clone()));
+        let state = AppState {
+            store: graph_store,
+            guard_store,
+            engine,
+            agent,
+            pool: Arc::new(LlmPool::default()),
+            guard: test_guard(),
+            mgmt: Some(store.clone()),
+            mcp: crate::mcp::McpManager::idle(),
+            tool_catalog: Arc::new(dhi_tool_catalog::CatalogRuntime::default()),
+            tool_control: None,
+            web: Arc::new(crate::web_providers::WebProviderRuntime::empty()),
+            task_runs: Arc::new(TaskRunRegistry::disabled()),
+            project_folders: Arc::new(crate::project_folders::ProjectFolders::default()),
+            web_projects: Arc::new(crate::web_projects::WebProjects::default()),
+            web_project_store: None,
+            team_store: None,
+            scale_gate: None,
+        };
+        (store, state)
+    }
+
+    fn scale_request(
+        task_id: TaskId,
+        requested: usize,
+        timeout_secs: Option<u64>,
+    ) -> dhi_core::ScaleApprovalRequest {
+        dhi_core::ScaleApprovalRequest {
+            task_id,
+            team_id: None,
+            requested_workers: requested,
+            current_cap: dhi_core::SWARM_AUTO_WORKERS,
+            reason: "the auto swarm needs more teammates".to_string(),
+            timeout_secs,
+        }
+    }
+
+    #[sqlx::test(migrations = "../dhi-store/migrations")]
+    async fn scale_approvals_route_returns_the_pending_shape(pool: sqlx::PgPool) {
+        let (store, state) = store_state(pool);
+        let task = store.create_task("scale the auto swarm").await.unwrap();
+        let approval = store
+            .create_scale_approval(&scale_request(task.id, 32, Some(600)))
+            .await
+            .unwrap();
+
+        let app = router(state);
+        let (status, json) = send(app, get_uri("/api/scale-approvals")).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let approvals = json["approvals"].as_array().unwrap();
+        assert_eq!(approvals.len(), 1);
+        let row = &approvals[0];
+        assert_eq!(row["id"], approval.id.to_string());
+        assert_eq!(row["task_id"], task.id.to_string());
+        assert!(row["team_id"].is_null());
+        assert_eq!(row["requested_workers"], 32);
+        assert_eq!(row["current_cap"], 8);
+        assert_eq!(row["reason"], "the auto swarm needs more teammates");
+        assert_eq!(row["status"], "pending");
+        assert!(row["created_at"].is_string());
+        assert!(row["expires_at"].is_string());
+        assert!(row["decided_at"].is_null());
+        assert!(
+            row.get("api_key").is_none(),
+            "the response carries no secret: {row}"
+        );
+    }
+
+    #[sqlx::test(migrations = "../dhi-store/migrations")]
+    async fn scale_approval_allow_grants_and_second_decision_is_409(pool: sqlx::PgPool) {
+        let (store, state) = store_state(pool);
+        let task = store.create_task("allow the wider swarm").await.unwrap();
+        let approval = store
+            .create_scale_approval(&scale_request(task.id, 48, Some(600)))
+            .await
+            .unwrap();
+
+        let app = router(state);
+        let (status, json) = send(
+            app.clone(),
+            post_json(
+                &format!("/api/scale-approvals/{}/decision", approval.id),
+                json!({ "decision": "allow" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["approval"]["id"], approval.id.to_string());
+        assert_eq!(json["approval"]["status"], "granted");
+        assert!(json["approval"]["decided_at"].is_string());
+        assert!(
+            json["approval"].get("task").is_none(),
+            "the route returns only {{ approval }}"
+        );
+
+        let stored = store
+            .get_scale_approval(approval.id)
+            .await
+            .unwrap()
+            .expect("the row exists");
+        assert_eq!(stored.status, ScaleApprovalStatus::Granted);
+        assert!(stored.status.is_granted());
+        let activities = GraphStore::list_activity(store.as_ref(), task.id, None)
+            .await
+            .unwrap();
+        assert!(
+            activities
+                .iter()
+                .any(|activity| activity.kind == "scale_approval_granted"),
+            "a grant is audited in activity"
+        );
+
+        let (status, json) = send(
+            app,
+            post_json(
+                &format!("/api/scale-approvals/{}/decision", approval.id),
+                json!({ "decision": "deny" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert!(json["error"].is_string());
+    }
+
+    #[sqlx::test(migrations = "../dhi-store/migrations")]
+    async fn scale_approval_deny_sets_denied(pool: sqlx::PgPool) {
+        let (store, state) = store_state(pool);
+        let task = store.create_task("deny the wider swarm").await.unwrap();
+        let approval = store
+            .create_scale_approval(&scale_request(task.id, 20, Some(600)))
+            .await
+            .unwrap();
+
+        let app = router(state);
+        let (status, json) = send(
+            app,
+            post_json(
+                &format!("/api/scale-approvals/{}/decision", approval.id),
+                json!({ "decision": "deny" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["approval"]["status"], "denied");
+        assert!(json["approval"]["decided_at"].is_string());
+        let activities = GraphStore::list_activity(store.as_ref(), task.id, None)
+            .await
+            .unwrap();
+        assert!(
+            activities
+                .iter()
+                .any(|activity| activity.kind == "scale_approval_denied"),
+            "a denial is audited in activity"
+        );
+    }
+
+    #[sqlx::test(migrations = "../dhi-store/migrations")]
+    async fn supervisor_expires_overdue_scale_approvals_as_denial(pool: sqlx::PgPool) {
+        let (store, state) = store_state(pool);
+        let task = store.create_task("expire the wider swarm").await.unwrap();
+        let approval = store
+            .create_scale_approval(&scale_request(task.id, 64, Some(0)))
+            .await
+            .unwrap();
+
+        let graph_store: Arc<dyn GraphStore> = store.clone();
+        let expired = sweep_scale_approvals(&graph_store, store.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(expired, 1, "one pending row expired");
+
+        let stored = store
+            .get_scale_approval(approval.id)
+            .await
+            .unwrap()
+            .expect("the row still exists");
+        assert_eq!(stored.status, ScaleApprovalStatus::Expired);
+        assert!(stored.decided_at.is_none());
+        let activities = GraphStore::list_activity(store.as_ref(), task.id, None)
+            .await
+            .unwrap();
+        assert!(
+            activities
+                .iter()
+                .any(|activity| activity.kind == "scale_approval_expired"),
+            "expiry is audited in activity"
+        );
+
+        let app = router(state);
+        let (status, json) = send(app.clone(), get_uri("/api/scale-approvals")).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["approvals"], json!([]));
+
+        let (status, json) = send(
+            app,
+            post_json(
+                &format!("/api/scale-approvals/{}/decision", approval.id),
+                json!({ "decision": "allow" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert!(json["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn scale_approvals_without_a_management_store_is_500() {
+        let app = router(test_state());
+        let (status, json) = send(app, get_uri("/api/scale-approvals")).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{json}");
+        assert!(json["error"].is_string());
+    }
+
     #[tokio::test]
     async fn task_usage_returns_runs() {
         let store = Arc::new(MemoryStore::new());
@@ -5892,5 +7459,261 @@ mod tests {
             .map(|activity| activity.kind)
             .collect();
         assert_eq!(kinds, vec!["agent_delegated", "agent_returned"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Cline Teams read routes
+    // -----------------------------------------------------------------------
+
+    async fn seed_team_state(team_store: &dyn TeamStore, task_id: TaskId) {
+        team_store
+            .upsert_team_member(&TeamMember::new(
+                task_id,
+                "lead",
+                TeamRole::Lead,
+                "owns the outcome",
+            ))
+            .await
+            .unwrap();
+        team_store
+            .upsert_team_member(&TeamMember::new(
+                task_id,
+                "w0",
+                TeamRole::Teammate,
+                "collects evidence",
+            ))
+            .await
+            .unwrap();
+
+        team_store
+            .create_team_task(&NewTeamTask::new(task_id, "collect", "lead"))
+            .await
+            .unwrap();
+        team_store
+            .send_team_message(&NewTeamMessage::direct(
+                task_id,
+                "lead",
+                "w0",
+                "handoff",
+                "please collect",
+            ))
+            .await
+            .unwrap();
+        team_store
+            .send_team_message(&NewTeamMessage::direct(
+                task_id,
+                "w0",
+                "lead",
+                "reply",
+                "collected",
+            ))
+            .await
+            .unwrap();
+        team_store
+            .append_mission_log(&NewMissionLogEntry::new(
+                task_id,
+                "lead",
+                MissionLogKind::Progress,
+                "started",
+            ))
+            .await
+            .unwrap();
+
+        let run = team_store
+            .enqueue_team_run(&NewTeamRun::new(task_id, "w0", "collect the evidence"))
+            .await
+            .unwrap();
+        team_store
+            .start_team_run(task_id, run.id, "test-lease")
+            .await
+            .unwrap();
+        team_store
+            .finish_team_run(
+                task_id,
+                run.id,
+                TeamRunStatus::Completed,
+                Some("found the evidence"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let outcome = team_store
+            .create_team_outcome(
+                &NewTeamOutcome::new(task_id, "report", "lead")
+                    .with_sections(vec!["summary".to_string()]),
+            )
+            .await
+            .unwrap();
+        team_store
+            .attach_outcome_fragment(&NewTeamOutcomeFragment::new(
+                task_id,
+                outcome.id,
+                "summary",
+                "w0",
+                "reviewed summary",
+            ))
+            .await
+            .unwrap();
+    }
+
+    fn team_state(store: Arc<MemoryStore>, team_store: Arc<dyn TeamStore>) -> AppState {
+        let mut state = test_state_with_store(store);
+        state.team_store = Some(team_store);
+        state
+    }
+
+    #[tokio::test]
+    async fn team_routes_return_the_contract_shapes() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("read the team");
+        let team_store: Arc<dyn TeamStore> = Arc::new(MemoryTeamStore::new());
+        seed_team_state(team_store.as_ref(), task.id).await;
+        let app = router(team_state(store, team_store));
+
+        let (status, json) = send(
+            app.clone(),
+            get_uri(&format!("/api/tasks/{}/team", task.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let team = &json["team"];
+        assert_eq!(team["team_id"], task.id.to_string());
+        assert_eq!(team["task_id"], task.id.to_string());
+        assert_eq!(team["status"], "active");
+        assert_eq!(team["lead"], "lead");
+        assert_eq!(team["worker_count"], 1);
+        assert_eq!(team["members"].as_array().unwrap().len(), 2);
+
+        let (status, json) = send(
+            app.clone(),
+            get_uri(&format!("/api/tasks/{}/team/tasks", task.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let tasks = json["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["title"], "collect");
+        assert_eq!(tasks[0]["status"], "pending");
+
+        let (status, json) = send(
+            app.clone(),
+            get_uri(&format!("/api/tasks/{}/team/mailbox?box=inbox", task.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let inbox = json["messages"].as_array().unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0]["from_agent_id"], "w0");
+        assert_eq!(inbox[0]["to_agent_id"], "lead");
+
+        let (status, json) = send(
+            app.clone(),
+            get_uri(&format!("/api/tasks/{}/team/mailbox?box=sent", task.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let sent = json["messages"].as_array().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["from_agent_id"], "lead");
+        assert_eq!(sent[0]["to_agent_id"], "w0");
+
+        let (status, json) = send(
+            app.clone(),
+            get_uri(&format!("/api/tasks/{}/team/mission", task.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let mission = json["mission"].as_array().unwrap();
+        assert_eq!(mission.len(), 1);
+        assert_eq!(mission[0]["kind"], "progress");
+        assert_eq!(mission[0]["summary"], "started");
+
+        let (status, json) = send(
+            app.clone(),
+            get_uri(&format!("/api/tasks/{}/team/runs", task.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let runs = json["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0]["agent_id"], "w0");
+        assert_eq!(runs[0]["status"], "completed");
+        assert_eq!(runs[0]["result"], "found the evidence");
+
+        let (status, json) = send(
+            app,
+            get_uri(&format!("/api/tasks/{}/team/outcomes", task.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let outcomes = json["outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0]["title"], "report");
+        assert_eq!(outcomes[0]["status"], "draft");
+        assert_eq!(
+            outcomes[0]["fragments"].as_array().unwrap().len(),
+            1,
+            "outcomes carry their fragments"
+        );
+        assert_eq!(outcomes[0]["fragments"][0]["section"], "summary");
+    }
+
+    #[tokio::test]
+    async fn team_routes_are_404_without_a_team() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("no team yet");
+        let team_store: Arc<dyn TeamStore> = Arc::new(MemoryTeamStore::new());
+        let app = router(team_state(store, team_store));
+
+        for suffix in ["", "/tasks", "/mailbox", "/mission", "/runs", "/outcomes"] {
+            let (status, json) = send(
+                app.clone(),
+                get_uri(&format!("/api/tasks/{}/team{suffix}", task.id)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "suffix {suffix:?}: {json}");
+            assert!(json["error"].is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn team_mailbox_override_and_invalid_box() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("mailbox override");
+        let team_store: Arc<dyn TeamStore> = Arc::new(MemoryTeamStore::new());
+        seed_team_state(team_store.as_ref(), task.id).await;
+        let app = router(team_state(store, team_store));
+
+        let (status, json) = send(
+            app.clone(),
+            get_uri(&format!(
+                "/api/tasks/{}/team/mailbox?box=inbox&agent_id=w0",
+                task.id
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let inbox = json["messages"].as_array().unwrap();
+        assert_eq!(inbox.len(), 1, "w0's inbox holds the lead's handoff");
+        assert_eq!(inbox[0]["from_agent_id"], "lead");
+
+        let (status, json) = send(
+            app,
+            get_uri(&format!("/api/tasks/{}/team/mailbox?box=trash", task.id)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert!(json["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn team_routes_are_503_without_a_team_store() {
+        let store = Arc::new(MemoryStore::new());
+        let task = store.seed_task("no team store");
+        let app = router(test_state_with_store(store));
+        let (status, json) = send(app, get_uri(&format!("/api/tasks/{}/team", task.id))).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{json}");
+        assert!(json["error"].is_string());
     }
 }

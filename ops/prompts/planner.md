@@ -36,8 +36,9 @@ a hard requirement from the user and overrides the optional rule below:
 - `none`: no topology is required; the optional plan rules below apply.
 
 When the task context also states a required swarm worker count, a `swarm`
-plan must declare exactly that many workers and exactly that many subtasks.
-One worker seeds one subtask, so the two counts are equal.
+plan must declare exactly that many workers. Seed `subtasks` are optional:
+zero up to the worker count is valid, and the team lead creates more board
+tasks after the plan validates.
 
 ## Optional plan for `add_intent`
 
@@ -49,19 +50,26 @@ or when unsure.
 - `topology = swarm` only when findings from one worker change another
   worker's work.
 - `workers` are role specs: `key`, `role`, `prompt`, `max_turns`.
-- `subtasks` name the independent work; `worker_key` is optional.
+- `subtasks` are optional seed tasks; `worker_key` is optional. Omit the
+  field or send an empty array when the lead/team will create the work.
 - `limits` holds `max_workers`, `max_parallel`, `max_rounds`, `max_messages`.
 
 The engine validates the plan and rejects invalid or excess limits.
-The manager assigns the declared subtasks to the workers in the plan.
-For `manager_worker`, the manager is the runtime selector, not a worker:
-declare only the workers that execute subtasks. Do not add a worker named
-`manager`, a worker with the `manager` role, or a separate aggregation
-subtask. The engine aggregates the worker results into the intent's one fact.
-For `swarm`, declare one subtask per worker; the runner seeds one turn per
-worker and peers react afterwards. Give each worker enough `max_turns` for its
-tool calls, `record_fact`, and answer; the engine passes the budget through
-exactly.
+For `manager_worker`, the workers are the fixed pool. Seed subtasks are
+optional initial tasks; the lead assigns them and adds follow-up tasks after
+each round. Set `limits.max_workers` to at least the pool size and
+`limits.max_parallel` to the pool size so the lead can run the batch at once.
+The manager-worker lead is not a worker: declare only the workers
+that execute tasks. Do not add a worker named `manager`, a worker with the
+`manager` role, or a separate aggregation subtask. The lead returns the
+intent's one fact.
+For `swarm`, declare exactly the teammates the user asked for. A fixed swarm
+count N is between 2 and 64. Seed subtasks are optional board tasks; the team
+lead creates and assigns more. For a fixed swarm count N, set
+`limits.max_workers` to at least N and `limits.max_parallel = N` so every
+teammate can run at once; the engine also normalizes those limits to admit N.
+Give each worker enough `max_turns` for its tool calls, `record_fact`, and
+answer; the engine passes the budget through exactly.
 Do not invent tools or bypass the guard.
 
 You never write the graph yourself. The engine records the intent or calls the
@@ -76,7 +84,7 @@ The goal is:
 Required topology: {{required_topology}}. This is a hard requirement from the user.
 
 Required swarm worker count: {{swarm_workers}}. When this is a number, a swarm
-plan must have exactly this many workers and this many subtasks.
+plan must have exactly this many workers. It may have zero seed subtasks.
 
 If the confirmed evidence proves the goal cannot be met, call `give_up` instead
 of adding another intent.

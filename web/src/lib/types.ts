@@ -178,6 +178,30 @@ export type ProjectFolder = {
   agents_md_present: boolean;
 };
 
+/**
+ * One uploaded browser-folder snapshot (`GET /api/web-projects`
+ * `projects[]`). The folder itself never leaves the browser: only the
+ * snapshot bytes and this metadata reach the server.
+ */
+export type WebProject = {
+  id: string;
+  name: string;
+  /** True when the uploaded snapshot carried an `AGENTS.md`. */
+  agents_md_present: boolean;
+  file_count?: number;
+  total_bytes?: number;
+  created_at?: string;
+};
+
+/** One result file returned by `GET /api/tasks/{id}/outputs`. */
+export type TaskOutputFile = {
+  /** Relative path under the project, normally `.dhi/<task-id>/…`. */
+  path: string;
+  /** File contents as text (`utf8`) or standard base64 (`base64`). */
+  content: string;
+  encoding: "utf8" | "base64";
+};
+
 export type Task = {
   id: string;
   goal: string;
@@ -200,9 +224,9 @@ export type Task = {
    */
   topology?: TaskTopology | null;
   /**
-   * Swarm worker count pinned at creation (`2..=8`), or `null`/omitted when
-   * the planner decides. Only meaningful with `topology: "swarm"`; older
-   * servers omit the field.
+   * Swarm teammate count pinned at creation (`2..=64`), or `null`/omitted when
+   * the coordinator decides (Auto). `N` excludes the extra coordinator agent. Only
+   * meaningful with `topology: "swarm"`; older servers omit the field.
    */
   swarm_workers?: number | null;
   /**
@@ -210,6 +234,13 @@ export type Task = {
    * workspace task. Older servers omit the field entirely.
    */
   project_folder?: string | null;
+  /**
+   * Uploaded web project this task works against, or `null`/omitted for
+   * Docker-folder and legacy tasks. Older servers omit the field.
+   */
+  web_project_id?: string | null;
+  /** Display name of `web_project_id`, when the server resolved one. */
+  web_project_name?: string | null;
   /** Per-task scratch folder inside `project_folder`, or `null`/omitted. */
   task_folder?: string | null;
   /**
@@ -847,6 +878,30 @@ export type SwarmMessagesResponse = {
   messages: SwarmMessageRecord[];
 };
 
+/**
+ * One row of `GET /api/tasks/{id}/team/messages` — every team message in both
+ * directions. `to_agent_id = null` is a team broadcast.
+ */
+export type TeamMessageRecord = {
+  id: number;
+  team_id: string;
+  from_agent_id: string;
+  to_agent_id: string | null;
+  subject: string;
+  body: string;
+  task_id: string | null;
+  /** The route exposes the durable `sent_at` column under this name. */
+  created_at: string;
+  /** Legacy alias accepted by the graph parser. */
+  sent_at?: string;
+  read_at: string | null;
+};
+
+/** `GET /api/tasks/{id}/team/messages` — both directions, oldest first. */
+export type TeamMessagesResponse = {
+  messages: TeamMessageRecord[];
+};
+
 /** `GET /api/tasks/{id}/instructions` — instruction history. */
 export type InstructionsResponse = {
   instructions: Instruction[];
@@ -891,6 +946,27 @@ export type ProfilesResponse = {
 /** `GET /api/project-folders` — the selectable project folders. */
 export type ProjectFoldersResponse = {
   folders: ProjectFolder[];
+};
+
+/** `GET /api/web-projects` — every uploaded browser-folder snapshot. */
+export type WebProjectsResponse = {
+  projects: WebProject[];
+};
+
+/** `POST /api/web-projects` and `GET /api/web-projects/{id}`. */
+export type WebProjectResponse = {
+  project: WebProject;
+};
+
+/** `PUT /api/web-projects/{id}/files?path=…` — the stored path and size. */
+export type WebProjectFileResponse = {
+  path: string;
+  size: number;
+};
+
+/** `GET /api/tasks/{id}/outputs` — result files written by the task. */
+export type TaskOutputsResponse = {
+  files: TaskOutputFile[];
 };
 
 /** `GET /api/intercept/rules` — every rule, evaluation order. */
@@ -951,8 +1027,9 @@ export type CreateTaskInput = {
    */
   topology?: TaskTopology | null;
   /**
-   * `null`/omitted lets the planner decide the swarm width; otherwise `2..=8`.
-   * The server accepts this only together with `topology: "swarm"`.
+   * `null`/omitted lets the lead decide the swarm width (Auto); otherwise a
+   * fixed teammate count `2..=64`. `N` excludes the extra lead agent. The
+   * server accepts this only together with `topology: "swarm"`.
    */
   swarm_workers?: number | null;
   /**
@@ -961,8 +1038,14 @@ export type CreateTaskInput = {
    */
   project_folder?: string | null;
   /**
-   * Whether to load the project folder's `AGENTS.md`. Only meaningful (and
-   * only sent by the UI) together with `project_folder`.
+   * Uploaded web project selected for the task. Mutually exclusive with
+   * `project_folder`: when present the server resolves the snapshot and the
+   * browser keeps syncing results back through the folder handle.
+   */
+  web_project_id?: string | null;
+  /**
+   * Whether to load the project's `AGENTS.md`. Only meaningful (and only sent
+   * by the UI) together with `project_folder` or `web_project_id`.
    */
   load_agents_md?: boolean;
 };

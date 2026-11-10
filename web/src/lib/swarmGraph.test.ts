@@ -3,6 +3,8 @@ import { test } from "node:test";
 
 import {
   buildSwarmGraph,
+  buildTeamMessageGraph,
+  mapTeamMessages,
   SWARM_CIRCLE_LIMIT,
   SWARM_DEFAULT_EDGE_COLOR,
   SWARM_EDGE_COLORS,
@@ -305,4 +307,124 @@ test("more than six workers switch to a centered grid", () => {
   const ys = model.nodes.map((node) => node.position.y);
   assert.equal(Math.min(...xs) + Math.max(...xs), 0);
   assert.equal(Math.min(...ys) + Math.max(...ys), 0);
+});
+
+// ---------------------------------------------------------------------------
+// Team messages: direct and broadcast graph mapping
+// ---------------------------------------------------------------------------
+
+function teamMessage(
+  id: number,
+  from: string,
+  to: string | null,
+  subject: string,
+) {
+  return {
+    id,
+    team_id: "team-1",
+    from_agent_id: from,
+    to_agent_id: to,
+    subject,
+    body: `${subject} body`,
+    task_id: null,
+    created_at: `2026-11-10T10:00:0${id}Z`,
+    read_at: null,
+  };
+}
+
+const TEAM_MESSAGES = [
+  teamMessage(1, "coordinator", "w1", "Direct one"),
+  teamMessage(2, "w1", null, "Broadcast one"),
+  teamMessage(3, "w2", "coordinator", "Reply"),
+];
+
+test("team graph maps a direct message to exactly its recipient", () => {
+  const model = buildTeamMessageGraph(TEAM_MESSAGES, 1);
+
+  assert.equal(model.selected?.id, "1");
+  assert.equal(model.sender, "coordinator");
+  assert.deepEqual(model.recipients, ["w1"]);
+  assert.equal(model.broadcast, false);
+  assert.equal(model.layout, "circle");
+
+  assert.deepEqual(
+    model.nodes.map((node) => node.data.sender),
+    ["coordinator", "w1", "w2"],
+  );
+  assert.deepEqual(
+    model.edges.map((edge) => [edge.source, edge.target, edge.kind]),
+    [[swarmNodeId("coordinator"), swarmNodeId("w1"), "direct"]],
+  );
+
+  const nodes = new Map(
+    model.nodes.map((node) => [node.data.sender, node.data]),
+  );
+  assert.equal(nodes.get("coordinator")?.selected, true);
+  assert.equal(nodes.get("w1")?.recipient, true);
+  assert.equal(nodes.get("w2")?.recipient, false);
+  assert.equal(nodes.get("coordinator")?.count, 1);
+  assert.equal(nodes.get("w1")?.count, 1);
+  assert.equal(nodes.get("w2")?.count, 1);
+});
+
+test("team graph fans a broadcast out to every other participant", () => {
+  const model = buildTeamMessageGraph(TEAM_MESSAGES, 2);
+
+  assert.equal(model.selected?.id, "2");
+  assert.equal(model.sender, "w1");
+  assert.equal(model.broadcast, true);
+  assert.deepEqual(model.recipients, ["coordinator", "w2"]);
+  assert.deepEqual(
+    model.edges.map((edge) => [edge.source, edge.target, edge.kind]),
+    [
+      [swarmNodeId("w1"), swarmNodeId("coordinator"), "broadcast"],
+      [swarmNodeId("w1"), swarmNodeId("w2"), "broadcast"],
+    ],
+  );
+
+  assert.deepEqual(
+    model.chips.map((chip) => [chip.message.from, chip.message.to]),
+    [
+      ["coordinator", "w1"],
+      ["w1", null],
+      ["w2", "coordinator"],
+    ],
+  );
+  assert.deepEqual(
+    model.chips.map((chip) => chip.selected),
+    [false, true, false],
+  );
+});
+
+test("team graph defaults to the first message and keeps broadcast labels", () => {
+  const model = buildTeamMessageGraph(TEAM_MESSAGES);
+
+  assert.equal(model.selected?.id, "1");
+  assert.equal(model.chips[0]?.selected, true);
+  assert.equal(model.chips[1]?.label, "w1 → all · Broadcast one");
+  assert.equal(model.chips[0]?.label, "coordinator → w1 · Direct one");
+});
+
+test("team graph parses aliases and ignores unusable rows", () => {
+  const views = mapTeamMessages([
+    {
+      id: "m1",
+      from: "alice",
+      to: "all",
+      subject: "Hello",
+      body: "Team update",
+    },
+    { id: "", from_agent_id: "ignored" },
+  ]);
+  assert.deepEqual(views, [
+    {
+      id: "m1",
+      from: "alice",
+      to: null,
+      subject: "Hello",
+      body: "Team update",
+      sentAt: "",
+      broadcast: true,
+    },
+  ]);
 });

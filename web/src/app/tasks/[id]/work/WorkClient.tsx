@@ -21,7 +21,7 @@ import {
   provenanceDetailText,
   renderProvenance,
   shortenId,
-  swarmWorkersLabel,
+  swarmWorkersSummary,
   taskIdFromPathname,
   topologyLabel,
 } from "@/lib/ui";
@@ -37,6 +37,7 @@ import { Crumbs } from "@/app/_components/Crumbs";
 import { LiveActivityFeed } from "@/app/_components/ActivityLog";
 import { MarkdownMath } from "@/components/markdown-math";
 import { ProjectContext } from "@/components/project-context";
+import { WebProjectSyncCard } from "@/components/web-project-sync";
 import { CopyButton } from "@/components/ui/copy-button";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -281,7 +282,10 @@ function TaskWorkView() {
     activityRows,
   );
   const topologyName = topologyLabel(effectiveTopology);
-  const workersLabel = swarmWorkersLabel(work.task.swarm_workers);
+  const workersLabel = swarmWorkersSummary(
+    effectiveTopology,
+    work.task.swarm_workers,
+  );
   const swarmAvailable = taskUsesSwarm(work.task.topology, activityRows);
   const capacityNotice = capacityPauseNotice(work.task, activityRows);
   const shownTab: WorkTab =
@@ -322,7 +326,7 @@ function TaskWorkView() {
             ) : null}
             {workersLabel !== null ? (
               <Badge variant="outline" title="Swarm workers">
-                Workers: {workersLabel}
+                Swarm workers: {workersLabel}
               </Badge>
             ) : null}
             <span className="mono" title={work.task.id}>
@@ -366,6 +370,10 @@ function TaskWorkView() {
         task={work.task}
         className="rounded-lg border border-border bg-surface-subtle px-3.5 py-2.5"
       />
+
+      {/* Outside the tab strip: switching work tabs must not unmount an
+          in-flight sync. */}
+      <WebProjectSyncCard task={work.task} />
 
       <GoalBlock text={work.task.goal} />
 

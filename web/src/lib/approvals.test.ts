@@ -4,11 +4,16 @@ import {
   APPROVAL_REFRESH_DEBOUNCE_MS,
   MISSING_TOOL_INPUT_NOTE,
   TOOL_INPUT_MAX_LINES,
+  approvalQueueKey,
+  buildApprovalQueue,
   buildDecisionRequest,
+  buildScaleDecisionRequest,
   formatApprovalAge,
   renderToolInput,
+  scaleApprovalSummary,
 } from "./approvals.ts";
 import { ApiError, decideApproval, listApprovals } from "./api.ts";
+import { scaleApprovalStatusLabel, type ScaleApproval } from "./teamTypes.ts";
 import type { ApprovalItem } from "./types.ts";
 
 const originalFetch = globalThis.fetch;
@@ -55,6 +60,25 @@ function makeApproval(overrides: Partial<ApprovalItem> = {}): ApprovalItem {
     created_at: "2026-10-30T00:00:00Z",
     tool_name: "finishTurn",
     input: { move: "Qh5" },
+    ...overrides,
+  };
+}
+
+/** A wire-shaped pending swarm scale request. */
+function makeScaleApproval(
+  overrides: Partial<ScaleApproval> = {},
+): ScaleApproval {
+  return {
+    id: "00000000-0000-4000-8000-000000000011",
+    task_id: "00000000-0000-4000-8000-000000000001",
+    team_id: "00000000-0000-4000-8000-000000000012",
+    requested_workers: 24,
+    current_cap: 8,
+    reason: "Need more researchers",
+    status: "pending",
+    created_at: "2026-10-30T00:01:00Z",
+    expires_at: "2026-10-30T00:16:00Z",
+    decided_at: null,
     ...overrides,
   };
 }
@@ -239,6 +263,65 @@ test("buildDecisionRequest rejects invalid decision values and blank ids", () =>
   for (const blank of ["", "   "]) {
     assert.equal(buildDecisionRequest(blank, "allow").ok, false);
   }
+});
+
+// ---------------------------------------------------------------------------
+// Scale approval request builder and status handling
+// ---------------------------------------------------------------------------
+
+test("buildScaleDecisionRequest builds allow and deny bodies", () => {
+  assert.deepEqual(buildScaleDecisionRequest("s1", "allow"), {
+    ok: true,
+    path: "/scale-approvals/s1/decision",
+    body: { decision: "allow" },
+  });
+  assert.deepEqual(buildScaleDecisionRequest(" s 2 ", "deny"), {
+    ok: true,
+    path: "/scale-approvals/s%202/decision",
+    body: { decision: "deny" },
+  });
+});
+
+test("buildScaleDecisionRequest rejects invalid decisions and blank ids", () => {
+  for (const bad of ["granted", "denied", "allowed", "", "yes"]) {
+    const result = buildScaleDecisionRequest("s1", bad);
+    assert.equal(result.ok, false, `expected rejection for ${bad}`);
+    if (!result.ok) {
+      assert.match(result.error, /"allow" or "deny"/);
+    }
+  }
+  assert.equal(buildScaleDecisionRequest(7, "allow").ok, false);
+  assert.equal(buildScaleDecisionRequest("  ", "allow").ok, false);
+});
+
+test("scale approval status labels and summaries disclose the cap", () => {
+  assert.equal(scaleApprovalStatusLabel("pending"), "Pending");
+  assert.equal(scaleApprovalStatusLabel("allowed"), "Allowed");
+  assert.equal(scaleApprovalStatusLabel("denied"), "Denied");
+  assert.equal(scaleApprovalStatusLabel("expired"), "Expired");
+  assert.equal(
+    scaleApprovalSummary(makeScaleApproval()),
+    "24 requested · cap 8 · pending",
+  );
+});
+
+test("the queue mixes pending tool and scale approvals oldest first", () => {
+  const queue = buildApprovalQueue(
+    [makeApproval({ created_at: "2026-10-30T00:02:00Z" })],
+    [
+      makeScaleApproval({ created_at: "2026-10-30T00:01:00Z" }),
+      makeScaleApproval({
+        id: "decided",
+        status: "granted",
+        created_at: "2026-10-30T00:00:00Z",
+      }),
+    ],
+  );
+  assert.equal(queue.length, 2);
+  assert.equal(queue[0]?.kind, "scale");
+  assert.equal(queue[1]?.kind, "tool");
+  assert.equal(queue[0]?.key, approvalQueueKey("scale", makeScaleApproval().id));
+  assert.equal(queue[1]?.key, approvalQueueKey("tool", makeApproval().id));
 });
 
 // ---------------------------------------------------------------------------

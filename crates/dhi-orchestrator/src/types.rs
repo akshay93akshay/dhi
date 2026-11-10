@@ -4,7 +4,9 @@ use dhi_agent::FactDraft;
 use serde::{Deserialize, Serialize};
 
 pub use dhi_core::{
-    CapabilityLimits, IntentPlan, OrchestrationError, Subtask, Topology, WorkerSpec,
+    CapabilityLimits, IntentPlan, LeadBudget, LeadDecision, LeadError, LeadInput, LeadLimits,
+    LeadTask, LeadWorkerResult, LeadWorkerStatus, OrchestrationError, Subtask, Topology,
+    WorkerSpec,
 };
 
 /// Final state of one worker execution.

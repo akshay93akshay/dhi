@@ -32,8 +32,10 @@ use tracing::warn;
 use uuid::Uuid;
 
 mod team;
+mod team_host;
 
 use team::RuntimeWorkerExecutor;
+use team_host::TeamService;
 
 const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(30);
 
@@ -112,16 +114,36 @@ fn enforce_required_topology(
 ///
 /// The planner tool guard already rejects a mismatched `add_intent` plan; this
 /// second check protects every other `AgentRuntime`, a restarted engine that
-/// loaded a persisted plan, and a plan that bypassed the tool. A swarm seeds
-/// one subtask per worker, so both counts must equal the required value.
+/// loaded a persisted plan, and a plan that bypassed the tool. The lead/team
+/// runtimes let a plan start with no subtasks (up to one per teammate), so the
+/// worker count is exact while subtasks may be `0..=N`.
 fn enforce_swarm_worker_count(required: Option<usize>, plan: &IntentPlan) -> Result<(), String> {
     let Some(required) = required else {
+        // Auto still has a hard floor: the plan validation requires two
+        // teammates, and the engine enforces the same rule before running a
+        // runtime-supplied or persisted plan.
+        if plan.topology == Topology::Swarm && plan.workers.len() < dhi_core::SWARM_MIN_WORKERS {
+            return Err(format!(
+                "swarm topology requires at least {} teammates, got {}; refusing to run the \
+                 swarm",
+                dhi_core::SWARM_MIN_WORKERS,
+                plan.workers.len()
+            ));
+        }
         return Ok(());
     };
+    if !dhi_core::valid_swarm_worker_count(required) {
+        return Err(format!(
+            "required swarm worker count {required} is outside {}..={}; refusing to run the \
+             swarm",
+            dhi_core::SWARM_MIN_WORKERS,
+            dhi_core::SWARM_MAX_WORKERS
+        ));
+    }
     if plan.topology != Topology::Swarm {
         return Ok(());
     }
-    if plan.workers.len() != required || plan.subtasks.len() != required {
+    if plan.workers.len() != required || plan.subtasks.len() > required {
         return Err(format!(
             "required swarm worker count {required}, but the plan declares {} workers and {} \
              subtasks; refusing to run the swarm",
@@ -203,6 +225,30 @@ fn agent_run<T>(
     }
 }
 
+/// Records every completion call a runtime made for one lead/manager turn.
+///
+/// Usage accounting is best effort: a failed save is logged and never fails
+/// the decision the model already produced.
+async fn record_runtime_calls<T>(
+    store: &dyn GraphStore,
+    task_id: Uuid,
+    intent_id: Option<Uuid>,
+    worker_key: &str,
+    call: &AgentCall<T>,
+) {
+    for record in &call.meta.calls {
+        let run = agent_run(task_id, intent_id, Some(worker_key), record, call);
+        if let Err(err) = store.save_agent_run(&run).await {
+            warn!(
+                run_id = %record.run_id,
+                role = record.role.as_str(),
+                task_id = %task_id,
+                "could not record {worker_key} agent run: {err}"
+            );
+        }
+    }
+}
+
 /// Evidence for the one fact a team run records.
 ///
 /// The deterministic aggregator already lists failed and skipped results;
@@ -280,6 +326,61 @@ fn apply_task_capacity(
 ) -> dhi_core::IntentPlan {
     if let Some(max_parallel_workers) = capacity.max_parallel_workers.filter(|limit| *limit > 0) {
         plan.limits.max_parallel = plan.limits.max_parallel.min(max_parallel_workers);
+    }
+    plan
+}
+
+/// The plan the team runner actually executes.
+///
+/// A swarm runs every teammate at once, so its `max_parallel` is the team
+/// size and the DHI+ task capacity never throttles it below that. For a fixed
+/// user count N, the plan limits are raised to admit N even when the planner
+/// left the default `max_workers` (8). Auto leaves `max_workers` alone: the
+/// planner's own cap (8 without approval) still decides how wide the team may
+/// be. Manager/worker plans keep the existing capacity clamp.
+fn effective_team_plan(
+    mut plan: dhi_core::IntentPlan,
+    task: &dhi_core::Task,
+) -> dhi_core::IntentPlan {
+    if plan.topology == Topology::Swarm {
+        match task.swarm_workers {
+            Some(workers) if workers > 0 => {
+                plan.limits.max_workers = plan.limits.max_workers.max(workers);
+                plan.limits.max_parallel = workers;
+            }
+            _ => {
+                let workers = plan.workers.len();
+                if workers > 0 {
+                    plan.limits.max_parallel = workers;
+                }
+            }
+        }
+        return plan;
+    }
+    apply_task_capacity(plan, task.capacity)
+}
+
+/// How often a waiting engine checks the task stop flag while the scale gate
+/// is pending. The gate itself polls its row every 500 ms.
+const SCALE_GATE_STOP_POLL: Duration = Duration::from_millis(200);
+
+/// Truncates a swarm plan to the teammate cap an Auto swarm may actually use.
+///
+/// The team runner takes its roster from the plan's workers; subtasks are not
+/// seeds in that runtime, but they are trimmed with the roster so a plan never
+/// names a removed teammate.
+fn cap_swarm_plan(mut plan: dhi_core::IntentPlan, cap: usize) -> dhi_core::IntentPlan {
+    let cap = cap.clamp(1, dhi_core::SWARM_MAX_WORKERS);
+    if plan.workers.len() > cap {
+        plan.workers.truncate(cap);
+    }
+    let workers = plan.workers.len();
+    if plan.subtasks.len() > workers {
+        plan.subtasks.truncate(workers);
+    }
+    if workers > 0 {
+        plan.limits.max_workers = plan.limits.max_workers.max(workers);
+        plan.limits.max_parallel = workers;
     }
     plan
 }
@@ -416,6 +517,51 @@ impl TeamSelector for RuntimeTeamSelector {
     }
 }
 
+/// Runs one manager-worker lead review through the task's agent runtime.
+///
+/// The lead is a planner-role model call on the task's pinned planner profile.
+/// Every completion record becomes an `agent_runs` row with worker key
+/// `manager`, and the call count feeds the task's model-call ledger.
+struct RuntimeTeamLead {
+    store: Arc<dyn GraphStore>,
+    agent: Arc<dyn AgentRuntime>,
+    task_id: Uuid,
+    intent_id: Uuid,
+    planner_profile_id: Option<i64>,
+    model_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl dhi_orchestrator::TeamLead for RuntimeTeamLead {
+    async fn review(
+        &self,
+        input: &dhi_orchestrator::LeadInput,
+    ) -> anyhow::Result<dhi_orchestrator::LeadDecision> {
+        let call = self
+            .agent
+            .review_lead(dhi_agent::LeadReviewInput {
+                task_id: self.task_id,
+                intent_id: self.intent_id,
+                input: input.clone(),
+                planner_profile_id: self.planner_profile_id,
+            })
+            .await
+            .map_err(|err| anyhow::anyhow!("manager lead review failed: {err}"))?;
+
+        self.model_calls
+            .fetch_add(call.meta.calls.len(), Ordering::SeqCst);
+        record_runtime_calls(
+            self.store.as_ref(),
+            self.task_id,
+            Some(self.intent_id),
+            "manager",
+            &call,
+        )
+        .await;
+        Ok(call.output)
+    }
+}
+
 pub struct Engine {
     store: Arc<dyn GraphStore>,
     agent: Arc<dyn AgentRuntime>,
@@ -434,6 +580,12 @@ pub struct Engine {
     /// Optional manager choice. `None` keeps `ManagerRunner::new` and the
     /// planner's plan unchanged, so the default path is untouched.
     manager_selector: Option<Arc<dyn TeamSelector>>,
+    /// True when the agent runtime implements the manager-worker lead review.
+    lead_runtime: bool,
+    /// Cline Teams persistence. `None` falls back to the legacy peer swarm.
+    team_store: Option<Arc<dyn dhi_core::team::TeamStore>>,
+    /// `swarm_scale` gate for an Auto swarm above the approval-free cap.
+    scale_gate: Option<Arc<dyn dhi_core::ScaleApprovalGate>>,
     /// In-memory cache of DHI+ plans keyed by the intent the planner created.
     ///
     /// Every planned intent also has a durable `intent_plans` row. The cache is
@@ -463,6 +615,9 @@ impl Engine {
             max_idle_ticks: DEFAULT_MAX_IDLE_TICKS,
             max_no_progress_rounds: DEFAULT_MAX_NO_PROGRESS_ROUNDS,
             manager_selector: None,
+            lead_runtime: false,
+            team_store: None,
+            scale_gate: None,
             plans: Mutex::new(HashMap::new()),
         }
     }
@@ -493,12 +648,174 @@ impl Engine {
             .remove(&intent_id);
     }
 
+    /// Records the runtime calls of a team result batch and returns how many
+    /// completion calls it counted against the model-call ledger.
+    async fn record_result_calls(
+        &self,
+        task_id: Uuid,
+        intent_id: Uuid,
+        workers: &[&dhi_orchestrator::WorkerResult],
+    ) -> usize {
+        let mut calls = 0;
+        for worker in workers {
+            if worker.call_meta.calls.is_empty() {
+                continue;
+            }
+            calls += worker.call_meta.calls.len();
+            let call: AgentCall<()> = AgentCall {
+                output: (),
+                meta: worker.call_meta.clone(),
+                prompt: worker.prompt.clone(),
+                response: worker.response.clone(),
+                thinking: worker.thinking.clone(),
+            };
+            self.record_agent_calls(
+                task_id,
+                Some(intent_id),
+                Some(worker.worker_key.as_str()),
+                &call,
+            )
+            .await;
+        }
+        calls
+    }
+
+    /// Ends one intent after a lead/team `Stop` without failing the task.
+    ///
+    /// The intent moves to `stopped`, the cached plan is dropped, and one
+    /// `team_stopped` activity row records the reason. The task stays running
+    /// so the planner can choose another step.
+    async fn stop_intent_for_team(
+        &self,
+        task_id: Uuid,
+        intent_id: Uuid,
+        reason: &str,
+        worker_results: &[dhi_orchestrator::WorkerResult],
+    ) -> anyhow::Result<()> {
+        let refs: Vec<&dhi_orchestrator::WorkerResult> = worker_results.iter().collect();
+        let _ = self.record_result_calls(task_id, intent_id, &refs).await;
+        self.store
+            .finish_intent(intent_id, IntentState::Stopped)
+            .await?;
+        self.forget_plan(intent_id);
+        self.log_activity(
+            task_id,
+            "team_stopped",
+            format!("team stopped the intent: {reason}"),
+            serde_json::json!({
+                "intent_id": intent_id,
+                "reason": reason,
+                "workers": worker_results.len(),
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Applies the `swarm_scale` gate to an Auto swarm plan.
+    ///
+    /// A fixed count never calls the gate. For Auto, a plan of at most
+    /// [`dhi_core::SWARM_AUTO_WORKERS`] runs unchanged; a wider plan asks for
+    /// one approval, waits with stop-flag checks, and is capped to the granted
+    /// count. Denial, expiry, or a missing gate keeps the approval-free cap.
+    async fn apply_scale_gate(
+        &self,
+        task: &Task,
+        plan: &IntentPlan,
+        stop: Option<&Arc<AtomicBool>>,
+    ) -> anyhow::Result<IntentPlan> {
+        if plan.topology != Topology::Swarm || task.swarm_workers.is_some() {
+            return Ok(plan.clone());
+        }
+
+        let requested = plan.workers.len().min(dhi_core::SWARM_MAX_WORKERS);
+        if requested <= dhi_core::SWARM_AUTO_WORKERS {
+            return Ok(plan.clone());
+        }
+
+        let Some(gate) = self.scale_gate.as_ref() else {
+            return Ok(cap_swarm_plan(plan.clone(), dhi_core::SWARM_AUTO_WORKERS));
+        };
+
+        if stop_requested(stop) {
+            anyhow::bail!("stop requested before requesting swarm_scale approval");
+        }
+
+        let wait = gate.request_and_wait_scale_approval(dhi_core::ScaleApprovalRequest {
+            task_id: task.id,
+            team_id: Some(task.id),
+            requested_workers: requested,
+            current_cap: dhi_core::SWARM_AUTO_WORKERS,
+            reason: format!(
+                "auto swarm requested {requested} teammates; the approval-free cap is {}",
+                dhi_core::SWARM_AUTO_WORKERS
+            ),
+            timeout_secs: None,
+        });
+
+        // The gate waits until a person decides or the request expires. Poll
+        // the task stop flag alongside it so a stopped task never hangs here.
+        tokio::pin!(wait);
+        let decided = loop {
+            tokio::select! {
+                result = &mut wait => break result?,
+                _ = tokio::time::sleep(SCALE_GATE_STOP_POLL) => {
+                    if stop_requested(stop) {
+                        anyhow::bail!("stop requested while waiting for swarm_scale approval");
+                    }
+                }
+            }
+        };
+
+        let cap = decided.effective_cap().min(dhi_core::SWARM_MAX_WORKERS);
+        Ok(cap_swarm_plan(plan.clone(), cap))
+    }
+
+    /// The maximum active teammates this run may have.
+    ///
+    /// Fixed N is exactly N. Auto keeps the approval-free cap of 8 even when
+    /// the planner seeds fewer, and uses the post-gate plan size after an
+    /// allow or denial. The hard cap is 64.
+    fn effective_teammate_cap(task: &Task, plan: &IntentPlan) -> usize {
+        match task.swarm_workers {
+            Some(workers) => workers,
+            None => plan.workers.len().max(dhi_core::SWARM_AUTO_WORKERS),
+        }
+        .clamp(dhi_core::SWARM_MIN_WORKERS, dhi_core::SWARM_MAX_WORKERS)
+    }
+
+    /// Builds the team config with the engine's effective teammate cap.
+    ///
+    /// The cap is fixed N for a fixed swarm, 8 for an ungranted Auto swarm,
+    /// and the granted N after an allow. `TeamRunConfig` enforces it on seeded
+    /// teammates and on later coordinator spawns, so the coordinator cannot
+    /// widen the team past the engine's decision.
+    fn team_run_config(
+        task_id: Uuid,
+        intent_id: Uuid,
+        plan: &IntentPlan,
+        teammate_cap: usize,
+    ) -> dhi_orchestrator::TeamRunConfig {
+        let cap = teammate_cap.clamp(dhi_core::SWARM_MIN_WORKERS, dhi_core::SWARM_MAX_WORKERS);
+        let mut config = dhi_orchestrator::TeamRunConfig::from_plan(task_id, intent_id, plan)
+            .with_max_teammates(cap);
+        if config.teammates.len() > cap {
+            config.teammates.truncate(cap);
+        }
+        // The team contract is all N teammates in parallel, including Auto
+        // teammates the coordinator spawns after the seed wave. The active
+        // cap is the only parallelism bound that matters here.
+        config.max_parallel = cap;
+        config
+    }
+
     /// Runs a non-single plan through its topology's runner.
     ///
     /// Returns the run result, the effective plan (the planner's plan narrowed
-    /// by the task's DHI+ capacity), and the manager's model-call count. The
-    /// stored plan is never changed. The count is zero for a swarm run or an
-    /// explicit selector override, neither of which reports selection meta.
+    /// by the task's DHI+ capacity, or widened to the fixed swarm size), and
+    /// whether a zero-worker final result is valid. The stored plan is never
+    /// changed. The caller owns the model-call counter so a lead/team `Stop`
+    /// still charges the calls it made before ending the intent.
     async fn run_team_plan(
         &self,
         task_id: Uuid,
@@ -506,8 +823,11 @@ impl Engine {
         intent: &Intent,
         plan: &IntentPlan,
         facts: &[Fact],
-    ) -> anyhow::Result<(IntentResult, IntentPlan, usize)> {
-        let plan = apply_task_capacity(plan.clone(), task.capacity);
+        model_calls: &Arc<AtomicUsize>,
+        stop: Option<&Arc<AtomicBool>>,
+    ) -> anyhow::Result<(IntentResult, IntentPlan, bool)> {
+        let plan = effective_team_plan(plan.clone(), task);
+        let plan = self.apply_scale_gate(task, &plan, stop).await?;
         let executor = Arc::new(RuntimeWorkerExecutor {
             agent: Arc::clone(&self.agent),
             task_id,
@@ -515,17 +835,35 @@ impl Engine {
             context: team_fact_context(facts),
             worker_profile_id: task.pinned_worker_profile_id,
         });
-        let manager_model_calls = Arc::new(AtomicUsize::new(0));
-        let result = match plan.topology {
-            Topology::ManagerWorker => match self.manager_selector.as_ref() {
-                // A test (or host) override always wins over the runtime
-                // manager. It reports no selection meta, so it counts zero.
-                Some(selector) => {
-                    ManagerRunner::with_selector(executor, Arc::clone(selector))
-                        .run(&plan)
-                        .await
-                }
-                None => {
+        let (result, allow_empty_result) = match plan.topology {
+            Topology::ManagerWorker => {
+                if let Some(selector) = self.manager_selector.as_ref() {
+                    // A test (or host) override always wins over the runtime
+                    // manager and the lead. It reports no selection meta, so
+                    // it counts zero.
+                    (
+                        ManagerRunner::with_selector(executor, Arc::clone(selector))
+                            .run(&plan)
+                            .await,
+                        false,
+                    )
+                } else if self.lead_runtime {
+                    let lead = RuntimeTeamLead {
+                        store: Arc::clone(&self.store),
+                        agent: Arc::clone(&self.agent),
+                        task_id,
+                        intent_id: intent.id,
+                        planner_profile_id: task.pinned_planner_profile_id,
+                        model_calls: Arc::clone(model_calls),
+                    };
+                    (
+                        ManagerRunner::new(executor)
+                            .with_lead(lead)
+                            .run(&plan)
+                            .await,
+                        true,
+                    )
+                } else {
                     let selector = RuntimeTeamSelector {
                         store: Arc::clone(&self.store),
                         agent: Arc::clone(&self.agent),
@@ -533,23 +871,119 @@ impl Engine {
                         intent_id: intent.id,
                         intent: plan.intent.clone(),
                         worker_profile_id: task.pinned_worker_profile_id,
-                        model_calls: Arc::clone(&manager_model_calls),
+                        model_calls: Arc::clone(model_calls),
                     };
-                    ManagerRunner::with_selector(executor, selector)
-                        .run(&plan)
-                        .await
+                    (
+                        ManagerRunner::with_selector(executor, selector)
+                            .run(&plan)
+                            .await,
+                        false,
+                    )
+                }
+            }
+            Topology::Swarm => match self.team_store.as_ref() {
+                Some(store) => {
+                    let teammate_cap = Self::effective_teammate_cap(task, &plan);
+                    let config = Self::team_run_config(task_id, intent.id, &plan, teammate_cap);
+                    let mut context = team_fact_context(facts);
+                    context.push(format!(
+                        "Coordinator id: {} (the persisted team role is `lead`; it is the coordinator)",
+                        config.lead.agent_id
+                    ));
+                    context.push(format!(
+                        "Teammate cap: {} active teammates; the coordinator is extra",
+                        config.max_teammates
+                    ));
+                    context.push(
+                        "A stopped teammate stays stopped until you call team_spawn_teammate again."
+                            .to_string(),
+                    );
+                    let roster = config
+                        .teammates
+                        .iter()
+                        .map(|teammate| {
+                            format!("{}: {}", teammate.agent_id, teammate.description.trim())
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    context.push(format!("Seeded roster: {roster}"));
+                    let service = TeamService::start(
+                        Arc::clone(&self.agent),
+                        Arc::clone(store),
+                        config.clone(),
+                        context.clone(),
+                        task.pinned_worker_profile_id,
+                    )
+                    .await?;
+                    let view: Arc<dyn dhi_agent::ToolServerView> =
+                        Arc::new(service.coordinator_view());
+                    let executed = self
+                        .agent
+                        .execute_coordinator(
+                            ExecuteInput {
+                                task_id,
+                                intent_id: intent.id,
+                                intent: config.objective.clone(),
+                                context,
+                                worker_profile_id: task.pinned_worker_profile_id,
+                                max_turns: None,
+                                agent_id: None,
+                                role: None,
+                                task: None,
+                            },
+                            view,
+                        )
+                        .await;
+                    let call = match executed {
+                        Ok(call) => call,
+                        Err(err) => {
+                            if service.is_stopped() {
+                                return Err(service.stopped().await.into());
+                            }
+                            service.cleanup().await;
+                            return Err(err);
+                        }
+                    };
+                    // The coordinator is a normal worker-role call; record
+                    // its model usage under `coordinator` and charge it to
+                    // the task's model-call ledger.
+                    model_calls.fetch_add(call.meta.calls.len(), Ordering::SeqCst);
+                    record_runtime_calls(
+                        self.store.as_ref(),
+                        task_id,
+                        Some(intent.id),
+                        "coordinator",
+                        &call,
+                    )
+                    .await;
+                    if service.is_stopped() {
+                        return Err(service.stopped().await.into());
+                    }
+                    // One fact, from the coordinator's `record_fact`; the
+                    // settled teammate results travel as provenance and
+                    // capacity evidence. A teammate stop that lands while an
+                    // async run is settling still wins: no fact is recorded.
+                    let result = service.finish(call.output.fact).await;
+                    if service.is_stopped() {
+                        return Err(service.stopped().await.into());
+                    }
+                    service.cleanup().await;
+                    (result, true)
+                }
+                None => {
+                    // Legacy fallback for hosts without team persistence. The
+                    // plan is still capped by the scale gate above, and a
+                    // zero-worker final is not valid for a peer swarm.
+                    let runner = SwarmRunner::new(executor);
+                    let result = runner.run(&plan).await;
+                    self.persist_swarm_messages(task_id, intent.id, runner.messages())
+                        .await;
+                    (result, false)
                 }
             },
-            Topology::Swarm => {
-                let runner = SwarmRunner::new(executor);
-                let result = runner.run(&plan).await;
-                self.persist_swarm_messages(task_id, intent.id, runner.messages())
-                    .await;
-                result
-            }
             Topology::Single => unreachable!("single plans use the worker path"),
-        }?;
-        Ok((result, plan, manager_model_calls.load(Ordering::SeqCst)))
+        };
+        Ok((result?, plan, allow_empty_result))
     }
 
     /// Persists the typed broadcast log of one swarm run.
@@ -640,6 +1074,31 @@ impl Engine {
         S: TeamSelector + 'static,
     {
         self.manager_selector = Some(Arc::new(selector));
+        self
+    }
+
+    /// Declares that the agent runtime implements `review_lead`.
+    ///
+    /// Without this flag the engine keeps the one-shot selector path, because
+    /// the default `AgentRuntime::review_lead` refuses. The binary enables it
+    /// for the Rig runtime; tests that script lead decisions enable it too.
+    pub fn with_lead_runtime(mut self) -> Self {
+        self.lead_runtime = true;
+        self
+    }
+
+    /// Attaches Cline Teams persistence. With a team store the swarm topology
+    /// runs through the coordinator-agent team host; without one it keeps the
+    /// legacy peer [`SwarmRunner`].
+    pub fn with_team_store(mut self, store: Arc<dyn dhi_core::team::TeamStore>) -> Self {
+        self.team_store = Some(store);
+        self
+    }
+
+    /// Attaches the `swarm_scale` approval gate. Without a gate an Auto swarm
+    /// above the approval-free cap is capped at that cap.
+    pub fn with_scale_gate(mut self, gate: Arc<dyn dhi_core::ScaleApprovalGate>) -> Self {
+        self.scale_gate = Some(gate);
         self
     }
 
@@ -1546,12 +2005,27 @@ impl Engine {
                         .await?;
                     anyhow::bail!("{reason}");
                 }
-                let (result, team_plan, manager_model_calls) = match self
-                    .run_team_plan(task_id, &task, &claimed, &plan, &facts)
+                let plan_model_calls = Arc::new(AtomicUsize::new(0));
+                let (result, team_plan, allow_empty_result) = match self
+                    .run_team_plan(
+                        task_id,
+                        &task,
+                        &claimed,
+                        &plan,
+                        &facts,
+                        &plan_model_calls,
+                        stop.as_ref(),
+                    )
                     .await
                 {
-                    Ok(outcome) => outcome,
+                    Ok(outcome) => {
+                        model_calls += plan_model_calls.load(Ordering::SeqCst);
+                        outcome
+                    }
                     Err(err) => {
+                        // Count the coordinator/team calls before any stop or
+                        // failure path; those model calls were spent.
+                        model_calls += plan_model_calls.load(Ordering::SeqCst);
                         if stop_requested(stop.as_ref()) {
                             return self
                                 .stopped_result(
@@ -1561,6 +2035,38 @@ impl Engine {
                                     "stop requested during the team run",
                                 )
                                 .await;
+                        }
+                        // A lead/team Stop is not a failure: the intent ends
+                        // without a fact and the planner chooses the next step.
+                        if let Some(stopped) = err.downcast_ref::<dhi_orchestrator::LeadStopped>() {
+                            model_calls += stopped
+                                .worker_results
+                                .iter()
+                                .map(|worker| worker.call_meta.calls.len())
+                                .sum::<usize>();
+                            self.stop_intent_for_team(
+                                task_id,
+                                claimed.id,
+                                &stopped.reason,
+                                &stopped.worker_results,
+                            )
+                            .await?;
+                            continue;
+                        }
+                        if let Some(stopped) = err.downcast_ref::<dhi_orchestrator::TeamStopped>() {
+                            model_calls += stopped
+                                .worker_results
+                                .iter()
+                                .map(|worker| worker.call_meta.calls.len())
+                                .sum::<usize>();
+                            self.stop_intent_for_team(
+                                task_id,
+                                claimed.id,
+                                &stopped.reason,
+                                &stopped.worker_results,
+                            )
+                            .await?;
+                            continue;
                         }
                         let reason = format!("worker/engine: {err}");
                         self.store
@@ -1580,7 +2086,6 @@ impl Engine {
                 //
                 // Failed calls that produced no `AgentCallMeta` cannot be
                 // counted; the ledger only sees calls a runtime reported.
-                model_calls += manager_model_calls;
                 // Seed turns are the aggregate fact; reaction turns are
                 // audit/capacity work. Both are real completion calls, so
                 // both count against `max_model_calls` and become
@@ -1590,29 +2095,9 @@ impl Engine {
                     .iter()
                     .chain(result.audit_results.iter())
                     .collect();
-                model_calls += all_results
-                    .iter()
-                    .map(|worker| worker.call_meta.calls.len())
-                    .sum::<usize>();
-                for worker in &all_results {
-                    if worker.call_meta.calls.is_empty() {
-                        continue;
-                    }
-                    let call: AgentCall<()> = AgentCall {
-                        output: (),
-                        meta: worker.call_meta.clone(),
-                        prompt: worker.prompt.clone(),
-                        response: worker.response.clone(),
-                        thinking: worker.thinking.clone(),
-                    };
-                    self.record_agent_calls(
-                        task_id,
-                        Some(claimed.id),
-                        Some(worker.worker_key.as_str()),
-                        &call,
-                    )
+                model_calls += self
+                    .record_result_calls(task_id, claimed.id, &all_results)
                     .await;
-                }
 
                 if stop_requested(stop.as_ref()) {
                     return self
@@ -1666,7 +2151,7 @@ impl Engine {
                     .filter(|worker| worker.status == WorkerStatus::Skipped)
                     .count();
 
-                if successes == 0 {
+                if successes == 0 && !allow_empty_result {
                     // A worker failure is evidence for the planner, not an
                     // automatic task failure. Record a rejected result and a
                     // `team_failed` row, stop this intent, and return to the
@@ -1799,7 +2284,7 @@ impl Engine {
                         "success": successes,
                         "failed": failures,
                         "skipped": skipped,
-                        "manager_model_calls": manager_model_calls,
+                        "manager_model_calls": plan_model_calls.load(Ordering::SeqCst),
                         "reactions": result.audit_results.len(),
                         "reaction_failures": result
                             .audit_results
@@ -1878,6 +2363,9 @@ impl Engine {
                     context: facts.iter().map(|f| f.claim.clone()).collect(),
                     worker_profile_id: task.pinned_worker_profile_id,
                     max_turns: None,
+                    agent_id: None,
+                    role: None,
+                    task: None,
                 })
                 .await
             {
@@ -2114,6 +2602,7 @@ mod tests {
     use super::*;
     use crate::team::team_intent;
     use dhi_agent::{AgentCallRecord, MockAgentRuntime, PlanOutcome, Role};
+    use dhi_core::team::TeamStore;
     use dhi_core::{
         Activity, AgentRole, AgentsMdState, Approval, ApprovalStatus, FactId, FactState, Goal,
         GoalId, GoalState, GuardVerdict, Intent, IntentId, NewSideQuestionRequest, ReopenOutcome,
@@ -2229,6 +2718,249 @@ mod tests {
 
         fn name(&self) -> &str {
             "scripted"
+        }
+    }
+
+    /// Scripted planner/worker runtime that also answers manager lead reviews.
+    struct LeadAgent {
+        planner: ScriptedAgent,
+        leads: Mutex<Vec<dhi_core::LeadDecision>>,
+        review_inputs: Mutex<Vec<dhi_agent::LeadReviewInput>>,
+        record_leads: bool,
+    }
+
+    impl LeadAgent {
+        fn new(
+            plans: Vec<ScriptedPlan>,
+            executes: Vec<dhi_agent::ExecuteOutput>,
+            leads: Vec<dhi_core::LeadDecision>,
+        ) -> Self {
+            let mut leads = leads;
+            leads.reverse();
+            Self {
+                planner: ScriptedAgent::with_plans(plans, executes),
+                leads: Mutex::new(leads),
+                review_inputs: Mutex::new(Vec::new()),
+                record_leads: false,
+            }
+        }
+
+        fn recorded(mut self) -> Self {
+            self.record_leads = true;
+            self
+        }
+
+        fn review_inputs(&self) -> Vec<dhi_agent::LeadReviewInput> {
+            self.review_inputs.lock().unwrap().clone()
+        }
+
+        fn plan_inputs(&self) -> Vec<PlanInput> {
+            self.planner.plan_inputs()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRuntime for LeadAgent {
+        async fn plan(
+            &self,
+            input: PlanInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<PlanOutcome>> {
+            self.planner.plan(input).await
+        }
+
+        async fn execute(
+            &self,
+            input: ExecuteInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<dhi_agent::ExecuteOutput>> {
+            self.planner.execute(input).await
+        }
+
+        async fn review_lead(
+            &self,
+            input: dhi_agent::LeadReviewInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<dhi_core::LeadDecision>> {
+            self.review_inputs.lock().unwrap().push(input);
+            let decision = self
+                .leads
+                .lock()
+                .unwrap()
+                .pop()
+                .ok_or_else(|| anyhow::anyhow!("lead script exhausted"))?;
+            if !self.record_leads {
+                return Ok(unrecorded(decision));
+            }
+            let record = call_record(Role::Planner, "lead-m");
+            Ok(dhi_agent::AgentCall {
+                output: decision,
+                meta: dhi_agent::AgentCallMeta {
+                    usage: record.usage,
+                    calls: vec![record],
+                },
+                prompt: "manager lead prompt".to_string(),
+                response: "manager lead response".to_string(),
+                thinking: Some("manager lead reasoning".to_string()),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "lead-scripted"
+        }
+    }
+
+    /// One coordinator tool script: calls to dispatch, then the fact the
+    /// script returns through `record_fact`.
+    #[derive(Clone)]
+    struct CoordinatorScript {
+        calls: Vec<(&'static str, serde_json::Value)>,
+        summary: &'static str,
+        record: bool,
+    }
+
+    /// One teammate tool script.
+    #[derive(Clone)]
+    struct TeammateScript {
+        calls: Vec<(&'static str, serde_json::Value)>,
+        summary: &'static str,
+        record: bool,
+    }
+
+    /// Scripted planner plus coordinator/teammate runs. The coordinator and
+    /// teammate paths call the real host tools through the view they receive,
+    /// so the tests exercise the tool loop, not a JSON decision.
+    struct CoordinatorAgent {
+        planner: ScriptedAgent,
+        coordinator: Mutex<Option<CoordinatorScript>>,
+        teammate: Mutex<Option<TeammateScript>>,
+        coordinator_inputs: Mutex<Vec<ExecuteInput>>,
+        teammate_inputs: Mutex<Vec<ExecuteInput>>,
+    }
+
+    impl CoordinatorAgent {
+        fn new(
+            plans: Vec<ScriptedPlan>,
+            coordinator: CoordinatorScript,
+            teammate: TeammateScript,
+        ) -> Self {
+            Self {
+                planner: ScriptedAgent::with_plans(plans, vec![]),
+                coordinator: Mutex::new(Some(coordinator)),
+                teammate: Mutex::new(Some(teammate)),
+                coordinator_inputs: Mutex::new(Vec::new()),
+                teammate_inputs: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn coordinator_inputs(&self) -> Vec<ExecuteInput> {
+            self.coordinator_inputs.lock().unwrap().clone()
+        }
+
+        fn teammate_inputs(&self) -> Vec<ExecuteInput> {
+            self.teammate_inputs.lock().unwrap().clone()
+        }
+    }
+
+    /// Calls one tool from the registry the runtime gave this run.
+    async fn call_team_tool(
+        team_tools: &Arc<dyn dhi_agent::ToolServerView>,
+        name: &str,
+        args: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        let handle = team_tools.tool_server();
+        let toolset = handle.toolset();
+        let tool = toolset
+            .get(name)
+            .unwrap_or_else(|| panic!("team tool {name} is registered"))
+            .clone();
+        let mut context = rig::tool::ToolContext::new();
+        let result = tool.execute(args.to_string(), &mut context).await;
+        if !result.is_success() {
+            anyhow::bail!("team tool {name} failed: {result:?}");
+        }
+        Ok(result.output().as_json().cloned().unwrap_or_default())
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRuntime for CoordinatorAgent {
+        async fn plan(
+            &self,
+            input: PlanInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<PlanOutcome>> {
+            self.planner.plan(input).await
+        }
+
+        async fn execute(
+            &self,
+            _input: ExecuteInput,
+        ) -> anyhow::Result<dhi_agent::AgentCall<dhi_agent::ExecuteOutput>> {
+            anyhow::bail!("a coordinator test never uses the single-worker execute path")
+        }
+
+        async fn execute_coordinator(
+            &self,
+            input: ExecuteInput,
+            team_tools: Arc<dyn dhi_agent::ToolServerView>,
+        ) -> anyhow::Result<dhi_agent::AgentCall<dhi_agent::ExecuteOutput>> {
+            self.coordinator_inputs.lock().unwrap().push(input.clone());
+            let script = self
+                .coordinator
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("coordinator script exhausted"))?;
+            for (name, args) in &script.calls {
+                call_team_tool(&team_tools, *name, args.clone()).await?;
+            }
+            let output = execute_output(script.summary, vec![]);
+            if !script.record {
+                return Ok(unrecorded(output));
+            }
+            let record = call_record(Role::Worker, "coordinator-m");
+            Ok(dhi_agent::AgentCall {
+                output,
+                meta: dhi_agent::AgentCallMeta {
+                    usage: record.usage,
+                    calls: vec![record],
+                },
+                prompt: input.intent.clone(),
+                response: script.summary.to_string(),
+                thinking: Some("coordinator reasoning".to_string()),
+            })
+        }
+
+        async fn execute_teammate(
+            &self,
+            input: ExecuteInput,
+            team_tools: Arc<dyn dhi_agent::ToolServerView>,
+        ) -> anyhow::Result<dhi_agent::AgentCall<dhi_agent::ExecuteOutput>> {
+            self.teammate_inputs.lock().unwrap().push(input.clone());
+            let script = self
+                .teammate
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("teammate script exhausted"))?;
+            for (name, args) in &script.calls {
+                call_team_tool(&team_tools, *name, args.clone()).await?;
+            }
+            let output = execute_output(script.summary, vec![]);
+            if !script.record {
+                return Ok(unrecorded(output));
+            }
+            let record = call_record(Role::Worker, "teammate-m");
+            Ok(dhi_agent::AgentCall {
+                output,
+                meta: dhi_agent::AgentCallMeta {
+                    usage: record.usage,
+                    calls: vec![record],
+                },
+                prompt: input.task.clone().unwrap_or_else(|| input.intent.clone()),
+                response: script.summary.to_string(),
+                thinking: Some("teammate reasoning".to_string()),
+            })
+        }
+
+        fn name(&self) -> &str {
+            "coordinator-scripted"
         }
     }
 
@@ -5625,6 +6357,107 @@ mod tests {
         assert_eq!(unchanged, plan);
     }
 
+    /// A swarm plan with one explicitly assigned subtask per worker.
+    fn swarm_plan(worker_count: usize) -> IntentPlan {
+        let workers: Vec<WorkerSpec> = (0..worker_count)
+            .map(|index| team_worker(&format!("w{index}"), "researcher"))
+            .collect();
+        let subtasks: Vec<Subtask> = (0..worker_count)
+            .map(|index| {
+                team_subtask(
+                    &format!("s{index}"),
+                    &format!("subtask {index}"),
+                    &format!("w{index}"),
+                )
+            })
+            .collect();
+        IntentPlan {
+            intent: "swarm".to_string(),
+            topology: Topology::Swarm,
+            workers,
+            subtasks,
+            limits: CapabilityLimits::default(),
+        }
+    }
+
+    fn swarm_task(workers: Option<usize>) -> Task {
+        let mut task = Task::new("swarm");
+        task.topology = Some(Topology::Swarm);
+        task.swarm_workers = workers;
+        // A narrow DHI+ capacity must never throttle a swarm below its team.
+        task.capacity.max_parallel_workers = Some(1);
+        task
+    }
+
+    #[test]
+    fn fixed_swarm_counts_two_eight_and_sixty_four_are_accepted() {
+        for workers in [2, 8, 64] {
+            let plan = swarm_plan(workers);
+            assert!(
+                enforce_swarm_worker_count(Some(workers), &plan).is_ok(),
+                "{workers} workers must be accepted"
+            );
+
+            let effective = effective_team_plan(plan, &swarm_task(Some(workers)));
+            assert_eq!(
+                effective.limits.max_parallel, workers,
+                "a fixed swarm runs every teammate at once"
+            );
+            assert!(
+                effective.limits.max_workers >= workers,
+                "max_workers must admit all {workers} teammates"
+            );
+            assert!(
+                effective.validate().is_ok(),
+                "the normalized {workers}-worker plan must validate"
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_swarm_counts_one_and_sixty_five_are_rejected() {
+        for workers in [1, 65] {
+            let err = enforce_swarm_worker_count(Some(workers), &swarm_plan(2))
+                .expect_err("out-of-range worker counts are rejected");
+            assert!(err.contains("outside"), "{err}");
+        }
+    }
+
+    #[test]
+    fn auto_swarm_runs_every_declared_teammate_at_once() {
+        let effective = effective_team_plan(swarm_plan(6), &swarm_task(None));
+
+        assert_eq!(effective.limits.max_parallel, 6);
+        assert_eq!(effective.limits.max_workers, 8);
+        assert!(effective.validate().is_ok());
+    }
+
+    #[test]
+    fn auto_swarm_never_widens_the_approval_free_cap_by_itself() {
+        let unapproved = effective_team_plan(swarm_plan(10), &swarm_task(None));
+
+        assert_eq!(
+            unapproved.limits.max_workers, 8,
+            "Auto must keep the planner's max_workers; only a granted scale approval may widen it"
+        );
+        assert!(
+            unapproved.validate().is_err(),
+            "a ten-worker Auto plan without a raised max_workers must not run"
+        );
+    }
+
+    #[test]
+    fn manager_worker_still_honors_the_task_parallel_capacity() {
+        let mut task = Task::new("managed");
+        task.topology = Some(Topology::ManagerWorker);
+        task.capacity.max_parallel_workers = Some(1);
+
+        let effective =
+            effective_team_plan(two_worker_plan("managed", Topology::ManagerWorker), &task);
+
+        assert_eq!(effective.limits.max_parallel, 1);
+    }
+
     // ---------- DHI+ plan execution ----------
 
     /// Scripted team agent whose runtime manager keeps only alpha and assigns
@@ -7057,5 +7890,985 @@ mod tests {
         assert_eq!(result.rounds, 3);
         // The idle round must actually hibernate for at least one heartbeat.
         assert!(elapsed >= heartbeat);
+    }
+
+    // ---------- manager-worker lead wiring ----------
+
+    async fn manager_task(store: &MemoryStore, goal: &str) -> (Task, Goal) {
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new(goal).with_topology(Some(Topology::ManagerWorker)),
+        )
+        .await
+        .unwrap();
+        let goal = store.add_goal(task.id, task.goal.clone()).await.unwrap();
+        (task, goal)
+    }
+
+    #[tokio::test]
+    async fn manager_lead_can_start_with_no_initial_subtasks() {
+        let store = Arc::new(MemoryStore::new());
+        let (task, goal) = manager_task(&store, "empty initial plan").await;
+        let mut plan = two_worker_plan("empty initial plan", Topology::ManagerWorker);
+        plan.subtasks.clear();
+        let agent = Arc::new(LeadAgent::new(
+            vec![
+                ScriptedPlan::Outcome(planned_intent("empty initial plan", plan)),
+                ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+            ],
+            vec![],
+            vec![dhi_core::LeadDecision::Final {
+                summary: "empty-plan lead summary".to_string(),
+                detail: String::new(),
+                evidence: "the lead planned directly".to_string(),
+                confidence: "observed".to_string(),
+            }],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone()).with_lead_runtime();
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(agent.review_inputs().len(), 1);
+        assert!(
+            store
+                .facts(task.id)
+                .iter()
+                .any(|fact| fact.claim == "empty-plan lead summary")
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_lead_final_records_the_intent_fact() {
+        let store = Arc::new(MemoryStore::new());
+        let (task, goal) = manager_task(&store, "lead the work").await;
+        let agent = Arc::new(
+            LeadAgent::new(
+                vec![
+                    ScriptedPlan::Outcome(planned_intent(
+                        "lead the work",
+                        two_worker_plan("lead the work", Topology::ManagerWorker),
+                    )),
+                    ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+                ],
+                vec![
+                    execute_output("alpha finding", vec![]),
+                    execute_output("beta finding", vec![]),
+                ],
+                vec![dhi_core::LeadDecision::Final {
+                    summary: "lead final summary".to_string(),
+                    detail: "the lead merged both findings".to_string(),
+                    evidence: "alpha and beta".to_string(),
+                    confidence: "observed".to_string(),
+                }],
+            )
+            .recorded(),
+        );
+        let engine = Engine::new(store.clone(), agent.clone()).with_lead_runtime();
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        let facts = store.facts(task.id);
+        assert!(
+            facts.iter().any(|fact| fact.claim == "lead final summary"),
+            "the lead's final decision supplies the fact: {facts:?}"
+        );
+        let runs = store.agent_runs(task.id);
+        assert!(
+            runs.iter()
+                .any(|run| run.worker_key.as_deref() == Some("manager")),
+            "the lead call is an agent run under manager"
+        );
+        assert_eq!(agent.review_inputs().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn manager_lead_continue_runs_direct_assignments() {
+        let store = Arc::new(MemoryStore::new());
+        let (task, goal) = manager_task(&store, "continue the lead").await;
+        let agent = Arc::new(
+            LeadAgent::new(
+                vec![
+                    ScriptedPlan::Outcome(planned_intent(
+                        "continue the lead",
+                        two_worker_plan("continue the lead", Topology::ManagerWorker),
+                    )),
+                    ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+                ],
+                vec![
+                    execute_output("alpha initial", vec![]),
+                    execute_output("beta initial", vec![]),
+                    execute_output("alpha follow-up", vec![]),
+                ],
+                vec![
+                    dhi_core::LeadDecision::Continue {
+                        tasks: vec![dhi_core::LeadTask {
+                            id: "follow-1".to_string(),
+                            title: "follow up".to_string(),
+                            description: "check the edge case".to_string(),
+                            assignee: "alpha".to_string(),
+                            depends_on: Vec::new(),
+                        }],
+                        reason: "one more check".to_string(),
+                    },
+                    dhi_core::LeadDecision::Final {
+                        summary: "continued lead summary".to_string(),
+                        detail: String::new(),
+                        evidence: "three worker turns".to_string(),
+                        confidence: "observed".to_string(),
+                    },
+                ],
+            )
+            .recorded(),
+        );
+        let engine = Engine::new(store.clone(), agent.clone()).with_lead_runtime();
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(agent.review_inputs().len(), 2);
+        assert!(
+            store
+                .facts(task.id)
+                .iter()
+                .any(|fact| fact.claim == "continued lead summary")
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_lead_ask_worker_runs_one_pool_turn() {
+        let store = Arc::new(MemoryStore::new());
+        let (task, goal) = manager_task(&store, "ask a worker").await;
+        let agent = Arc::new(LeadAgent::new(
+            vec![
+                ScriptedPlan::Outcome(planned_intent(
+                    "ask a worker",
+                    two_worker_plan("ask a worker", Topology::ManagerWorker),
+                )),
+                ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+            ],
+            vec![
+                execute_output("alpha initial", vec![]),
+                execute_output("beta initial", vec![]),
+                execute_output("beta asked", vec![]),
+            ],
+            vec![
+                dhi_core::LeadDecision::AskWorker {
+                    worker_key: "beta".to_string(),
+                    prompt: "check the edge case".to_string(),
+                },
+                dhi_core::LeadDecision::Final {
+                    summary: "asked lead summary".to_string(),
+                    detail: String::new(),
+                    evidence: "asked beta".to_string(),
+                    confidence: "inferred".to_string(),
+                },
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone()).with_lead_runtime();
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(agent.review_inputs().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn manager_lead_stop_returns_to_the_planner_without_failing_the_task() {
+        let store = Arc::new(MemoryStore::new());
+        let (task, _goal) = manager_task(&store, "stop the lead").await;
+        let agent = Arc::new(LeadAgent::new(
+            vec![
+                ScriptedPlan::Outcome(planned_intent(
+                    "stop the lead",
+                    two_worker_plan("stop the lead", Topology::ManagerWorker),
+                )),
+                ScriptedPlan::Outcome(idle_plan()),
+            ],
+            vec![
+                execute_output("alpha initial", vec![]),
+                execute_output("beta initial", vec![]),
+            ],
+            vec![dhi_core::LeadDecision::Stop {
+                reason: "the source is unavailable".to_string(),
+            }],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone())
+            .with_lead_runtime()
+            .with_heartbeat(Duration::from_millis(10))
+            .with_max_idle_ticks(1);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Timeout);
+        assert_ne!(result.task.state, TaskState::Failed);
+        let intents = store.intents(task.id);
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].state, IntentState::Stopped);
+        let stopped = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "team_stopped")
+            .expect("team_stopped activity");
+        assert_eq!(stopped.payload["reason"], "the source is unavailable");
+        assert!(
+            agent.plan_inputs().len() >= 2,
+            "the planner is consulted again after a stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_lead_stop_counts_the_lead_call_against_capacity() {
+        let store = Arc::new(MemoryStore::new());
+        let (task, _goal) = manager_task(&store, "stop and charge the lead").await;
+        GraphStore::set_task_capacity(
+            store.as_ref(),
+            task.id,
+            dhi_core::TaskCapacity {
+                max_model_calls: Some(1),
+                ..dhi_core::TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut plan = two_worker_plan("stop and charge the lead", Topology::ManagerWorker);
+        plan.subtasks.clear();
+        let agent = Arc::new(
+            LeadAgent::new(
+                vec![ScriptedPlan::Outcome(planned_intent(
+                    "stop and charge the lead",
+                    plan,
+                ))],
+                vec![],
+                vec![dhi_core::LeadDecision::Stop {
+                    reason: "stop after one review".to_string(),
+                }],
+            )
+            .recorded(),
+        );
+        let engine = Engine::new(store.clone(), agent)
+            .with_lead_runtime()
+            .with_heartbeat(Duration::from_millis(10))
+            .with_max_idle_ticks(1);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(
+            result.task.state,
+            TaskState::Paused,
+            "the stopped lead's model call must reach the capacity ledger"
+        );
+        let paused = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "capacity_exhausted")
+            .expect("capacity_exhausted activity");
+        assert_eq!(paused.payload["reason"], "model_calls");
+        assert_eq!(paused.payload["model_calls"], 1);
+    }
+
+    // ---------- Cline Teams wiring ----------
+
+    fn team_plan(worker_count: usize, subtasks: usize) -> IntentPlan {
+        let mut plan = swarm_plan(worker_count);
+        plan.subtasks.truncate(subtasks);
+        plan.limits.max_rounds = 3;
+        plan
+    }
+
+    #[tokio::test]
+    async fn coordinator_tool_loop_records_one_fact_and_persists_team_state() {
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new("run the team").with_topology(Some(Topology::Swarm)),
+        )
+        .await
+        .unwrap();
+        let goal = store.add_goal(task.id, task.goal.clone()).await.unwrap();
+        let plan = team_plan(2, 0);
+        let team_store: Arc<dyn TeamStore> = Arc::new(dhi_core::team::MemoryTeamStore::new());
+        let board_task = Uuid::new_v4();
+        let outcome_id = Uuid::new_v4();
+        let coordinator = CoordinatorScript {
+            calls: vec![
+                (
+                    "team_task",
+                    json!({
+                        "operation": "create",
+                        "id": board_task,
+                        "title": "collect evidence",
+                        "description": "deep dive",
+                        "assignee": "w0"
+                    }),
+                ),
+                (
+                    "team_run_task",
+                    json!({
+                        "task_id": board_task,
+                        "agent_id": "w0",
+                        "mode": "sync",
+                        "message": "run it"
+                    }),
+                ),
+                (
+                    "team_send_message",
+                    json!({
+                        "to": "w0",
+                        "subject": "handoff",
+                        "body": "please collect",
+                        "task_id": board_task
+                    }),
+                ),
+                (
+                    "team_broadcast",
+                    json!({"subject": "status", "body": "one card is running"}),
+                ),
+                (
+                    "team_mission_log",
+                    json!({
+                        "kind": "progress",
+                        "summary": "coordinator started the board",
+                        "evidence": "created one card"
+                    }),
+                ),
+                (
+                    "team_create_outcome",
+                    json!({
+                        "id": outcome_id,
+                        "title": "report",
+                        "required_sections": ["summary", "evidence"]
+                    }),
+                ),
+                (
+                    "team_attach_outcome_fragment",
+                    json!({
+                        "outcome_id": outcome_id,
+                        "section": "summary",
+                        "content": "the team collected evidence"
+                    }),
+                ),
+                (
+                    "team_attach_outcome_fragment",
+                    json!({
+                        "outcome_id": outcome_id,
+                        "section": "evidence",
+                        "content": "w0 completed collect evidence"
+                    }),
+                ),
+            ],
+            summary: "coordinator final summary",
+            record: true,
+        };
+        let teammate = TeammateScript {
+            calls: vec![
+                (
+                    "team_send_message",
+                    json!({"to": "lead", "subject": "finding", "body": "the parser is clean"}),
+                ),
+                (
+                    "team_mission_log",
+                    json!({
+                        "kind": "progress",
+                        "summary": "teammate note",
+                        "evidence": "read the parser"
+                    }),
+                ),
+            ],
+            summary: "teammate finding",
+            record: true,
+        };
+        let agent = Arc::new(CoordinatorAgent::new(
+            vec![
+                ScriptedPlan::Outcome(planned_intent("run the team", plan)),
+                ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+            ],
+            coordinator,
+            teammate,
+        ));
+        let engine = Engine::new(store.clone(), agent.clone()).with_team_store(team_store.clone());
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        let facts = store.facts(task.id);
+        let confirmed: Vec<&dhi_core::Fact> = facts
+            .iter()
+            .filter(|fact| fact.state == FactState::Confirmed)
+            .collect();
+        assert_eq!(confirmed.len(), 1, "one coordinator fact for the intent");
+        assert_eq!(confirmed[0].claim, "coordinator final summary");
+        assert_eq!(store.intents(task.id).len(), 1);
+        assert_eq!(store.intents(task.id)[0].state, IntentState::Done);
+
+        let tasks = team_store.team_tasks(task.id).await.unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].status, dhi_core::team::TeamTaskStatus::Completed);
+        let lead_sent = team_store.team_sent(task.id, "lead").await.unwrap();
+        assert_eq!(lead_sent.len(), 2, "direct handoff plus broadcast");
+        assert_eq!(lead_sent[0].subject, "handoff");
+        let teammate_sent = team_store.team_sent(task.id, "w0").await.unwrap();
+        assert_eq!(teammate_sent.len(), 1);
+        assert_eq!(teammate_sent[0].subject, "finding");
+        assert!(
+            !team_store
+                .team_mission_log(task.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let runs = team_store.team_runs(task.id).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, dhi_core::team::TeamRunStatus::Completed);
+        let outcomes = team_store.team_outcomes(task.id).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        let fragments = team_store
+            .team_outcome_fragments(task.id, Some(outcome_id))
+            .await
+            .unwrap();
+        assert_eq!(fragments.len(), 2);
+
+        let agent_runs = store.agent_runs(task.id);
+        assert!(
+            agent_runs
+                .iter()
+                .any(|run| run.worker_key.as_deref() == Some("coordinator")),
+            "the coordinator call is recorded under its own worker key"
+        );
+        assert!(
+            agent_runs
+                .iter()
+                .any(|run| run.worker_key.as_deref() == Some("w0")),
+            "the teammate call is recorded"
+        );
+        assert_eq!(
+            agent_runs
+                .iter()
+                .filter(|run| run.worker_key.as_deref() == Some("coordinator"))
+                .count(),
+            1,
+            "one coordinator completion call"
+        );
+        let coordinator_inputs = agent.coordinator_inputs();
+        assert_eq!(coordinator_inputs.len(), 1);
+        assert_eq!(coordinator_inputs[0].intent, "swarm");
+        assert!(
+            coordinator_inputs[0]
+                .context
+                .iter()
+                .any(|line| line.contains("Teammate cap: 8")),
+            "the coordinator sees its cap: {:?}",
+            coordinator_inputs[0].context
+        );
+        let teammate_inputs = agent.teammate_inputs();
+        assert_eq!(teammate_inputs.len(), 1);
+        assert_eq!(teammate_inputs[0].agent_id.as_deref(), Some("w0"));
+        assert!(
+            teammate_inputs[0]
+                .task
+                .as_deref()
+                .is_some_and(|task| task.contains("collect evidence")),
+            "the teammate sees its assigned task: {:?}",
+            teammate_inputs[0].task
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_fact_with_zero_worker_results_is_valid() {
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new("finalize without workers").with_topology(Some(Topology::Swarm)),
+        )
+        .await
+        .unwrap();
+        let goal = store.add_goal(task.id, task.goal.clone()).await.unwrap();
+        let plan = team_plan(2, 0);
+        let team_store: Arc<dyn TeamStore> = Arc::new(dhi_core::team::MemoryTeamStore::new());
+        let agent = Arc::new(CoordinatorAgent::new(
+            vec![
+                ScriptedPlan::Outcome(planned_intent("finalize without workers", plan)),
+                ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id },
+            ],
+            CoordinatorScript {
+                calls: Vec::new(),
+                summary: "zero-worker coordinator fact",
+                record: true,
+            },
+            TeammateScript {
+                calls: Vec::new(),
+                summary: "unused",
+                record: false,
+            },
+        ));
+        let engine = Engine::new(store.clone(), agent).with_team_store(team_store.clone());
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert!(
+            store
+                .facts(task.id)
+                .iter()
+                .any(|fact| fact.claim == "zero-worker coordinator fact"),
+            "a coordinator record_fact with no worker results is valid"
+        );
+        assert!(
+            team_store.team_runs(task.id).await.unwrap().is_empty(),
+            "no teammate ran"
+        );
+        assert_eq!(
+            team_store.team_members(task.id).await.unwrap().len(),
+            3,
+            "the coordinator plus two seeded teammates exist"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_peer_swarm_rejects_a_zero_seed_plan() {
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new("zero seed peer swarm").with_topology(Some(Topology::Swarm)),
+        )
+        .await
+        .unwrap();
+        let mut plan = swarm_plan(2);
+        plan.subtasks.clear();
+        let agent = Arc::new(ScriptedAgent::new(
+            vec![
+                planned_intent("zero seed peer swarm", plan),
+                PlanOutcome::NoPlan {
+                    reason: "nothing left".to_string(),
+                },
+            ],
+            vec![],
+        ));
+        let engine = Engine::new(store.clone(), agent);
+
+        let err = engine
+            .run_task(task.id)
+            .await
+            .expect_err("the legacy peer swarm cannot run without a seed");
+        assert!(err.to_string().contains("seed subtask"), "{err}");
+        assert_eq!(
+            store.get_task(task.id).await.unwrap().unwrap().state,
+            TaskState::Failed
+        );
+        assert!(
+            store
+                .facts(task.id)
+                .iter()
+                .all(|fact| fact.state != FactState::Confirmed),
+            "a zero-worker peer swarm must not produce a fact"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_stop_returns_to_the_planner_without_a_fact() {
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new("stop the team").with_topology(Some(Topology::Swarm)),
+        )
+        .await
+        .unwrap();
+        let plan = team_plan(2, 0);
+        let team_store: Arc<dyn TeamStore> = Arc::new(dhi_core::team::MemoryTeamStore::new());
+        let agent = Arc::new(CoordinatorAgent::new(
+            vec![
+                ScriptedPlan::Outcome(planned_intent("stop the team", plan)),
+                ScriptedPlan::Outcome(idle_plan()),
+            ],
+            CoordinatorScript {
+                calls: vec![("team_stop", json!({"reason": "the team is blocked"}))],
+                summary: "this fact must never be recorded",
+                record: true,
+            },
+            TeammateScript {
+                calls: Vec::new(),
+                summary: "unused",
+                record: false,
+            },
+        ));
+        let engine = Engine::new(store.clone(), agent)
+            .with_team_store(team_store)
+            .with_heartbeat(Duration::from_millis(10))
+            .with_max_idle_ticks(1);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Timeout);
+        assert_eq!(store.intents(task.id)[0].state, IntentState::Stopped);
+        assert!(
+            store
+                .facts(task.id)
+                .iter()
+                .all(|fact| fact.claim != "this fact must never be recorded"),
+            "a coordinator stop records no fact"
+        );
+        let stopped = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "team_stopped")
+            .expect("team_stopped activity");
+        assert_eq!(stopped.payload["reason"], "the team is blocked");
+        assert!(
+            store
+                .agent_runs(task.id)
+                .iter()
+                .any(|run| run.worker_key.as_deref() == Some("coordinator")),
+            "the coordinator call is still recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn coordinator_stop_counts_the_call_against_capacity() {
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new("stop and charge the team").with_topology(Some(Topology::Swarm)),
+        )
+        .await
+        .unwrap();
+        GraphStore::set_task_capacity(
+            store.as_ref(),
+            task.id,
+            dhi_core::TaskCapacity {
+                max_model_calls: Some(1),
+                ..dhi_core::TaskCapacity::default()
+            },
+        )
+        .await
+        .unwrap();
+        let plan = team_plan(2, 0);
+        let team_store: Arc<dyn TeamStore> = Arc::new(dhi_core::team::MemoryTeamStore::new());
+        let agent = Arc::new(CoordinatorAgent::new(
+            vec![ScriptedPlan::Outcome(planned_intent(
+                "stop and charge the team",
+                plan,
+            ))],
+            CoordinatorScript {
+                calls: vec![("team_stop", json!({"reason": "stop after one turn"}))],
+                summary: "ignored",
+                record: true,
+            },
+            TeammateScript {
+                calls: Vec::new(),
+                summary: "unused",
+                record: false,
+            },
+        ));
+        let engine = Engine::new(store.clone(), agent)
+            .with_team_store(team_store)
+            .with_heartbeat(Duration::from_millis(10))
+            .with_max_idle_ticks(1);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(
+            result.task.state,
+            TaskState::Paused,
+            "the stopped coordinator's model call must reach the capacity ledger"
+        );
+        let paused = store
+            .activities(task.id)
+            .into_iter()
+            .find(|activity| activity.kind == "capacity_exhausted")
+            .expect("capacity_exhausted activity");
+        assert_eq!(paused.payload["reason"], "model_calls");
+        assert_eq!(paused.payload["model_calls"], 1);
+    }
+
+    // ---------- scale gate ----------
+
+    struct FakeScaleGate {
+        requests: Mutex<Vec<dhi_core::ScaleApprovalRequest>>,
+        status: dhi_core::ScaleApprovalStatus,
+    }
+
+    impl FakeScaleGate {
+        fn new(status: dhi_core::ScaleApprovalStatus) -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                status,
+            }
+        }
+
+        fn requests(&self) -> Vec<dhi_core::ScaleApprovalRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl dhi_core::ScaleApprovalGate for FakeScaleGate {
+        async fn request_scale_approval(
+            &self,
+            request: dhi_core::ScaleApprovalRequest,
+        ) -> anyhow::Result<dhi_core::ScaleApproval> {
+            self.requests.lock().unwrap().push(request.clone());
+            Ok(dhi_core::ScaleApproval {
+                id: Uuid::new_v4(),
+                task_id: request.task_id,
+                team_id: request.team_id,
+                requested_workers: request.requested_workers,
+                current_cap: request.current_cap,
+                reason: request.reason,
+                status: dhi_core::ScaleApprovalStatus::Pending,
+                created_at: Utc::now(),
+                expires_at: Utc::now() + chrono::Duration::minutes(1),
+                decided_at: None,
+            })
+        }
+
+        async fn wait_for_scale_approval(
+            &self,
+            _approval_id: Uuid,
+        ) -> anyhow::Result<dhi_core::ScaleApproval> {
+            let request = self
+                .requests
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .expect("the gate was asked first");
+            Ok(dhi_core::ScaleApproval {
+                id: Uuid::new_v4(),
+                task_id: request.task_id,
+                team_id: request.team_id,
+                requested_workers: request.requested_workers,
+                current_cap: request.current_cap,
+                reason: request.reason,
+                status: self.status,
+                created_at: Utc::now(),
+                expires_at: Utc::now() + chrono::Duration::minutes(1),
+                decided_at: None,
+            })
+        }
+    }
+
+    fn auto_swarm_task(workers: Option<usize>) -> Task {
+        let mut task = Task::new("gate the swarm");
+        task.topology = Some(Topology::Swarm);
+        task.swarm_workers = workers;
+        task
+    }
+
+    #[test]
+    fn effective_teammate_cap_matches_the_swarm_contract() {
+        let auto_task = auto_swarm_task(None);
+        assert_eq!(
+            Engine::effective_teammate_cap(&auto_task, &swarm_plan(3)),
+            dhi_core::SWARM_AUTO_WORKERS,
+            "Auto may still grow to 8 even when the plan seeds fewer"
+        );
+        assert_eq!(
+            Engine::effective_teammate_cap(&auto_task, &swarm_plan(10)),
+            10,
+            "a granted Auto plan keeps its final size"
+        );
+        assert_eq!(
+            Engine::effective_teammate_cap(&auto_task, &swarm_plan(100)),
+            dhi_core::SWARM_MAX_WORKERS
+        );
+
+        let fixed_task = auto_swarm_task(Some(12));
+        assert_eq!(
+            Engine::effective_teammate_cap(&fixed_task, &swarm_plan(12)),
+            12
+        );
+    }
+
+    #[test]
+    fn team_config_never_exceeds_the_effective_teammate_cap() {
+        let task_id = Uuid::new_v4();
+        let intent_id = Uuid::new_v4();
+        let plan = swarm_plan(12);
+
+        let fixed = Engine::team_run_config(task_id, intent_id, &plan, 12);
+        assert_eq!(fixed.max_teammates, 12);
+        assert_eq!(fixed.teammates.len(), 12);
+
+        let auto = Engine::team_run_config(task_id, intent_id, &plan, 8);
+        assert_eq!(auto.max_teammates, dhi_core::SWARM_AUTO_WORKERS);
+        assert_eq!(auto.teammates.len(), dhi_core::SWARM_AUTO_WORKERS);
+
+        let granted = Engine::team_run_config(task_id, intent_id, &plan, 10);
+        assert_eq!(granted.max_teammates, 10);
+        assert_eq!(granted.teammates.len(), 10);
+
+        let hard_cap = Engine::team_run_config(task_id, intent_id, &plan, 100);
+        assert_eq!(hard_cap.max_teammates, dhi_core::SWARM_MAX_WORKERS);
+    }
+
+    #[tokio::test]
+    async fn fixed_swarm_never_asks_for_scale_approval() {
+        let gate = Arc::new(FakeScaleGate::new(dhi_core::ScaleApprovalStatus::Granted));
+        let engine = Engine::new(Arc::new(MemoryStore::new()), Arc::new(MockAgentRuntime))
+            .with_scale_gate(gate.clone());
+        let plan = effective_team_plan(swarm_plan(10), &auto_swarm_task(Some(10)));
+
+        let effective = engine
+            .apply_scale_gate(&auto_swarm_task(Some(10)), &plan, None)
+            .await
+            .unwrap();
+
+        assert_eq!(effective.workers.len(), 10);
+        assert_eq!(effective.limits.max_parallel, 10);
+        assert!(gate.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_swarm_of_eight_never_asks_for_scale_approval() {
+        let gate = Arc::new(FakeScaleGate::new(dhi_core::ScaleApprovalStatus::Granted));
+        let engine = Engine::new(Arc::new(MemoryStore::new()), Arc::new(MockAgentRuntime))
+            .with_scale_gate(gate.clone());
+        let task = auto_swarm_task(None);
+        let plan = effective_team_plan(swarm_plan(8), &task);
+
+        let effective = engine.apply_scale_gate(&task, &plan, None).await.unwrap();
+
+        assert_eq!(effective.workers.len(), 8);
+        assert_eq!(effective.limits.max_parallel, 8);
+        assert!(gate.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_swarm_above_eight_uses_a_granted_cap() {
+        let gate = Arc::new(FakeScaleGate::new(dhi_core::ScaleApprovalStatus::Granted));
+        let engine = Engine::new(Arc::new(MemoryStore::new()), Arc::new(MockAgentRuntime))
+            .with_scale_gate(gate.clone());
+        let task = auto_swarm_task(None);
+        let plan = effective_team_plan(swarm_plan(10), &task);
+
+        let effective = engine.apply_scale_gate(&task, &plan, None).await.unwrap();
+
+        assert_eq!(effective.workers.len(), 10);
+        assert_eq!(effective.limits.max_parallel, 10);
+        let requests = gate.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].requested_workers, 10);
+        assert_eq!(requests[0].current_cap, dhi_core::SWARM_AUTO_WORKERS);
+        let config =
+            Engine::team_run_config(task.id, Uuid::new_v4(), &effective, effective.workers.len());
+        assert_eq!(config.max_teammates, 10);
+    }
+
+    #[tokio::test]
+    async fn auto_swarm_above_eight_is_capped_when_denied() {
+        let gate = Arc::new(FakeScaleGate::new(dhi_core::ScaleApprovalStatus::Denied));
+        let engine = Engine::new(Arc::new(MemoryStore::new()), Arc::new(MockAgentRuntime))
+            .with_scale_gate(gate.clone());
+        let task = auto_swarm_task(None);
+        let plan = effective_team_plan(swarm_plan(10), &task);
+
+        let effective = engine.apply_scale_gate(&task, &plan, None).await.unwrap();
+
+        assert_eq!(effective.workers.len(), dhi_core::SWARM_AUTO_WORKERS);
+        assert_eq!(effective.limits.max_parallel, dhi_core::SWARM_AUTO_WORKERS);
+        assert_eq!(gate.requests().len(), 1);
+        let config =
+            Engine::team_run_config(task.id, Uuid::new_v4(), &effective, effective.workers.len());
+        assert_eq!(config.max_teammates, dhi_core::SWARM_AUTO_WORKERS);
+    }
+
+    #[tokio::test]
+    async fn auto_swarm_above_eight_is_capped_when_expired() {
+        let gate = Arc::new(FakeScaleGate::new(dhi_core::ScaleApprovalStatus::Expired));
+        let engine = Engine::new(Arc::new(MemoryStore::new()), Arc::new(MockAgentRuntime))
+            .with_scale_gate(gate);
+        let task = auto_swarm_task(None);
+        let plan = effective_team_plan(swarm_plan(12), &task);
+
+        let effective = engine.apply_scale_gate(&task, &plan, None).await.unwrap();
+
+        assert_eq!(effective.workers.len(), dhi_core::SWARM_AUTO_WORKERS);
+        assert_eq!(effective.limits.max_parallel, dhi_core::SWARM_AUTO_WORKERS);
+    }
+
+    struct NeverDecidedGate;
+
+    #[async_trait::async_trait]
+    impl dhi_core::ScaleApprovalGate for NeverDecidedGate {
+        async fn request_scale_approval(
+            &self,
+            request: dhi_core::ScaleApprovalRequest,
+        ) -> anyhow::Result<dhi_core::ScaleApproval> {
+            Ok(dhi_core::ScaleApproval {
+                id: Uuid::new_v4(),
+                task_id: request.task_id,
+                team_id: request.team_id,
+                requested_workers: request.requested_workers,
+                current_cap: request.current_cap,
+                reason: request.reason,
+                status: dhi_core::ScaleApprovalStatus::Pending,
+                created_at: Utc::now(),
+                expires_at: Utc::now() + chrono::Duration::minutes(1),
+                decided_at: None,
+            })
+        }
+
+        async fn wait_for_scale_approval(
+            &self,
+            _approval_id: Uuid,
+        ) -> anyhow::Result<dhi_core::ScaleApproval> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn scale_gate_wait_honors_the_stop_flag() {
+        let engine = Engine::new(Arc::new(MemoryStore::new()), Arc::new(MockAgentRuntime))
+            .with_scale_gate(Arc::new(NeverDecidedGate));
+        let task = auto_swarm_task(None);
+        let plan = effective_team_plan(swarm_plan(10), &task);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let err = engine
+            .apply_scale_gate(&task, &plan, Some(&stop))
+            .await
+            .expect_err("stop must interrupt the gate wait");
+
+        assert!(
+            err.to_string().contains("stop requested"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn auto_swarm_requires_at_least_two_workers() {
+        for workers in [0, 1] {
+            let err = enforce_swarm_worker_count(None, &swarm_plan(workers))
+                .expect_err("an Auto swarm below the minimum must be rejected");
+            assert!(err.contains("at least 2"), "{err}");
+        }
+        assert!(enforce_swarm_worker_count(None, &swarm_plan(2)).is_ok());
+    }
+
+    #[test]
+    fn fixed_swarm_accepts_zero_to_n_subtasks() {
+        for workers in [2, 8, 64] {
+            let mut plan = swarm_plan(workers);
+            plan.subtasks.clear();
+            assert!(
+                enforce_swarm_worker_count(Some(workers), &plan).is_ok(),
+                "a {workers}-worker team may start with no subtasks"
+            );
+            plan.subtasks = swarm_plan(workers)
+                .subtasks
+                .into_iter()
+                .take(workers / 2)
+                .collect();
+            assert!(
+                enforce_swarm_worker_count(Some(workers), &plan).is_ok(),
+                "a {workers}-worker team may start with partial subtasks"
+            );
+        }
     }
 }

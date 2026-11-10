@@ -218,6 +218,8 @@ impl GraphStore for MemoryStore {
         task.topology = new.topology;
         task.swarm_workers = new.swarm_workers;
         task.project_folder = new.project_folder;
+        task.web_project_id = new.web_project_id;
+        task.web_project_name = new.web_project_name;
         task.load_agents_md = new.load_agents_md;
         task.agents_md_state = new.agents_md_state;
         task.refresh_task_folder();

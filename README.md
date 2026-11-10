@@ -22,7 +22,7 @@ flowchart TD
 
     T -->|manager_worker| M[Manager selects workers]
     M --> W[Workers]
-    T -->|swarm| S[Seed one subtask per worker]
+    T -->|swarm| S[Coordinator agent + shared team]
     S --> W
 
     W --> GU[Guard + audit]
@@ -54,9 +54,26 @@ A DHI<sup>+</sup> intent still follows the DHI lifecycle. The difference is the 
 
 ## DHI<sup>+</sup> orchestration
 
-The planner selects the topology for each intent: `single`, `manager_worker`, or `swarm`. The team topologies, `manager_worker` and `swarm`, are planner-selected. `manager_worker` uses a manager to choose workers and subtasks within the planner's limits, then runs independent workers in parallel. `swarm` seeds one subtask per worker and lets peers exchange typed findings directly, stopping on its budget and stop rules.
+The planner selects the topology for each intent: `single`, `manager_worker`, or `swarm`. The team topologies, `manager_worker` and `swarm`, are planner-selected. `manager_worker` uses a manager to choose workers and subtasks within the planner's limits, then runs independent workers in parallel. `swarm` is the Cline Teams model: one coordinator agent receives the claimed intent and works with domain tools plus team tools over a shared task board, mailbox, mission log, outcome fragments, and sync/async runs. The coordinator calls tools directly; there is no JSON decision loop in the Swarm path. Its one `record_fact` becomes the intent fact. Teammates are normal agent runs with the same team tools except spawn, shutdown, cleanup, and outcome finalization. A `team_stop` returns to the planner without a fact.
 
-Only each worker's seed turn enters the aggregated fact; reaction turns remain visible in the swarm audit and count against capacity. Either team topology still produces one confirmed fact for the intent. The guard and audit path is unchanged: every worker tool call passes through the same guarded executor, and the aggregate fact is recorded only after those decisions are applied.
+The persisted team role string remains `lead` so existing state needs no migration; `TeamRole::Lead` is the coordinator role. Manager-worker keeps its separate no-tools lead loop and `LeadDecision` contract.
+
+Swarm team tools:
+
+```text
+team_spawn_teammate  team_shutdown_teammate  team_status
+team_task            team_run_task           team_list_runs
+team_await_runs      team_cancel_run         team_send_message
+team_broadcast       team_read_mailbox       team_mission_log
+team_create_outcome  team_attach_outcome_fragment
+team_review_outcome_fragment  team_finalize_outcome
+team_list_outcomes   team_cleanup            team_stop
+```
+
+The coordinator may call every tool. A teammate gets the same set except
+`team_spawn_teammate`, `team_shutdown_teammate`, `team_cleanup`, and
+`team_finalize_outcome`; teammates can create and review outcomes but not
+finalize them. The host enforces the `max_teammates` cap at spawn.
 
 Each task has a visible capacity ledger: `max_rounds`, `max_model_calls`, `max_wall_secs`, and `max_parallel_workers`. Omitted limits use the engine defaults. `POST /api/tasks` accepts the ledger at creation, `POST /api/tasks/{id}/capacity` extends it, and the Work view shows and edits it. Exhaustion pauses the task (never fails it); an extension resumes a paused task. Swarm broadcasts are durable and readable at `GET /api/tasks/{id}/swarm-messages`.
 
@@ -223,6 +240,7 @@ Main settings:
 - `DHI_WORKSPACE_ROOT` — workspace root visible to the server; defaults to `workspace`
 - `DHI_WORKSPACE_HOST_ROOT` — host path of that root, used as the bind-mount source for task containers; set it when the server runs in a container
 - `DHI_PROJECT_FOLDERS` — comma-separated absolute paths of project folders; each must be mounted into the server at the same absolute path
+- `DHI_WEB_PROJECTS_ROOT` — absolute root for browser-folder web projects; unset disables them, and the server and Docker daemon must see the same path
 - `DHI_MCP_CONFIG` — MCP config path; when unset, the nearest `ops/mcp.json`
 - `DHI_LLM_BASE_URL`, `DHI_LLM_API_KEY`, `DHI_LLM_PLANNER_MODEL`, `DHI_LLM_WORKER_MODEL` — LLM endpoint and models; other OpenAI-compatible endpoints work
 - `TINYFISH_API_KEY`, `PARALLEL_API_KEY`, `FIRECRAWL_API_KEY`, `DHI_WEB_PROVIDER` — web tool providers
@@ -234,6 +252,12 @@ Set `DHI_PROJECT_FOLDERS` to a comma-separated list of absolute paths. Mount eac
 DHI<sup>+</sup> creates `<project>/.dhi/<task-id>/` for each task in a project folder. The task container mounts the project root at `/project` read-only and the task folder at `/work` read-write. One configured folder is selected per task.
 
 `AGENTS.md` is read from the selected project root only. It is planner-only: no global or nested file is read, and the file is capped at 32 KiB.
+
+### Browser-folder web projects
+
+Set `DHI_WEB_PROJECTS_ROOT` to one absolute directory to enable browser-folder projects. The server validates it at startup: it must exist or be creatable, be writable by the server, and not be a symlink. The same absolute path must be visible to the server process and to the Docker daemon, because each project's folder, `<root>/<id>`, is passed to the existing project bind mount unchanged. There is no host-root remapping variable for this root; mount it into `dhi-server` at the same path, read-write, and make that path meaningful to the daemon (for example with the Docker socket's host filesystem visible under the same path).
+
+When the variable is unset, web projects are disabled: `GET /api/web-projects` answers `404` so the UI treats the feature as unavailable, and creates or tasks that name a web project answer `400`. Uploads are capped server-side at 8 MB per file and 256 MB for the snapshot tree; the server-generated `.dhi` directory is excluded from snapshot counts and the total cap. Upload paths are relative and must not target `.dhi`. `GET /api/tasks/{id}/outputs` reads the task's `.dhi/<task-id>` folder from the web project, skips symlinks, returns UTF-8 as text and other bytes as base64, and excludes files over its per-file or total response cap. Output reads revalidate that the task folder is a real directory below the configured root before reading.
 
 On first boot, DHI<sup>+</sup> seeds guard rules plus LLM profiles and settings when an LLM key is configured. After that, PostgreSQL is the source of truth and profiles and rules are managed from the settings UI or API.
 
@@ -269,7 +293,8 @@ Keep `ops/mcp.json` local. `ops/mcp.example.json` and `ops/mcp.docker.json` are 
 All API routes are under `/api`. Most return JSON; `/api/stream` is a server-sent event stream. The static UI is the fallback for non-API paths.
 
 - **Health** — `GET /api/health`
-- **Tasks** — `GET|POST /api/tasks`; `GET|DELETE /api/tasks/{id}`; `POST /api/tasks/{id}/stop`; bulk `POST /api/tasks/stop` and `POST /api/tasks/delete`; `GET /api/tasks/{id}/work`, `/activity`, and `/usage`
+- **Tasks** — `GET|POST /api/tasks`; `GET|DELETE /api/tasks/{id}`; `POST /api/tasks/{id}/stop`; bulk `POST /api/tasks/stop` and `POST /api/tasks/delete`; `GET /api/tasks/{id}/work`, `/activity`, `/usage`, and `/outputs`
+- **Web projects** — `GET|POST /api/web-projects`; `GET /api/web-projects/{id}`; `PUT /api/web-projects/{id}/files?path=…`
 - **Goals** — `POST /api/tasks/{id}/goals`
 - **Side questions** — `GET|POST /api/tasks/{id}/side-questions`
 - **Approvals** — `GET /api/approvals`; `POST /api/approvals/{id}/decision`

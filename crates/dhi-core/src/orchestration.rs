@@ -2,8 +2,10 @@
 //!
 //! The planner proposes one [`IntentPlan`] per intent: topology, workers,
 //! subtasks, and capability limits. Validation is typed by
-//! [`OrchestrationError`] and covers topology worker counts, non-empty
+//! [`OrchestrationError`] and covers topology worker counts, single-worker
 //! subtasks, unique worker keys, known assigned workers, and non-zero limits.
+//! Manager-worker and swarm plans may start with zero subtasks: the lead or
+//! team creates work after the plan validates.
 
 use std::collections::HashSet;
 
@@ -87,6 +89,9 @@ pub struct IntentPlan {
     pub intent: String,
     pub topology: Topology,
     pub workers: Vec<WorkerSpec>,
+    /// Seed tasks. Manager-worker and swarm plans may leave this empty: the
+    /// lead or team creates tasks dynamically after the plan validates.
+    #[serde(default)]
     pub subtasks: Vec<Subtask>,
     #[serde(default)]
     pub limits: CapabilityLimits,
@@ -104,7 +109,7 @@ impl IntentPlan {
         if self.limits.max_rounds == 0 {
             return Err(OrchestrationError::ZeroMaxRounds);
         }
-        if self.subtasks.is_empty() {
+        if self.topology == Topology::Single && self.subtasks.is_empty() {
             return Err(OrchestrationError::NoSubtasks);
         }
 
@@ -115,11 +120,21 @@ impl IntentPlan {
                     actual: self.workers.len(),
                 });
             }
-            Topology::ManagerWorker | Topology::Swarm
+            Topology::ManagerWorker
                 if self.workers.is_empty() || self.workers.len() > self.limits.max_workers =>
             {
                 return Err(OrchestrationError::WorkerCountOutOfRange {
                     topology: self.topology,
+                    max_workers: self.limits.max_workers,
+                    actual: self.workers.len(),
+                });
+            }
+            Topology::Swarm
+                if self.workers.len() < crate::SWARM_MIN_WORKERS
+                    || self.workers.len() > self.limits.max_workers =>
+            {
+                return Err(OrchestrationError::SwarmWorkerCountOutOfRange {
+                    min_workers: crate::SWARM_MIN_WORKERS,
                     max_workers: self.limits.max_workers,
                     actual: self.workers.len(),
                 });
@@ -202,13 +217,19 @@ pub enum OrchestrationError {
     ZeroMaxParallel,
     #[error("max_rounds must be greater than zero")]
     ZeroMaxRounds,
-    #[error("plan must contain at least one subtask")]
+    #[error("single topology requires at least one subtask")]
     NoSubtasks,
     #[error("{topology} topology requires exactly one worker, got {actual}")]
     SingleRequiresOneWorker { topology: Topology, actual: usize },
     #[error("{topology} topology requires 1..={max_workers} workers, got {actual}")]
     WorkerCountOutOfRange {
         topology: Topology,
+        max_workers: usize,
+        actual: usize,
+    },
+    #[error("swarm topology requires {min_workers}..={max_workers} workers, got {actual}")]
+    SwarmWorkerCountOutOfRange {
+        min_workers: usize,
         max_workers: usize,
         actual: usize,
     },
@@ -227,7 +248,7 @@ pub enum OrchestrationError {
         worker_key: String,
     },
     #[error(
-        "swarm topology has {subtasks} subtasks for {workers} workers; a swarm seeds one subtask per worker"
+        "swarm topology has {subtasks} subtasks for {workers} workers; a swarm can seed at most one subtask per worker"
     )]
     SwarmSubtaskCount { workers: usize, subtasks: usize },
     #[error("swarm worker {worker_key:?} is assigned more than one seed subtask")]
@@ -279,6 +300,99 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(plan.limits, CapabilityLimits::default());
+    }
+
+    #[test]
+    fn manager_worker_and_swarm_may_start_with_zero_seed_subtasks() {
+        for topology in [Topology::ManagerWorker, Topology::Swarm] {
+            let plan = IntentPlan {
+                intent: "ship it".to_owned(),
+                topology,
+                workers: vec![worker("a"), worker("b")],
+                subtasks: vec![],
+                limits: CapabilityLimits::default(),
+            };
+            assert_eq!(plan.validate(), Ok(()), "{topology} may start empty");
+        }
+    }
+
+    #[test]
+    fn fixed_swarm_nine_with_raised_limits_validates_empty() {
+        let workers = (0..9)
+            .map(|index| worker(&format!("w{index}")))
+            .collect::<Vec<_>>();
+        let plan = IntentPlan {
+            intent: "ship it".to_owned(),
+            topology: Topology::Swarm,
+            workers,
+            subtasks: vec![],
+            limits: CapabilityLimits {
+                max_workers: 9,
+                max_parallel: 9,
+                ..CapabilityLimits::default()
+            },
+        };
+        assert_eq!(plan.validate(), Ok(()));
+    }
+
+    #[test]
+    fn swarm_requires_at_least_two_workers() {
+        let plan = IntentPlan {
+            intent: "ship it".to_owned(),
+            topology: Topology::Swarm,
+            workers: vec![worker("a")],
+            subtasks: vec![],
+            limits: CapabilityLimits::default(),
+        };
+        assert_eq!(
+            plan.validate(),
+            Err(OrchestrationError::SwarmWorkerCountOutOfRange {
+                min_workers: crate::SWARM_MIN_WORKERS,
+                max_workers: CapabilityLimits::default().max_workers,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn manager_worker_still_accepts_one_worker() {
+        let plan = IntentPlan {
+            intent: "ship it".to_owned(),
+            topology: Topology::ManagerWorker,
+            workers: vec![worker("a")],
+            subtasks: vec![],
+            limits: CapabilityLimits::default(),
+        };
+        assert_eq!(plan.validate(), Ok(()));
+    }
+
+    #[test]
+    fn single_still_requires_a_subtask() {
+        let plan = IntentPlan {
+            intent: "ship it".to_owned(),
+            topology: Topology::Single,
+            workers: vec![worker("a")],
+            subtasks: vec![],
+            limits: CapabilityLimits::default(),
+        };
+        assert_eq!(plan.validate(), Err(OrchestrationError::NoSubtasks));
+    }
+
+    #[test]
+    fn plan_without_subtasks_field_deserializes_as_empty() {
+        let plan: IntentPlan = serde_json::from_value(serde_json::json!({
+            "intent": "ship it",
+            "topology": "manager_worker",
+            "workers": [{
+                "key": "a",
+                "role": "worker",
+                "prompt": "do it",
+                "max_turns": 1
+            }]
+        }))
+        .unwrap();
+        assert!(plan.subtasks.is_empty());
+        assert_eq!(plan.validate(), Ok(()));
     }
 
     #[test]

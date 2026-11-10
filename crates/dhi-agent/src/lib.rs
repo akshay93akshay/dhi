@@ -25,18 +25,28 @@ use thiserror::Error;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+pub mod lead;
 pub mod pool;
 pub mod profile;
 pub mod prompt;
 pub mod specialists;
+pub mod team_tools;
 pub mod tools;
+
+pub use lead::{
+    LeadCall, LeadReviewInput, lead_input_json, parse_and_validate_lead_decision,
+    parse_lead_decision,
+};
 
 pub use pool::{
     ChainEntry, LlmPool, POOL_TRIP_THRESHOLD, PoolSnapshot, PoolStatus, ProfileFormat, RawProfile,
     ResolvedProfile, RolePoolStatus,
 };
 pub use profile::{LlmProfile, MaxTokensField, ProfileError, Provider, Role, RoleProfiles};
-pub use prompt::{INVARIANT_TAIL, PlannerVars, PromptError, PromptSet, PromptTemplate, WorkerVars};
+pub use prompt::{
+    CoordinatorVars, INVARIANT_TAIL, PlannerVars, PromptError, PromptSet, PromptTemplate,
+    TeammateVars, WorkerVars,
+};
 pub use specialists::{
     DEFAULT_MANAGER_MAX_TURNS, DEFAULT_MAX_DELEGATIONS, DEFAULT_SPECIALIST_MAX_TURNS,
     DelegationLimits, MANAGER_ONLY_TOOLS, RunBudget, RuntimeSink, SpecialistEntry, SpecialistError,
@@ -154,6 +164,16 @@ pub struct ExecuteInput {
     /// only budget.
     #[serde(default)]
     pub max_turns: Option<usize>,
+    /// Swarm teammate identity for a teammate run. `None` for a normal worker,
+    /// coordinator, planner, or side-question call.
+    #[serde(default)]
+    pub agent_id: Option<String>,
+    /// Swarm teammate role label (`teammate`) for a teammate run.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// The assigned board task text for a teammate run.
+    #[serde(default)]
+    pub task: Option<String>,
 }
 
 /// One advisory side question about a task.
@@ -248,6 +268,42 @@ pub trait AgentRuntime: Send + Sync {
             response: String::new(),
             thinking: None,
         })
+    }
+
+    /// Reviews one manager-worker lead turn.
+    ///
+    /// The default refuses: a runtime that has not opted into the lead loop
+    /// cannot silently decide the intent. The lead runs on the planner role
+    /// and profile for now; it gets no tools and cannot write a fact.
+    async fn review_lead(
+        &self,
+        _input: LeadReviewInput,
+    ) -> anyhow::Result<AgentCall<dhi_core::LeadDecision>> {
+        anyhow::bail!("manager-worker lead reviews are not supported by this agent runtime")
+    }
+
+    /// Runs one Swarm coordinator turn with the team's tool host attached.
+    ///
+    /// The default keeps the runtime callable by delegating to [`Self::execute`]
+    /// without team tools, so a runtime that has not opted into the coordinator
+    /// loop still produces the intent's fact. The Rig runtime overrides this
+    /// with the coordinator prompt and merged domain/team tool registry.
+    async fn execute_coordinator(
+        &self,
+        input: ExecuteInput,
+        _team_tools: Arc<dyn ToolServerView>,
+    ) -> anyhow::Result<AgentCall<ExecuteOutput>> {
+        self.execute(input).await
+    }
+
+    /// Runs one Swarm teammate turn with its role-scoped team tool host
+    /// attached. The default delegates to [`Self::execute`].
+    async fn execute_teammate(
+        &self,
+        input: ExecuteInput,
+        _team_tools: Arc<dyn ToolServerView>,
+    ) -> anyhow::Result<AgentCall<ExecuteOutput>> {
+        self.execute(input).await
     }
 
     /// Answers one advisory side question from a frozen snapshot.
@@ -784,10 +840,20 @@ struct ToolSetup {
 /// recorded into the wrong worker's sink. Cloned registrations share the
 /// original handler, so guarded tools still dispatch to the host's one sink.
 fn private_tool_server(shared: &ToolServerHandle) -> ToolServerHandle {
-    let toolset = shared.toolset();
+    merge_tool_servers(std::slice::from_ref(shared))
+}
+
+/// Copies several registries into one private handle.
+///
+/// Cloned registrations share their original handler, so guarded tools still
+/// dispatch to the host's one sink. A later registration with the same name
+/// replaces the earlier one, matching Rig's own merge order.
+fn merge_tool_servers(servers: &[ToolServerHandle]) -> ToolServerHandle {
     let mut server = ToolServer::new();
-    for (_, tool) in toolset.iter() {
-        server = server.registered_tool(tool.clone());
+    for shared in servers {
+        for (_, tool) in shared.toolset().iter() {
+            server = server.registered_tool(tool.clone());
+        }
     }
     server.run()
 }
@@ -1027,6 +1093,44 @@ impl RigAgentRuntime {
         Ok(self.rendered(Role::Worker, system, user))
     }
 
+    /// Renders the Swarm coordinator call from an [`ExecuteInput`]. The static
+    /// tool contract is the system turn; the objective, confirmed facts,
+    /// roster, and cap are the user turn. It runs on the worker role and
+    /// worker pool.
+    pub fn render_coordinator(&self, input: &ExecuteInput) -> Result<RenderedCall, PromptError> {
+        let vars = crate::prompt::CoordinatorVars {
+            objective: input.intent.clone(),
+            context: bullet_list(&input.context),
+        };
+        let (system, user) = self.prompts.render_coordinator(&vars)?;
+        let mut call = self.rendered(Role::Worker, system, user);
+        call.prompt_hash = format!("coordinator@{}", self.prompts.coordinator.hash);
+        Ok(call)
+    }
+
+    /// Renders one Swarm teammate call. The static contract is the system
+    /// turn; the teammate id, objective, role, task, and context follow in the
+    /// user turn.
+    pub fn render_teammate(&self, input: &ExecuteInput) -> Result<RenderedCall, PromptError> {
+        let agent_id = input
+            .agent_id
+            .clone()
+            .unwrap_or_else(|| "teammate".to_string());
+        let role = input.role.clone().unwrap_or_else(|| "teammate".to_string());
+        let task = input.task.clone().unwrap_or_else(|| input.intent.clone());
+        let vars = crate::prompt::TeammateVars {
+            agent_id,
+            role,
+            objective: input.intent.clone(),
+            task,
+            context: bullet_list(&input.context),
+        };
+        let (system, user) = self.prompts.render_teammate(&vars)?;
+        let mut call = self.rendered(Role::Worker, system, user);
+        call.prompt_hash = format!("teammate@{}", self.prompts.teammate.hash);
+        Ok(call)
+    }
+
     /// Renders one manager selection call: the manager contract in the system
     /// turn and the planner's JSON plan in the user turn.
     ///
@@ -1037,6 +1141,19 @@ impl RigAgentRuntime {
         let mut call = self.rendered(Role::Worker, system, user);
         call.prompt_hash = format!("manager@{}", render_hash(&call));
         call
+    }
+
+    /// Renders one lead review: `ops/prompts/manager.md` in the system turn
+    /// and the serialized lead input in the user turn.
+    ///
+    /// The call runs on the planner role and planner pool for now; a dedicated
+    /// manager role is a later refinement.
+    pub fn render_lead_review(&self, input: &LeadReviewInput) -> anyhow::Result<RenderedCall> {
+        let user = lead_input_json(&input.input)?;
+        let (system, user) = self.prompts.render_lead(&user)?;
+        let mut call = self.rendered(Role::Planner, system, user);
+        call.prompt_hash = format!("manager@{}", self.prompts.manager.hash);
+        Ok(call)
     }
 
     /// Renders one side-question call: the advisory preamble in the system
@@ -1283,6 +1400,130 @@ impl RigAgentRuntime {
             prompt_hash: prompt_hash.to_string(),
         }
     }
+
+    /// The tool dispatch a Swarm coordinator or teammate run attaches: the
+    /// worker's domain registry merged with the supplied team registry.
+    ///
+    /// The team host owns the team tools and their permissions; this helper
+    /// only copies both registrations into one private handle so concurrent
+    /// runs cannot replace each other's per-attempt tools.
+    fn team_tool_setup(
+        &self,
+        input: &ExecuteInput,
+        team_tools: &Arc<dyn ToolServerView>,
+    ) -> anyhow::Result<ToolSetup> {
+        let mut tool_context = ToolContext::new();
+        tool_context
+            .insert(RunScope {
+                task_id: input.task_id,
+                intent_id: input.intent_id,
+            })
+            .map_err(|err| anyhow::anyhow!("failed to stamp the run scope: {err}"))?;
+        tool_context
+            .insert(crate::tools::RunRole::worker())
+            .map_err(|err| anyhow::anyhow!("failed to stamp the run role: {err}"))?;
+        let worker_registry = match &self.worker_tool_view {
+            Some(view) => view.tool_server(),
+            None => self.tool_server.clone(),
+        };
+        let team_registry = team_tools.tool_server();
+        Ok(ToolSetup {
+            context: Some(tool_context),
+            registry: Some(merge_tool_servers(&[worker_registry, team_registry])),
+        })
+    }
+
+    /// One worker-role tool loop. The coordinator and teammate paths differ
+    /// from a normal worker only in their rendered prompt and attached
+    /// registry; the fact tool, retry, failover, and usage accounting are
+    /// shared here.
+    async fn run_worker_loop(
+        &self,
+        call: RenderedCall,
+        worker_profile_id: Option<i64>,
+        tool_setup: ToolSetup,
+    ) -> anyhow::Result<AgentCall<ExecuteOutput>> {
+        // The planner's per-worker `max_turns` is retained in the input for
+        // the plan/audit contract only: DHI+ no longer caps a run by model
+        // calls, and the task budget is the only budget.
+        let attempt_tools = || {
+            let sink = WorkerSink::default();
+            let mut tools = sink.tools()?;
+            // The manager's delegation tools: one per specialist, sharing a
+            // budget that is fresh for this attempt.
+            if let Some(fleet) = &self.specialists {
+                let budget = RunBudget::new(fleet.max_delegations());
+                tools.extend(fleet.delegation_tools(budget)?);
+            }
+            Ok((sink, tools))
+        };
+        let (text, response, latency, candidate, sink) = self
+            .complete_via_pool(
+                Role::Worker,
+                worker_profile_id,
+                &call,
+                tool_setup.clone(),
+                &attempt_tools,
+            )
+            .await?;
+        // A worker that answered with prose never called `record_fact`, so the
+        // attempt produced no fact. Retry exactly once with a CRITICAL reminder
+        // in the system turn, a fresh sink, and fresh tools; the same tool
+        // context and registry remain attached. Only this exact finish error
+        // triggers the retry — pool and provider failures already returned
+        // above, and a locked sink is a runtime bug, not model behavior.
+        let (text, response, latency, candidate, fact, recorded_call) = match sink.finish() {
+            Ok(fact) => (text, response, latency, candidate, fact, call),
+            Err(err) if is_missing_record_fact(&err) => {
+                let retry_call = retry_with_record_fact(&call);
+                let (retry_text, retry_response, retry_latency, retry_candidate, retry_sink) = self
+                    .complete_via_pool(
+                        Role::Worker,
+                        worker_profile_id,
+                        &retry_call,
+                        tool_setup,
+                        &attempt_tools,
+                    )
+                    .await?;
+                // If the retry also fails, its error is returned.
+                let fact = retry_sink.finish()?;
+                // The retry is a second completion call, and its usage is the
+                // one recorded. The failed first attempt's tokens are not
+                // counted (nor is its prose used): only a fact-bearing call
+                // is billed to the run.
+                (
+                    retry_text,
+                    retry_response,
+                    retry_latency,
+                    retry_candidate,
+                    fact,
+                    retry_call,
+                )
+            }
+            Err(err) => return Err(err),
+        };
+        let thinking = response_thinking(&response);
+        let record = self.call_record(
+            Role::Worker,
+            &candidate,
+            &recorded_call.prompt_hash,
+            &response,
+            latency,
+        );
+        Ok(AgentCall {
+            output: ExecuteOutput {
+                fact,
+                tool_calls: vec![],
+            },
+            meta: AgentCallMeta {
+                usage: record.usage,
+                calls: vec![record],
+            },
+            prompt: recorded_call.user,
+            response: text,
+            thinking,
+        })
+    }
 }
 
 /// Classifies one completion error: `(retryable, rate_limited)`.
@@ -1436,9 +1677,34 @@ fn fallback_prompts() -> PromptSet {
             .to_string(),
         Role::Worker,
     );
-    match (planner, worker) {
-        (Ok(planner), Ok(worker)) => PromptSet { planner, worker },
-        (Err(err), _) | (_, Err(err)) => {
+    let manager = PromptTemplate::parse(
+        "# Manager prompt\n\nYou are the DHI+ manager-worker lead. Return JSON only.\n\n{{lead_input}}\n"
+            .to_string(),
+        Role::Planner,
+    );
+    let coordinator = PromptTemplate::parse(
+        "# Coordinator prompt\n\nYou are the DHI+ Swarm coordinator. Use the team tools and `record_fact`.\n\n{{objective}}\n\n{{context}}\n"
+            .to_string(),
+        Role::Worker,
+    );
+    let teammate = PromptTemplate::parse(
+        "# Teammate prompt\n\nYou are the DHI+ Swarm teammate {{agent_id}}. Use the team tools and `record_fact`.\n\n{{objective}}\n\n{{task}}\n\n{{context}}\n"
+            .to_string(),
+        Role::Worker,
+    );
+    match (planner, worker, manager, coordinator, teammate) {
+        (Ok(planner), Ok(worker), Ok(manager), Ok(coordinator), Ok(teammate)) => PromptSet {
+            planner,
+            worker,
+            manager,
+            coordinator,
+            teammate,
+        },
+        (Err(err), _, _, _, _)
+        | (_, Err(err), _, _, _)
+        | (_, _, Err(err), _, _)
+        | (_, _, _, Err(err), _)
+        | (_, _, _, _, Err(err)) => {
             warn!("fallback prompt is invalid: {err}");
             PromptSet {
                 planner: PromptTemplate {
@@ -1446,6 +1712,18 @@ fn fallback_prompts() -> PromptSet {
                     hash: String::new(),
                 },
                 worker: PromptTemplate {
+                    source: String::new(),
+                    hash: String::new(),
+                },
+                manager: PromptTemplate {
+                    source: String::new(),
+                    hash: String::new(),
+                },
+                coordinator: PromptTemplate {
+                    source: String::new(),
+                    hash: String::new(),
+                },
+                teammate: PromptTemplate {
                     source: String::new(),
                     hash: String::new(),
                 },
@@ -1467,7 +1745,7 @@ struct PlannerSink {
     /// mismatched call is a tool error the model can retry in the same run.
     required_topology: Option<dhi_core::Topology>,
     /// The user-required swarm worker count. When present, a swarm plan must
-    /// declare exactly this many workers and this many subtasks.
+    /// declare exactly this many workers; seed subtasks stay optional.
     swarm_workers: Option<usize>,
 }
 
@@ -1561,6 +1839,7 @@ impl PlannerSink {
                             },
                             "subtasks": {
                                 "type": "array",
+                                "description": "Optional seed tasks. Omit or send [] for manager_worker or swarm; the lead/team creates tasks dynamically.",
                                 "items": {
                                     "type": "object",
                                     "properties": {
@@ -1587,7 +1866,7 @@ impl PlannerSink {
                                 "additionalProperties": false
                             }
                         },
-                        "required": ["topology", "workers", "subtasks"],
+                        "required": ["topology", "workers"],
                         "additionalProperties": false
                     }
                 },
@@ -1777,9 +2056,10 @@ fn enforce_required_topology(
 
 /// Enforce the user's required swarm worker count on an `add_intent` plan.
 ///
-/// A swarm seeds exactly one subtask per worker, so both counts must equal the
-/// required value. A mismatch is an invalid-args tool error: the model can
-/// retry with the right shape in the same run.
+/// A fixed swarm has exactly the required number of workers. Seed subtasks are
+/// optional: the team lead creates board tasks after the plan validates, so
+/// zero up to the worker count is valid. A mismatch is an invalid-args tool
+/// error: the model can retry with the right shape in the same run.
 fn enforce_swarm_worker_count(
     required: Option<usize>,
     plan: Option<dhi_core::IntentPlan>,
@@ -1787,16 +2067,23 @@ fn enforce_swarm_worker_count(
     let Some(required) = required else {
         return Ok(plan);
     };
+    if !dhi_core::valid_swarm_worker_count(required) {
+        return Err(ToolExecutionError::invalid_args(format!(
+            "required swarm worker count {required} is outside {}..={}; retry with a valid count",
+            dhi_core::SWARM_MIN_WORKERS,
+            dhi_core::SWARM_MAX_WORKERS
+        )));
+    }
     let Some(plan) = plan else {
         return Ok(None);
     };
     if plan.topology != dhi_core::Topology::Swarm {
         return Ok(Some(plan));
     }
-    if plan.workers.len() != required || plan.subtasks.len() != required {
+    if plan.workers.len() != required || plan.subtasks.len() > required {
         return Err(ToolExecutionError::invalid_args(format!(
             "required swarm worker count {required}, but the plan declares {} workers and {} \
-             subtasks; retry with exactly {required} workers and {required} subtasks",
+             subtasks; retry with exactly {required} workers and 0..={required} subtasks",
             plan.workers.len(),
             plan.subtasks.len()
         )));
@@ -2053,86 +2340,34 @@ impl AgentRuntime for RigAgentRuntime {
             context: Some(tool_context),
             registry: Some(worker_registry),
         };
-        // The planner's per-worker `max_turns` is retained in `input` for the
-        // plan/audit contract only: DHI+ no longer caps a run by model calls,
-        // and the task budget is the only budget.
-        let attempt_tools = || {
-            let sink = WorkerSink::default();
-            let mut tools = sink.tools()?;
-            // The manager's delegation tools: one per specialist, sharing a
-            // budget that is fresh for this attempt.
-            if let Some(fleet) = &self.specialists {
-                let budget = RunBudget::new(fleet.max_delegations());
-                tools.extend(fleet.delegation_tools(budget)?);
-            }
-            Ok((sink, tools))
-        };
-        let (text, response, latency, candidate, sink) = self
-            .complete_via_pool(
-                Role::Worker,
-                input.worker_profile_id,
-                &call,
-                tool_setup.clone(),
-                &attempt_tools,
-            )
-            .await?;
-        // A worker that answered with prose never called `record_fact`, so the
-        // attempt produced no fact. Retry exactly once with a CRITICAL reminder
-        // in the system turn, a fresh sink, and fresh tools; the same tool
-        // context and registry remain attached. Only this exact finish error
-        // triggers the retry — pool and provider failures already returned
-        // above, and a locked sink is a runtime bug, not model behavior.
-        let (text, response, latency, candidate, fact, recorded_call) = match sink.finish() {
-            Ok(fact) => (text, response, latency, candidate, fact, call),
-            Err(err) if is_missing_record_fact(&err) => {
-                let retry_call = retry_with_record_fact(&call);
-                let (retry_text, retry_response, retry_latency, retry_candidate, retry_sink) = self
-                    .complete_via_pool(
-                        Role::Worker,
-                        input.worker_profile_id,
-                        &retry_call,
-                        tool_setup,
-                        &attempt_tools,
-                    )
-                    .await?;
-                // If the retry also fails, its error is returned.
-                let fact = retry_sink.finish()?;
-                // The retry is a second completion call, and its usage is the
-                // one recorded. The failed first attempt's tokens are not
-                // counted (nor is its prose used): only a fact-bearing call
-                // is billed to the run.
-                (
-                    retry_text,
-                    retry_response,
-                    retry_latency,
-                    retry_candidate,
-                    fact,
-                    retry_call,
-                )
-            }
-            Err(err) => return Err(err),
-        };
-        let thinking = response_thinking(&response);
-        let record = self.call_record(
-            Role::Worker,
-            &candidate,
-            &recorded_call.prompt_hash,
-            &response,
-            latency,
-        );
-        Ok(AgentCall {
-            output: ExecuteOutput {
-                fact,
-                tool_calls: vec![],
-            },
-            meta: AgentCallMeta {
-                usage: record.usage,
-                calls: vec![record],
-            },
-            prompt: recorded_call.user,
-            response: text,
-            thinking,
-        })
+        self.run_worker_loop(call, input.worker_profile_id, tool_setup)
+            .await
+    }
+
+    /// Runs one Swarm coordinator turn: the coordinator prompt, the worker
+    /// domain tools, and the full team tool registry.
+    async fn execute_coordinator(
+        &self,
+        input: ExecuteInput,
+        team_tools: Arc<dyn ToolServerView>,
+    ) -> anyhow::Result<AgentCall<ExecuteOutput>> {
+        let call = self.render_coordinator(&input)?;
+        let tool_setup = self.team_tool_setup(&input, &team_tools)?;
+        self.run_worker_loop(call, input.worker_profile_id, tool_setup)
+            .await
+    }
+
+    /// Runs one Swarm teammate turn: the teammate prompt, the worker domain
+    /// tools, and the role-scoped team tool registry.
+    async fn execute_teammate(
+        &self,
+        input: ExecuteInput,
+        team_tools: Arc<dyn ToolServerView>,
+    ) -> anyhow::Result<AgentCall<ExecuteOutput>> {
+        let call = self.render_teammate(&input)?;
+        let tool_setup = self.team_tool_setup(&input, &team_tools)?;
+        self.run_worker_loop(call, input.worker_profile_id, tool_setup)
+            .await
     }
 
     /// Chooses the actual DHI+ workers and subtasks through one worker-role
@@ -2175,6 +2410,49 @@ impl AgentRuntime for RigAgentRuntime {
         );
         Ok(AgentCall {
             output: choice,
+            meta: AgentCallMeta {
+                usage: record.usage,
+                calls: vec![record],
+            },
+            prompt: call.user,
+            response: text,
+            thinking,
+        })
+    }
+
+    /// Reviews one manager-worker lead turn on the planner role and profile.
+    ///
+    /// The lead gets no tools and no registry. Its JSON decision is parsed and
+    /// validated against the exact input before it reaches the runner; a parse
+    /// or validation failure fails the intent visibly instead of falling back
+    /// to a guessed decision.
+    async fn review_lead(
+        &self,
+        input: LeadReviewInput,
+    ) -> anyhow::Result<AgentCall<dhi_core::LeadDecision>> {
+        let call = self.render_lead_review(&input)?;
+        let (text, response, latency, candidate, _sink) = self
+            .complete_via_pool(
+                Role::Planner,
+                input.planner_profile_id,
+                &call,
+                ToolSetup::default(),
+                || Ok::<_, anyhow::Error>(((), Vec::new())),
+            )
+            .await?;
+        let thinking = response_thinking(&response);
+        let decision = parse_and_validate_lead_decision(&text, &input.input).map_err(|err| {
+            anyhow::anyhow!("lead review failed for intent {}: {err}", input.intent_id)
+        })?;
+        let record = self.call_record(
+            Role::Planner,
+            &candidate,
+            &call.prompt_hash,
+            &response,
+            latency,
+        );
+        Ok(AgentCall {
+            output: decision,
             meta: AgentCallMeta {
                 usage: record.usage,
                 calls: vec![record],
@@ -2237,6 +2515,14 @@ mod tests {
         PromptSet::load(&dir).expect("ops/prompts loads")
     }
 
+    struct EmptyToolView;
+
+    impl crate::tools::ToolServerView for EmptyToolView {
+        fn tool_server(&self) -> ToolServerHandle {
+            ToolServer::new().run()
+        }
+    }
+
     /// A runtime built from explicit profiles: no environment, no network.
     fn runtime_with(planner_model: &str, worker_model: &str) -> RigAgentRuntime {
         let mut profiles = RoleProfiles::default();
@@ -2294,6 +2580,9 @@ mod tests {
             context: vec!["fact 89abcdef: bishop on c1".to_string()],
             worker_profile_id: None,
             max_turns: None,
+            agent_id: None,
+            role: None,
+            task: None,
         }
     }
 
@@ -2937,37 +3226,169 @@ mod tests {
             })
         };
 
-        for (workers, subtasks) in [(2, 2), (4, 3), (3, 2)] {
+        for (workers, subtasks) in [(2, 2), (4, 3), (4, 4)] {
             let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::Swarm), Some(3));
             let tools = sink.tools().expect("planner tools build");
             let err = tools[0]
                 .run(plan_args(workers, subtasks))
                 .await
-                .expect_err("a mismatched swarm count must be a tool error");
+                .expect_err("a mismatched swarm shape must be a tool error");
             assert!(
                 format!("{err}").contains("required swarm worker count 3"),
                 "{workers}/{subtasks}: {err}"
             );
             assert!(
-                format!("{err}").contains("retry with exactly 3 workers and 3 subtasks"),
+                format!("{err}").contains("retry with exactly 3 workers and 0..=3 subtasks"),
                 "{workers}/{subtasks}: {err}"
             );
         }
 
-        let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::Swarm), Some(3));
+        // Seed subtasks are optional: zero up to N is valid for a fixed swarm.
+        for subtasks in [0, 2, 3] {
+            let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::Swarm), Some(3));
+            let tools = sink.tools().expect("planner tools build");
+            tools[0]
+                .run(plan_args(3, subtasks))
+                .await
+                .expect("a plan with exactly three workers accepts optional seeds");
+            let PlanOutcome::AddIntent {
+                plan: Some(plan), ..
+            } = sink.finish("ignored after a tool call")
+            else {
+                panic!("expected a plan");
+            };
+            assert_eq!(plan.workers.len(), 3);
+            assert_eq!(plan.subtasks.len(), subtasks);
+        }
+
+        // Omitting subtasks is the same as zero seeds.
+        let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::Swarm), Some(2));
         let tools = sink.tools().expect("planner tools build");
         tools[0]
-            .run(plan_args(3, 3))
+            .run(serde_json::json!({
+                "description": "split the research",
+                "plan": {
+                    "topology": "swarm",
+                    "workers": [
+                        {"key":"worker-0","role":"researcher","prompt":"work","max_turns":2},
+                        {"key":"worker-1","role":"researcher","prompt":"work","max_turns":2}
+                    ]
+                }
+            }))
             .await
-            .expect("a plan with the exact count is accepted on retry");
+            .expect("the subtasks field is optional");
         let PlanOutcome::AddIntent {
             plan: Some(plan), ..
         } = sink.finish("ignored after a tool call")
         else {
             panic!("expected a plan");
         };
-        assert_eq!(plan.workers.len(), 3);
-        assert_eq!(plan.subtasks.len(), 3);
+        assert!(plan.subtasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_intent_rejects_an_out_of_range_swarm_count() {
+        for workers in [1, 65] {
+            let sink =
+                PlannerSink::with_requirements(Some(dhi_core::Topology::Swarm), Some(workers));
+            let tools = sink.tools().expect("planner tools build");
+            let err = tools[0]
+                .run(serde_json::json!({
+                    "description": "split the research",
+                    "plan": {
+                        "topology": "swarm",
+                        "workers": [
+                            {
+                                "key": "worker-0",
+                                "role": "researcher",
+                                "prompt": "work",
+                                "max_turns": 2
+                            },
+                            {
+                                "key": "worker-1",
+                                "role": "researcher",
+                                "prompt": "work",
+                                "max_turns": 2
+                            }
+                        ],
+                        "subtasks": []
+                    }
+                }))
+                .await
+                .expect_err("a fixed swarm count outside 2..=64 is rejected");
+            assert!(format!("{err}").contains("outside 2..=64"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_swarm_nine_accepts_an_empty_seed_with_raised_limits() {
+        let workers: Vec<serde_json::Value> = (0..9)
+            .map(|n| {
+                serde_json::json!({
+                    "key": format!("worker-{n}"),
+                    "role": "researcher",
+                    "prompt": "do the work",
+                    "max_turns": 4
+                })
+            })
+            .collect();
+        let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::Swarm), Some(9));
+        let tools = sink.tools().expect("planner tools build");
+        tools[0]
+            .run(serde_json::json!({
+                "description": "split the research",
+                "plan": {
+                    "topology": "swarm",
+                    "workers": workers,
+                    "limits": {
+                        "max_workers": 9,
+                        "max_parallel": 9,
+                        "max_rounds": 4,
+                        "max_messages": 64
+                    }
+                }
+            }))
+            .await
+            .expect("a fixed nine-worker swarm may start with zero seed tasks");
+        let PlanOutcome::AddIntent {
+            plan: Some(plan), ..
+        } = sink.finish("ignored after a tool call")
+        else {
+            panic!("expected a plan");
+        };
+        assert_eq!(plan.workers.len(), 9);
+        assert!(plan.subtasks.is_empty());
+        assert_eq!(plan.limits.max_workers, 9);
+        assert_eq!(plan.limits.max_parallel, 9);
+    }
+
+    #[tokio::test]
+    async fn add_intent_accepts_a_manager_worker_plan_with_zero_initial_tasks() {
+        let sink = PlannerSink::with_requirements(Some(dhi_core::Topology::ManagerWorker), None);
+        let tools = sink.tools().expect("planner tools build");
+        tools[0]
+            .run(serde_json::json!({
+                "description": "lead the work",
+                "plan": {
+                    "topology": "manager_worker",
+                    "workers": [
+                        {"key":"alpha","role":"researcher","prompt":"research","max_turns":2},
+                        {"key":"beta","role":"reviewer","prompt":"review","max_turns":2}
+                    ],
+                    "subtasks": [],
+                    "limits": {"max_workers": 2, "max_parallel": 2, "max_rounds": 2, "max_messages": 8}
+                }
+            }))
+            .await
+            .expect("a manager-worker lead plan may start with zero tasks");
+        let PlanOutcome::AddIntent {
+            plan: Some(plan), ..
+        } = sink.finish("ignored after a tool call")
+        else {
+            panic!("expected a plan");
+        };
+        assert!(plan.subtasks.is_empty());
+        assert_eq!(plan.workers.len(), 2);
     }
 
     #[tokio::test]
@@ -3000,6 +3421,14 @@ mod tests {
                 "subtasks": [subtask.clone()]
             }
         });
+        let one_worker_swarm = serde_json::json!({
+            "description": "review the patch",
+            "plan": {
+                "topology": "swarm",
+                "workers": [worker.clone()],
+                "subtasks": []
+            }
+        });
         let unknown_worker = serde_json::json!({
             "description": "review the patch",
             "plan": {
@@ -3013,7 +3442,12 @@ mod tests {
             }
         });
 
-        for args in [invalid_topology, zero_workers, unknown_worker] {
+        for args in [
+            invalid_topology,
+            zero_workers,
+            one_worker_swarm,
+            unknown_worker,
+        ] {
             let sink = PlannerSink::default();
             let tools = sink.tools().expect("planner tools build");
             assert!(
@@ -3127,6 +3561,9 @@ mod tests {
                 context: vec![],
                 worker_profile_id: None,
                 max_turns: None,
+                agent_id: None,
+                role: None,
+                task: None,
             })
             .await
             .unwrap();
@@ -3354,6 +3791,154 @@ mod tests {
     fn manager_choice_rejects_non_json_text() {
         let err = parse_manager_choice("I choose alpha.").expect_err("there is no JSON object");
         assert!(err.to_string().contains("no JSON object"), "{err}");
+    }
+
+    #[test]
+    fn lead_render_uses_the_manager_prompt_and_planner_role() {
+        let runtime = runtime_with("river-planner", "river-worker");
+        let plan = manager_plan();
+        let input = dhi_core::LeadInput {
+            intent: plan.intent.clone(),
+            workers: plan.workers.clone(),
+            tasks: Vec::new(),
+            results: Vec::new(),
+            round: 1,
+            limits: dhi_core::LeadLimits::from_capabilities(&plan.limits, 0),
+            remaining: dhi_core::LeadBudget {
+                remaining_rounds: 3,
+                remaining_lead_turns: 4,
+                remaining_worker_runs: 8,
+            },
+        };
+        let call = runtime
+            .render_lead_review(&LeadReviewInput {
+                task_id: Uuid::new_v4(),
+                intent_id: Uuid::new_v4(),
+                input,
+                planner_profile_id: None,
+            })
+            .expect("the lead renders");
+
+        assert_eq!(call.role, Role::Planner);
+        assert_eq!(call.model, "river-planner");
+        assert!(
+            call.system.contains("manager-worker lead"),
+            "{}",
+            call.system
+        );
+        assert!(call.system.contains("ask_worker"), "{}", call.system);
+        assert!(call.user.contains("review the patch"), "{}", call.user);
+        assert!(call.user.contains("\"round\":1"), "{}", call.user);
+        assert!(call.prompt_hash.starts_with("manager@"));
+        assert!(!call.system.contains("{{"));
+        assert!(!call.user.contains("{{"));
+    }
+
+    #[tokio::test]
+    async fn mock_runtime_refuses_a_lead_review() {
+        let plan = manager_plan();
+        let input = dhi_core::LeadInput {
+            intent: plan.intent.clone(),
+            workers: plan.workers.clone(),
+            tasks: Vec::new(),
+            results: Vec::new(),
+            round: 1,
+            limits: dhi_core::LeadLimits::default(),
+            remaining: dhi_core::LeadBudget::default(),
+        };
+        let err = MockAgentRuntime
+            .review_lead(LeadReviewInput {
+                task_id: Uuid::new_v4(),
+                intent_id: Uuid::new_v4(),
+                input,
+                planner_profile_id: None,
+            })
+            .await
+            .expect_err("the mock does not decide a lead loop");
+        assert!(err.to_string().contains("not supported"), "{err}");
+    }
+
+    #[test]
+    fn coordinator_render_uses_the_team_prompt_and_worker_role() {
+        let runtime = runtime_with("river-planner", "river-worker");
+        let mut input = execute_input();
+        input.intent = "ship the swarm runtime".to_string();
+        input.context = vec![
+            "fact 89abcdef: the board is persisted".to_string(),
+            "Team cap: 8 teammates".to_string(),
+        ];
+        let call = runtime
+            .render_coordinator(&input)
+            .expect("coordinator renders");
+
+        assert_eq!(call.role, Role::Worker);
+        assert_eq!(call.model, "river-worker");
+        assert!(
+            call.system.contains("DHI+ Swarm team"),
+            "the coordinator contract is the system turn: {}",
+            call.system
+        );
+        assert!(
+            !call.system.contains("ship the swarm runtime"),
+            "the objective is the user turn, not the system prompt: {}",
+            call.system
+        );
+        assert!(
+            call.user.contains("ship the swarm runtime")
+                && call.user.contains("board is persisted"),
+            "the objective and context are the user turn: {}",
+            call.user
+        );
+        assert!(call.prompt_hash.starts_with("coordinator@"));
+        assert!(!call.system.contains("{{"));
+        assert!(!call.user.contains("{{"));
+    }
+
+    #[test]
+    fn teammate_render_uses_the_teammate_prompt_and_identity() {
+        let runtime = runtime_with("river-planner", "river-worker");
+        let mut input = execute_input();
+        input.intent = "ship the swarm runtime".to_string();
+        input.agent_id = Some("worker-1".to_string());
+        input.role = Some("teammate".to_string());
+        input.task = Some("audit the parser".to_string());
+        input.context = vec!["fact 89abcdef: the board is persisted".to_string()];
+        let call = runtime.render_teammate(&input).expect("teammate renders");
+
+        assert_eq!(call.role, Role::Worker);
+        assert!(
+            call.system.contains("DHI+ Swarm team") && !call.system.contains("worker-1"),
+            "the static teammate contract is the system turn: {}",
+            call.system
+        );
+        assert!(
+            call.user.contains("worker-1") && call.user.contains("audit the parser"),
+            "the teammate id and assigned task are the user turn: {}",
+            call.user
+        );
+        assert!(call.user.contains("ship the swarm runtime"));
+        assert!(call.prompt_hash.starts_with("teammate@"));
+        assert!(!call.system.contains("{{"));
+        assert!(!call.user.contains("{{"));
+    }
+
+    #[tokio::test]
+    async fn mock_coordinator_and_teammate_fall_back_to_execute() {
+        let mut input = execute_input();
+        input.agent_id = Some("worker-1".to_string());
+        input.role = Some("teammate".to_string());
+        input.task = Some("audit the parser".to_string());
+        let view: Arc<dyn ToolServerView> = Arc::new(EmptyToolView);
+        let coordinator = MockAgentRuntime
+            .execute_coordinator(input.clone(), view.clone())
+            .await
+            .expect("the default coordinator delegates to execute");
+        assert!(coordinator.output.fact.summary.contains("Executed intent"));
+        let teammate = MockAgentRuntime
+            .execute_teammate(input, view)
+            .await
+            .expect("the default teammate delegates to execute");
+        assert!(teammate.output.fact.summary.contains("Executed intent"));
     }
 
     #[tokio::test]

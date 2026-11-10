@@ -17,7 +17,13 @@
  *   state when a concurrent decision/expiry won).
  */
 
-import type { ApprovalDecision } from "./types.ts";
+import type { ApprovalDecision, ApprovalItem } from "./types.ts";
+import {
+  isScaleApprovalPending,
+  SCALE_APPROVAL_DEFAULT_CAP,
+  scaleApprovalStatusLabel,
+  type ScaleApproval,
+} from "./teamTypes.ts";
 
 // ---------------------------------------------------------------------------
 // Tunables
@@ -81,6 +87,128 @@ export function buildDecisionRequest(
     path: `/approvals/${encodeURIComponent(trimmedId)}/decision`,
     body: { decision },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Scale approval request builder
+// ---------------------------------------------------------------------------
+
+/** Result of {@link buildScaleDecisionRequest}. */
+export type ScaleDecisionRequest =
+  | { ok: true; path: string; body: { decision: ApprovalDecision } }
+  | { ok: false; error: string };
+
+/**
+ * Validates and shapes `POST /api/scale-approvals/{id}/decision`.
+ *
+ * Wire truth: the body is the same `{ decision: "allow" | "deny" }` enum as a
+ * tool approval. The preview card only offers those two typed values, so the
+ * rejection branch guards tests and future callers.
+ */
+export function buildScaleDecisionRequest(
+  id: unknown,
+  decision: unknown,
+): ScaleDecisionRequest {
+  const trimmedId = typeof id === "string" ? id.trim() : "";
+  if (trimmedId === "") {
+    return { ok: false, error: "Scale approval id is required." };
+  }
+  if (decision !== "allow" && decision !== "deny") {
+    return {
+      ok: false,
+      error: `decision must be "allow" or "deny", got: ${
+        typeof decision === "string" ? JSON.stringify(decision) : typeof decision
+      }`,
+    };
+  }
+  return {
+    ok: true,
+    path: `/scale-approvals/${encodeURIComponent(trimmedId)}/decision`,
+    body: { decision },
+  };
+}
+
+/** Queue summary for one scale request: `12 requested · cap 8`. */
+export function scaleApprovalSummary(
+  approval: Pick<ScaleApproval, "requested_workers" | "current_cap" | "status">,
+): string {
+  const cap =
+    approval.current_cap > 0
+      ? approval.current_cap
+      : SCALE_APPROVAL_DEFAULT_CAP;
+  return `${approval.requested_workers} requested · cap ${cap} · ${scaleApprovalStatusLabel(
+    approval.status,
+  ).toLowerCase()}`;
+}
+
+// ---------------------------------------------------------------------------
+// Unified queue
+// ---------------------------------------------------------------------------
+
+/** One row in the shared approvals queue, tagged by its approval family. */
+export type ApprovalQueueRow =
+  | {
+      kind: "tool";
+      key: string;
+      createdAt: string;
+      item: ApprovalItem;
+    }
+  | {
+      kind: "scale";
+      key: string;
+      createdAt: string;
+      item: ScaleApproval;
+    };
+
+/** Stable React key / inflight key for one queue row. */
+export function approvalQueueKey(kind: "tool" | "scale", id: string): string {
+  return `${kind}:${id}`;
+}
+
+/**
+ * Merges pending tool approvals and pending scale approvals into one queue,
+ * oldest first. Decided scale rows are ignored; the tool route already only
+ * serves pending rows. Missing timestamps sort last.
+ */
+export function buildApprovalQueue(
+  toolApprovals: readonly ApprovalItem[],
+  scaleApprovals: readonly ScaleApproval[],
+): ApprovalQueueRow[] {
+  const rows: ApprovalQueueRow[] = [];
+  for (const item of toolApprovals) {
+    if (item.status !== "pending") {
+      continue;
+    }
+    rows.push({
+      kind: "tool",
+      key: approvalQueueKey("tool", item.id),
+      createdAt: item.created_at,
+      item,
+    });
+  }
+  for (const item of scaleApprovals) {
+    if (!isScaleApprovalPending(item)) {
+      continue;
+    }
+    rows.push({
+      kind: "scale",
+      key: approvalQueueKey("scale", item.id),
+      createdAt: item.created_at ?? "",
+      item,
+    });
+  }
+  return rows.sort((a, b) => {
+    if (a.createdAt === "" && b.createdAt !== "") {
+      return 1;
+    }
+    if (b.createdAt === "" && a.createdAt !== "") {
+      return -1;
+    }
+    if (a.createdAt !== b.createdAt) {
+      return a.createdAt < b.createdAt ? -1 : 1;
+    }
+    return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+  });
 }
 
 // ---------------------------------------------------------------------------

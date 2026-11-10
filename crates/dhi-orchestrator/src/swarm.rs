@@ -58,6 +58,9 @@ pub struct SwarmStats {
 /// typed findings, and record results on the shared board. The coordinator
 /// only applies stop rules and shuts the swarm down; it never picks worker
 /// assignments after seeding.
+///
+/// This legacy peer swarm requires at least one seed subtask. A zero-seed
+/// swarm has no first turn and must use the Cline Teams shared-state runner.
 pub struct SwarmRunner<E> {
     executor: Arc<E>,
     aggregator: Arc<dyn Aggregator>,
@@ -151,7 +154,7 @@ impl<E: WorkerExecutor + 'static> SwarmRunner<E> {
         let (report_tx, mut report_rx) = mpsc::unbounded_channel::<WorkerReport>();
         let mut tasks = JoinSet::new();
         let mut identities: HashMap<Id, (String, String)> = HashMap::with_capacity(worker_count);
-        let seeds = swarm_seeds(plan);
+        let seeds = swarm_seeds(plan)?;
 
         for (index, worker) in plan.workers.iter().cloned().enumerate() {
             let seed = seeds[index].clone();
@@ -322,7 +325,17 @@ fn stop_reason(
 /// rejects a duplicate key and unknown keys). Unassigned subtasks fill the
 /// remaining workers in plan order; when there are fewer subtasks than
 /// workers, the planner's list cycles, as the runner's contract documents.
-fn swarm_seeds(plan: &IntentPlan) -> Vec<Subtask> {
+///
+/// The legacy peer swarm needs at least one seed subtask: without one it has
+/// no work to start and cannot derive a stopping point. A zero-seed swarm is
+/// the Cline Teams shared-state model and must run through the team runtime.
+fn swarm_seeds(plan: &IntentPlan) -> anyhow::Result<Vec<Subtask>> {
+    if plan.subtasks.is_empty() {
+        anyhow::bail!(
+            "legacy peer swarm needs at least one seed subtask; \
+             zero-seed swarms must use the team runtime"
+        );
+    }
     let mut explicit: HashMap<&str, Subtask> = HashMap::new();
     for subtask in &plan.subtasks {
         if let Some(key) = subtask.worker_key.as_deref() {
@@ -337,7 +350,8 @@ fn swarm_seeds(plan: &IntentPlan) -> Vec<Subtask> {
         .collect();
     let mut next_unassigned = 0usize;
 
-    plan.workers
+    let seeds: Vec<Subtask> = plan
+        .workers
         .iter()
         .enumerate()
         .map(|(index, worker)| {
@@ -351,7 +365,8 @@ fn swarm_seeds(plan: &IntentPlan) -> Vec<Subtask> {
             }
             plan.subtasks[index % plan.subtasks.len()].clone()
         })
-        .collect()
+        .collect();
+    Ok(seeds)
 }
 
 /// Wait until every live worker reports the current round, or until workers
@@ -887,7 +902,7 @@ mod tests {
             limits: crate::CapabilityLimits::default(),
         };
 
-        let seeds = swarm_seeds(&plan);
+        let seeds = swarm_seeds(&plan).expect("explicit seeds resolve");
         assert_eq!(seeds[0].id, "s1");
         assert_eq!(seeds[1].id, "s0");
     }
@@ -906,10 +921,32 @@ mod tests {
             limits: crate::CapabilityLimits::default(),
         };
 
-        let seeds = swarm_seeds(&plan);
+        let seeds = swarm_seeds(&plan).expect("cyclic seeds resolve");
         assert_eq!(seeds.len(), 2);
         assert_eq!(seeds[0].id, "s0");
         assert_eq!(seeds[1].id, "s0");
+    }
+
+    #[test]
+    fn zero_seed_swarm_requires_the_team_runtime() {
+        let plan = IntentPlan {
+            intent: "zero-seed swarm".to_string(),
+            topology: crate::Topology::Swarm,
+            workers: vec![worker_spec("alpha"), worker_spec("beta")],
+            subtasks: Vec::new(),
+            limits: crate::CapabilityLimits::default(),
+        };
+
+        let error = swarm_seeds(&plan).expect_err("legacy swarm needs a seed");
+        let message = error.to_string();
+        assert!(
+            message.contains("at least one seed subtask"),
+            "the guard names the missing seed: {message}"
+        );
+        assert!(
+            message.contains("team runtime"),
+            "the guard names the replacement runtime: {message}"
+        );
     }
 
     #[test]

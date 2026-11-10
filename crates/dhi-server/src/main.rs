@@ -7,14 +7,16 @@ use async_trait::async_trait;
 use dhi_agent::{
     AgentRuntime, GuardedToolSpec, LlmPool, MockAgentRuntime, PromptSet, RigAgentRuntime, ToolSink,
 };
-use dhi_core::{GraphStore, GuardStore};
+use dhi_core::team::TeamStore;
+use dhi_core::{GraphStore, GuardStore, ScaleApprovalGate};
 use dhi_engine::Engine;
 use dhi_exec::{CodingTools, ContainerConfig, TaskContainers};
 use dhi_guard::{GuardedExecutor, SharedPolicy, ToolBackend};
 use dhi_pty::PtyTools;
 use dhi_server::{
     AppState, GuardedToolSink, SUPERVISOR_INTERVAL, TaskRunRegistry, build_guard_policy,
-    build_pool_snapshot, recover_tasks_with_registry, router_with_web_ui, run_supervisor,
+    build_pool_snapshot, recover_tasks_with_registry, router_with_web_ui,
+    run_supervisor_with_scale,
 };
 use dhi_store::Store;
 use dhi_store::mgmt::{BootstrapSeed, DEFAULT_APPROVAL_TIMEOUT_SECS};
@@ -400,6 +402,17 @@ async fn main() -> anyhow::Result<()> {
         folders = ?project_folders.paths(),
         "project folders configured"
     );
+    // Browser-folder web projects are opt-in. A configured root must already
+    // exist or be creatable, be writable, and must not be a symlink. The same
+    // absolute path must be visible to this process and the Docker daemon:
+    // each web project's folder is passed to the existing project mount
+    // unchanged.
+    let web_projects = Arc::new(dhi_server::web_projects::WebProjects::from_env()?);
+    info!(
+        root = ?web_projects.root(),
+        enabled = web_projects.enabled(),
+        "web project storage configured"
+    );
 
     let app_dsn = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://dhi_app:dhi_app@127.0.0.1:5432/dhi".to_string());
@@ -745,12 +758,23 @@ async fn main() -> anyhow::Result<()> {
         no_progress_rounds = DEFAULT_ENGINE_NO_PROGRESS_ROUNDS,
         "engine round budgets configured"
     );
-    let engine = Arc::new(
-        Engine::new(store.clone(), agent.clone())
-            .with_executor(executor, guard_store.clone())
-            .with_max_rounds(DEFAULT_ENGINE_MAX_ROUNDS)
-            .with_max_no_progress_rounds(DEFAULT_ENGINE_NO_PROGRESS_ROUNDS),
-    );
+    let team_store: Arc<dyn TeamStore> = store.clone();
+    let scale_gate: Arc<dyn ScaleApprovalGate> = store.clone();
+    let web_project_store: Arc<dyn dhi_server::web_projects::WebProjectStore> = store.clone();
+    let lead_runtime = agent.name() == "rig";
+    let mut engine = Engine::new(store.clone(), agent.clone())
+        .with_executor(executor, guard_store.clone())
+        .with_max_rounds(DEFAULT_ENGINE_MAX_ROUNDS)
+        .with_max_no_progress_rounds(DEFAULT_ENGINE_NO_PROGRESS_ROUNDS)
+        .with_scale_gate(scale_gate.clone());
+    if lead_runtime {
+        // The lead/team runtimes are opt-in: the mock runtime refuses both
+        // reviews, so a degraded boot keeps the selector and peer-swarm paths.
+        engine = engine
+            .with_lead_runtime()
+            .with_team_store(team_store.clone());
+    }
+    let engine = Arc::new(engine);
 
     // Restart recovery: deny stale approvals, release running intents, and
     // restart every non-terminal task loop. Nothing serves traffic until it
@@ -765,10 +789,12 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // The approval supervisor: a fixed-interval sweep of every non-terminal
-    // task, so an overdue approval expires without a human decision.
-    tokio::spawn(run_supervisor(
+    // task plus the global `swarm_scale` queue, so an overdue approval expires
+    // without a human decision.
+    tokio::spawn(run_supervisor_with_scale(
         store.clone(),
         engine.clone(),
+        Some(store.clone()),
         SUPERVISOR_INTERVAL,
     ));
 
@@ -795,6 +821,10 @@ async fn main() -> anyhow::Result<()> {
         web: web_runtime,
         task_runs,
         project_folders,
+        web_projects,
+        web_project_store: Some(web_project_store),
+        team_store: Some(team_store),
+        scale_gate: Some(scale_gate),
     };
 
     let bind = std::env::var("DHI_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());

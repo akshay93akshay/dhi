@@ -73,44 +73,58 @@ impl WorkerExecutor for RuntimeWorkerExecutor {
                 context,
                 worker_profile_id: self.worker_profile_id,
                 max_turns: Some(worker.max_turns),
+                agent_id: None,
+                role: None,
+                task: None,
             })
             .await;
 
-        match executed {
-            Ok(call) => {
-                let dhi_agent::AgentCall {
-                    output,
-                    meta,
-                    prompt,
-                    response,
-                    thinking,
-                } = call;
-                let fact = output.fact;
-                let evidence = fact_evidence(&fact);
-                let mut result = WorkerResult::ok(
-                    worker.key.clone(),
-                    subtask.id.clone(),
-                    fact.summary,
-                    evidence,
-                );
-                // Audit is best-effort data: an empty field never fails the
-                // worker, and the engine skips results with no call records.
-                result.call_meta = meta;
-                result.prompt = prompt;
-                result.response = response;
-                result.thinking = thinking;
-                // Post-hoc tool calls travel with the result; the engine's
-                // guard is the only thing that may execute them.
-                result.tool_calls = output.tool_calls;
-                Ok(result)
-            }
-            // One failing worker never aborts the team: the runners turn this
-            // into a failed result and the remaining workers keep running.
-            Err(error) => Ok(WorkerResult::failed(
+        Ok(worker_result_from_call(worker, subtask, executed))
+    }
+}
+
+/// Maps one runtime call onto the runner's worker result.
+///
+/// The teammate executor and the normal worker executor share this so run
+/// rows, call metadata, prompt/response audit, and post-hoc tool calls keep
+/// exactly the same shape on both paths.
+pub(crate) fn worker_result_from_call(
+    worker: &WorkerSpec,
+    subtask: &Subtask,
+    executed: anyhow::Result<dhi_agent::AgentCall<dhi_agent::ExecuteOutput>>,
+) -> WorkerResult {
+    match executed {
+        Ok(call) => {
+            let dhi_agent::AgentCall {
+                output,
+                meta,
+                prompt,
+                response,
+                thinking,
+            } = call;
+            let fact = output.fact;
+            let evidence = fact_evidence(&fact);
+            let mut result = WorkerResult::ok(
                 worker.key.clone(),
                 subtask.id.clone(),
-                error.to_string(),
-            )),
+                fact.summary,
+                evidence,
+            );
+            // Audit is best-effort data: an empty field never fails the
+            // worker, and the engine skips results with no call records.
+            result.call_meta = meta;
+            result.prompt = prompt;
+            result.response = response;
+            result.thinking = thinking;
+            // Post-hoc tool calls travel with the result; the engine's
+            // guard is the only thing that may execute them.
+            result.tool_calls = output.tool_calls;
+            result
+        }
+        // One failing worker never aborts the team: the runners turn this
+        // into a failed result and the remaining workers keep running.
+        Err(error) => {
+            WorkerResult::failed(worker.key.clone(), subtask.id.clone(), error.to_string())
         }
     }
 }

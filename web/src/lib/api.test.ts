@@ -20,6 +20,7 @@ import {
   getTaskActivity,
   getTaskUsage,
   getTaskWork,
+  getTeamMessages,
   getWebProviders,
   listApprovals,
   listInstructions,
@@ -523,6 +524,37 @@ test("getSwarmMessages unwraps { messages } and forwards the limit", async () =>
   assert.equal(recorder.calls[0]?.init?.method, undefined);
   assert.deepEqual(defaulted, [record]);
   assert.deepEqual(explicit, [record]);
+});
+
+test("getTeamMessages unwraps the team-messages envelope", async () => {
+  const record = {
+    id: 9,
+    team_id: "team-1",
+    from_agent_id: "coordinator",
+    to_agent_id: null,
+    subject: "Kickoff",
+    body: "Start with the sources.",
+    task_id: null,
+    created_at: "2026-11-10T10:00:00Z",
+    read_at: null,
+  };
+  const recorder = stubFetch(() => jsonResponse({ messages: [record] }));
+
+  const messages = await getTeamMessages(sampleTask.id);
+
+  assert.deepEqual(recorder.urls, [
+    `/api/tasks/${sampleTask.id}/team/messages`,
+  ]);
+  assert.equal(recorder.calls[0]?.init?.method, undefined);
+  assert.deepEqual(messages, [record]);
+});
+
+test("getTeamMessages folds a missing team into an empty graph", async () => {
+  stubFetch(() => jsonResponse({ error: "team not found" }, 404));
+
+  const messages = await getTeamMessages(sampleTask.id);
+
+  assert.deepEqual(messages, []);
 });
 
 const sampleInstruction = {

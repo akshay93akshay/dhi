@@ -11,6 +11,7 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use dhi_agent::{LlmPool, MockAgentRuntime, PoolSnapshot};
+use dhi_core::team::{NewTeamMessage, NewTeamTask, TeamMember, TeamRole, TeamStore};
 use dhi_core::{GraphStore, GuardStore};
 use dhi_engine::Engine;
 use dhi_guard::{Policy, SharedPolicy};
@@ -68,6 +69,10 @@ async fn live_state(pool: sqlx::PgPool) -> (AppState, Arc<Store>, SharedPolicy) 
         web: Arc::new(dhi_server::web_providers::WebProviderRuntime::empty()),
         task_runs: Arc::new(dhi_server::TaskRunRegistry::disabled()),
         project_folders: Arc::new(dhi_server::project_folders::ProjectFolders::default()),
+        web_projects: Arc::new(dhi_server::web_projects::WebProjects::default()),
+        web_project_store: None,
+        team_store: None,
+        scale_gate: None,
     };
     (state, store, guard)
 }
@@ -104,6 +109,10 @@ async fn bare_state(pool: sqlx::PgPool) -> (AppState, Arc<Store>) {
         web: Arc::new(dhi_server::web_providers::WebProviderRuntime::empty()),
         task_runs: Arc::new(dhi_server::TaskRunRegistry::disabled()),
         project_folders: Arc::new(dhi_server::project_folders::ProjectFolders::default()),
+        web_projects: Arc::new(dhi_server::web_projects::WebProjects::default()),
+        web_project_store: None,
+        team_store: None,
+        scale_gate: None,
     };
     (state, store)
 }
@@ -947,6 +956,10 @@ async fn management_routes_degrade_without_mgmt_store(pg: sqlx::PgPool) {
         web: Arc::new(dhi_server::web_providers::WebProviderRuntime::empty()),
         task_runs: Arc::new(dhi_server::TaskRunRegistry::disabled()),
         project_folders: Arc::new(dhi_server::project_folders::ProjectFolders::default()),
+        web_projects: Arc::new(dhi_server::web_projects::WebProjects::default()),
+        web_project_store: None,
+        team_store: None,
+        scale_gate: None,
     };
     let app = router(state);
 
@@ -956,4 +969,139 @@ async fn management_routes_degrade_without_mgmt_store(pg: sqlx::PgPool) {
 
     let (status, _) = send(app, get("/api/health")).await;
     assert_eq!(status, StatusCode::OK, "core routes are unaffected");
+}
+
+// ---------- Swarm team messages ----------
+
+/// The read-only messages route lists every direction in insertion order,
+/// keeps broadcasts at `to_agent_id = null`, and exposes the durable
+/// `sent_at` as the contract's `created_at`.
+#[sqlx::test(migrations = "../dhi-store/migrations")]
+async fn team_messages_route_lists_both_directions_oldest_first(pg: sqlx::PgPool) {
+    let (mut state, store, _guard) = live_state(pg).await;
+    let task = store.create_task("read the swarm mailbox").await.unwrap();
+    let team_store: Arc<dyn TeamStore> = store.clone();
+
+    team_store
+        .upsert_team_member(&TeamMember::new(
+            task.id,
+            "lead",
+            TeamRole::Lead,
+            "owns the outcome",
+        ))
+        .await
+        .unwrap();
+    team_store
+        .upsert_team_member(&TeamMember::new(
+            task.id,
+            "w0",
+            TeamRole::Teammate,
+            "collects evidence",
+        ))
+        .await
+        .unwrap();
+    let board_task = team_store
+        .create_team_task(&NewTeamTask::new(task.id, "collect", "lead"))
+        .await
+        .unwrap();
+
+    let handoff = team_store
+        .send_team_message(
+            &NewTeamMessage::direct(task.id, "lead", "w0", "handoff", "please collect")
+                .with_task(board_task.id),
+        )
+        .await
+        .unwrap();
+    let reply = team_store
+        .send_team_message(&NewTeamMessage::direct(
+            task.id,
+            "w0",
+            "lead",
+            "reply",
+            "collected",
+        ))
+        .await
+        .unwrap();
+    let broadcast = team_store
+        .broadcast_team_message(&NewTeamMessage::broadcast(
+            task.id, "lead", "status", "started",
+        ))
+        .await
+        .unwrap();
+    team_store
+        .mark_team_message_read(task.id, reply.id, "lead")
+        .await
+        .unwrap();
+
+    state.team_store = Some(team_store);
+    let app = router(state);
+
+    let (status, body) = send(app, get(&format!("/api/tasks/{}/team/messages", task.id))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let messages = body["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 3, "{body}");
+    let ids: Vec<i64> = messages
+        .iter()
+        .map(|message| message["id"].as_i64().expect("numeric message id"))
+        .collect();
+    assert_eq!(
+        ids,
+        vec![handoff.id, reply.id, broadcast.id],
+        "oldest first by created_at, then id: {body}"
+    );
+
+    let handoff_row = &messages[0];
+    assert_eq!(handoff_row["team_id"], task.id.to_string());
+    assert_eq!(handoff_row["from_agent_id"], "lead");
+    assert_eq!(handoff_row["to_agent_id"], "w0");
+    assert_eq!(handoff_row["subject"], "handoff");
+    assert_eq!(handoff_row["body"], "please collect");
+    assert_eq!(handoff_row["task_id"], board_task.id.to_string());
+    assert!(handoff_row["read_at"].is_null());
+    assert!(handoff_row["created_at"].is_string(), "{body}");
+    assert!(
+        handoff_row.get("sent_at").is_none(),
+        "the route exposes created_at, not sent_at: {body}"
+    );
+
+    let reply_row = &messages[1];
+    assert_eq!(reply_row["from_agent_id"], "w0");
+    assert_eq!(reply_row["to_agent_id"], "lead");
+    assert!(reply_row["read_at"].is_string(), "{body}");
+    assert!(reply_row["task_id"].is_null());
+
+    let broadcast_row = &messages[2];
+    assert_eq!(broadcast_row["from_agent_id"], "lead");
+    assert!(
+        broadcast_row["to_agent_id"].is_null(),
+        "a broadcast has no recipient: {body}"
+    );
+    assert!(broadcast_row["created_at"].is_string(), "{body}");
+}
+
+/// A task with no team members is a 404, exactly like the other team routes.
+#[sqlx::test(migrations = "../dhi-store/migrations")]
+async fn team_messages_route_is_404_without_a_team(pg: sqlx::PgPool) {
+    let (mut state, store, _guard) = live_state(pg).await;
+    let task = store.create_task("no team yet").await.unwrap();
+    let team_store: Arc<dyn TeamStore> = store.clone();
+    state.team_store = Some(team_store);
+    let app = router(state);
+
+    let (status, body) = send(app, get(&format!("/api/tasks/{}/team/messages", task.id))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(body["error"].is_string());
+}
+
+/// No wired team store is a 503, consistent with the other team routes.
+#[sqlx::test(migrations = "../dhi-store/migrations")]
+async fn team_messages_route_is_503_without_a_team_store(pg: sqlx::PgPool) {
+    let (state, store, _guard) = live_state(pg).await;
+    let task = store.create_task("no team store").await.unwrap();
+    let app = router(state);
+
+    let (status, body) = send(app, get(&format!("/api/tasks/{}/team/messages", task.id))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(body["error"].is_string());
 }

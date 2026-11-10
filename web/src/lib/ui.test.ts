@@ -4,7 +4,10 @@ import { ApiError } from "./api.ts";
 import {
   PIN_UNSET,
   PROJECT_FOLDER_UNSET,
-  SWARM_WORKERS_OPTIONS,
+  SWARM_WORKERS_AUTO_LABEL,
+  SWARM_WORKERS_HELP_TEXT,
+  SWARM_WORKERS_MAX,
+  SWARM_WORKERS_MIN,
   TOPOLOGY_OPTIONS,
   agentsMdDefaultOn,
   agentsMdStateLabel,
@@ -20,10 +23,13 @@ import {
   serviceState,
   serviceStatusText,
   shortenId,
+  showsSwarmWorkersField,
   swarmWorkersLabel,
+  swarmWorkersSummary,
   taskIdFromPathname,
   topologyLabel,
   validateGoal,
+  validateSwarmWorkers,
 } from "./ui.ts";
 import type { ProjectFolder } from "./types.ts";
 
@@ -208,29 +214,55 @@ test("buildCreateTaskInput carries a selected topology enum", () => {
   assert.equal(unknown.input.swarm_workers, null);
 });
 
-test("buildCreateTaskInput sends swarm_workers only for a swarm topology", () => {
-  for (const workers of ["2", "3", "4", "5", "6", "7", "8"]) {
+test("buildCreateTaskInput sends a fixed swarm_workers only for a swarm topology", () => {
+  for (const workers of ["2", "8", "64"]) {
     const result = buildCreateTaskInput({
       goal: "g",
       plannerPin: "",
       workerPin: "",
       topology: "swarm",
       swarmWorkers: workers,
+      swarmWorkersAuto: false,
     });
     assert.ok(result.ok);
     assert.equal(result.input.swarm_workers, Number(workers));
   }
 
-  // Auto/blank stays null even for a swarm.
-  const auto = buildCreateTaskInput({
-    goal: "g",
-    plannerPin: "",
-    workerPin: "",
-    topology: "swarm",
-    swarmWorkers: "",
-  });
-  assert.ok(auto.ok);
-  assert.equal(auto.input.swarm_workers, null);
+  // The whole 2–64 range is accepted; 3–63 are the newly reachable widths.
+  for (
+    let workers = SWARM_WORKERS_MIN;
+    workers <= SWARM_WORKERS_MAX;
+    workers++
+  ) {
+    const result = buildCreateTaskInput({
+      goal: "g",
+      plannerPin: "",
+      workerPin: "",
+      topology: "swarm",
+      swarmWorkers: String(workers),
+      swarmWorkersAuto: false,
+    });
+    assert.ok(result.ok);
+    assert.equal(result.input.swarm_workers, workers);
+  }
+
+  // Auto and a blank fixed field both send null.
+  for (const values of [
+    { swarmWorkers: "", swarmWorkersAuto: true },
+    { swarmWorkers: "12", swarmWorkersAuto: true },
+    { swarmWorkers: "", swarmWorkersAuto: false },
+    { swarmWorkers: "", swarmWorkersAuto: undefined },
+  ]) {
+    const result = buildCreateTaskInput({
+      goal: "g",
+      plannerPin: "",
+      workerPin: "",
+      topology: "swarm",
+      ...values,
+    });
+    assert.ok(result.ok);
+    assert.equal(result.input.swarm_workers, null);
+  }
 
   // A width selected before switching topology away is not sent.
   for (const topology of ["", "single", "manager_worker"]) {
@@ -239,11 +271,41 @@ test("buildCreateTaskInput sends swarm_workers only for a swarm topology", () =>
       plannerPin: "",
       workerPin: "",
       topology,
-      swarmWorkers: "6",
+      swarmWorkers: "64",
+      swarmWorkersAuto: false,
     });
     assert.ok(result.ok);
     assert.equal(result.input.swarm_workers, null);
   }
+});
+
+test("buildCreateTaskInput rejects fixed swarm widths outside 2–64", () => {
+  for (const workers of ["1", "65", "0", "-2", "2.5", "four", "4x"]) {
+    const result = buildCreateTaskInput({
+      goal: "g",
+      plannerPin: "",
+      workerPin: "",
+      topology: "swarm",
+      swarmWorkers: workers,
+      swarmWorkersAuto: false,
+    });
+    assert.equal(result.ok, false, workers);
+    if (!result.ok) {
+      assert.match(result.error, /2 and 64/);
+    }
+  }
+
+  // Out-of-range text left behind while Auto is on is ignored, not submitted.
+  const auto = buildCreateTaskInput({
+    goal: "g",
+    plannerPin: "",
+    workerPin: "",
+    topology: "swarm",
+    swarmWorkers: "65",
+    swarmWorkersAuto: true,
+  });
+  assert.ok(auto.ok);
+  assert.equal(auto.input.swarm_workers, null);
 });
 
 test("parseTopology and topologyLabel map the select vocabulary", () => {
@@ -263,33 +325,66 @@ test("parseTopology and topologyLabel map the select vocabulary", () => {
   assert.equal(topologyLabel("swarm"), "Swarm");
 });
 
-test("parseSwarmWorkers accepts Auto and exactly 2 through 8", () => {
+test("parseSwarmWorkers accepts Auto and exactly 2 through 64", () => {
   assert.equal(parseSwarmWorkers(""), null);
   assert.equal(parseSwarmWorkers(undefined), null);
   assert.equal(parseSwarmWorkers("auto"), null);
   assert.equal(parseSwarmWorkers(" 2 "), 2);
-  assert.equal(parseSwarmWorkers("4"), 4);
   assert.equal(parseSwarmWorkers("8"), 8);
-  // Below/above the server range, fractions, negative, and text are Auto.
-  for (const raw of ["0", "1", "9", "10", "-2", "2.5", "four", "4x"]) {
+  assert.equal(parseSwarmWorkers("9"), 9);
+  assert.equal(parseSwarmWorkers("63"), 63);
+  assert.equal(parseSwarmWorkers("64"), 64);
+  // Below/above the range, fractions, negative, and text are not widths.
+  for (const raw of ["0", "1", "65", "100", "-2", "2.5", "four", "4x"]) {
     assert.equal(parseSwarmWorkers(raw), null, raw);
+    assert.notEqual(validateSwarmWorkers(raw), null, raw);
   }
-  assert.deepEqual(
-    SWARM_WORKERS_OPTIONS.map((option) => option.label),
-    [
-      "Auto (planner decides)",
-      "2",
-      "3",
-      "4",
-      "5",
-      "6",
-      "7",
-      "8",
-    ],
+  // Blank is valid (Auto), while explicit out-of-range values are rejected.
+  assert.equal(validateSwarmWorkers(""), null);
+  assert.equal(validateSwarmWorkers("auto"), null);
+  assert.equal(validateSwarmWorkers("2"), null);
+  assert.equal(validateSwarmWorkers("64"), null);
+  const rangeError =
+    "Swarm workers must be a whole number between 2 and 64, or Auto.";
+  assert.equal(validateSwarmWorkers("1"), rangeError);
+  assert.equal(validateSwarmWorkers("65"), rangeError);
+
+  assert.equal(
+    SWARM_WORKERS_HELP_TEXT,
+    "N teammates + 1 coordinator. All N run in parallel.",
   );
+  assert.equal(SWARM_WORKERS_MIN, 2);
+  assert.equal(SWARM_WORKERS_MAX, 64);
+
   assert.equal(swarmWorkersLabel(null), null);
   assert.equal(swarmWorkersLabel(undefined), null);
-  assert.equal(swarmWorkersLabel(4), "4");
+  assert.equal(swarmWorkersLabel(2), "2 + coordinator");
+  assert.equal(swarmWorkersLabel(8), "8 + coordinator");
+  assert.equal(swarmWorkersLabel(64), "64 + coordinator");
+
+  // Non-swarm tasks never show the Auto label; swarm tasks with no pinned
+  // count do. Legacy 2–8 tasks keep showing their exact count.
+  assert.equal(swarmWorkersSummary(null, null), null);
+  assert.equal(swarmWorkersSummary("single", null), null);
+  assert.equal(swarmWorkersSummary("manager_worker", null), null);
+  assert.equal(swarmWorkersSummary("swarm", null), SWARM_WORKERS_AUTO_LABEL);
+  assert.equal(
+    SWARM_WORKERS_AUTO_LABEL,
+    "Auto (coordinator decides, max 8 without approval)",
+  );
+  assert.equal(swarmWorkersSummary("swarm", 4), "4 + coordinator");
+  assert.equal(swarmWorkersSummary(null, 4), "4 + coordinator");
+});
+
+test("the swarm worker field is visible only for the swarm topology", () => {
+  assert.equal(showsSwarmWorkersField("swarm"), true);
+  assert.equal(showsSwarmWorkersField(" SWARM "), true);
+  assert.equal(showsSwarmWorkersField(""), false);
+  assert.equal(showsSwarmWorkersField(undefined), false);
+  assert.equal(showsSwarmWorkersField(null), false);
+  assert.equal(showsSwarmWorkersField("single"), false);
+  assert.equal(showsSwarmWorkersField("manager_worker"), false);
+  assert.equal(showsSwarmWorkersField("mystery"), false);
 });
 
 test("buildCreateTaskInput carries numeric pins into the canonical fields", () => {

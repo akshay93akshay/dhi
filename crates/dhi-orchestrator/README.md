@@ -8,9 +8,11 @@ The orchestration foundation for DHI+ intents. This crate turns one
 - **Planner**: outside this crate. It chooses the topology, workers, subtasks,
   and capability limits that make up an `IntentPlan`.
 - **Runner**: this crate. `ManagerRunner` executes a manager/worker plan;
-  `SwarmRunner` executes a peer-to-peer swarm plan. Both validate the plan
-  first and return every seed result, even when one worker fails. The swarm
-  also returns reaction turns separately in `audit_results`.
+  `ManagerRunner::with_lead` adds the direct-assignment manager loop.
+  `TeamRunner` loads and seeds the shared Cline Teams state used by the Swarm
+  coordinator agent. `SwarmRunner` remains the legacy peer-to-peer fallback
+  for hosts without team persistence. Runners validate the plan first and
+  return every seed result, even when one worker fails.
 - **WorkerExecutor**: the execution seam. A runner calls only this trait.
   Guard checks, auditing, tool routing, and model calls belong in the
   implementation, not in the runners.
@@ -38,12 +40,16 @@ The orchestration foundation for DHI+ intents. This crate turns one
 - `max_workers`, `max_parallel`, `max_rounds`, and `max_messages` are enforced
   by the runtime. A selector cannot widen the planner's limits.
 - A selected manager plan keeps the `manager_worker` topology, a non-empty
-  worker pool within `max_workers`, unique worker keys, and a non-empty
-  subtask list whose worker keys all exist. Invalid output fails before any
-  worker runs.
-- The manager assigns subtasks up front. The swarm seeds one task per worker
-  and then peers exchange typed `SwarmMessage`s without a central manager
-  choosing every step.
+  worker pool within `max_workers`, unique worker keys, and subtasks whose
+  worker keys all exist. A manager plan may start with zero subtasks when the
+  lead is used; the lead assigns follow-up work. Invalid output fails before
+  any worker runs.
+- A Swarm team starts from the plan's worker roster. The coordinator agent
+  owns the intent and calls the team tools; teammates may create, claim,
+  complete, and block cards, message peers, log mission entries, and create or
+  review outcome fragments. Spawn, shutdown, cleanup, and outcome finalization
+  stay coordinator-only. `SwarmRunner` is the legacy peer fallback and is not
+  the Swarm coordinator contract.
 
 ## Example
 

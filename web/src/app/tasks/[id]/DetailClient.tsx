@@ -25,7 +25,7 @@ import {
 import {
   describeApiError,
   shortenId,
-  swarmWorkersLabel,
+  swarmWorkersSummary,
   taskIdFromPathname,
   topologyLabel,
   type ServiceState,
@@ -39,6 +39,7 @@ import {
 import { RecentActivityFeed } from "@/app/_components/ActivityLog";
 import { MarkdownMath } from "@/components/markdown-math";
 import { ProjectContext } from "@/components/project-context";
+import { WebProjectSyncCard } from "@/components/web-project-sync";
 import { SideQuestions } from "./SideQuestions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -289,7 +290,7 @@ function TaskDetail() {
   // the latest team_run's choice (when one has run).
   const topology = resolveTaskTopology(task.topology, activityRows ?? []);
   const topologyName = topologyLabel(topology);
-  const workersLabel = swarmWorkersLabel(task.swarm_workers);
+  const workersLabel = swarmWorkersSummary(topology, task.swarm_workers);
 
   const visualState =
     task.state === "done"
@@ -366,7 +367,7 @@ function TaskDetail() {
             <>
               <span aria-hidden="true">·</span>
               <Badge variant="outline" title="Swarm workers">
-                Workers: {workersLabel}
+                Swarm workers: {workersLabel}
               </Badge>
             </>
           ) : null}
@@ -395,6 +396,8 @@ function TaskDetail() {
           </Button>
         </div>
       </header>
+
+      <WebProjectSyncCard task={task} className="mt-6" />
 
       {pageError !== null ? (
         <p
@@ -575,7 +578,7 @@ function TaskDetail() {
           {workersLabel !== null ? (
             <>
               <dt className="type-meta text-muted-foreground">
-                Workers
+                Swarm workers
               </dt>
               <dd className="m-0 type-meta text-muted-foreground">
                 {workersLabel}

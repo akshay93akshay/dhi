@@ -10,10 +10,16 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub mod graph;
+pub mod lead;
 pub mod orchestration;
 pub mod project;
 pub mod side_question;
+pub mod team;
 pub use graph::{GraphStore, GuardStore};
+pub use lead::{
+    LeadBudget, LeadDecision, LeadError, LeadInput, LeadLimits, LeadTask, LeadWorkerResult,
+    LeadWorkerStatus,
+};
 pub use orchestration::{
     CapabilityLimits, IntentPlan, OrchestrationError, Subtask, Topology, WorkerSpec,
 };
@@ -24,6 +30,13 @@ pub use project::{
 pub use side_question::{
     NewSideQuestionRequest, SideQuestionRequest, SideQuestionSession, SideQuestionSessionStatus,
     SideQuestionStatus, SideQuestionThread,
+};
+pub use team::{
+    MemoryTeamStore, MissionLogEntry, MissionLogKind, NewMissionLogEntry, NewTeamMessage,
+    NewTeamOutcome, NewTeamOutcomeFragment, NewTeamRun, NewTeamTask, TeamActionKind, TeamError,
+    TeamMember, TeamMemberSpec, TeamMemberStatus, TeamMessage, TeamOutcome, TeamOutcomeFragment,
+    TeamOutcomeFragmentStatus, TeamOutcomeStatus, TeamPermissions, TeamRole, TeamRun,
+    TeamRunProgress, TeamRunStatus, TeamSnapshot, TeamStore, TeamTask, TeamTaskStatus,
 };
 
 pub type TaskId = Uuid;
@@ -37,6 +50,23 @@ pub type CheckpointId = Uuid;
 pub type ToolCallId = Uuid;
 pub type GuardDecisionId = Uuid;
 pub type ApprovalId = Uuid;
+pub type ScaleApprovalId = Uuid;
+
+/// Smallest fixed swarm a create request accepts. N counts teammates; the
+/// lead is always one extra agent.
+pub const SWARM_MIN_WORKERS: usize = 2;
+/// Hard cap on swarm teammates, including a granted `swarm_scale` request.
+pub const SWARM_MAX_WORKERS: usize = 64;
+/// Teammates an Auto swarm may use without a `swarm_scale` approval.
+pub const SWARM_AUTO_WORKERS: usize = 8;
+/// Default lifetime of a pending `swarm_scale` approval, in seconds. The
+/// configured approval timeout wins when the settings row exists.
+pub const SCALE_APPROVAL_TIMEOUT_SECS: u64 = 15 * 60;
+
+/// True for the fixed swarm worker counts the API, planner, and runtime share.
+pub fn valid_swarm_worker_count(count: usize) -> bool {
+    (SWARM_MIN_WORKERS..=SWARM_MAX_WORKERS).contains(&count)
+}
 
 #[derive(Debug, Error)]
 pub enum CoreError {
@@ -352,6 +382,14 @@ pub struct Task {
     /// the task keeps its isolated folder under `DHI_WORKSPACE_ROOT`.
     #[serde(default)]
     pub project_folder: Option<String>,
+    /// Uploaded browser-folder web project this task works against. `None` for
+    /// host-folder and legacy tasks. Stored in `tasks.web_project_id`.
+    #[serde(default)]
+    pub web_project_id: Option<Uuid>,
+    /// Display name of the selected web project, copied at creation for audit.
+    /// Stored in `tasks.web_project_name`.
+    #[serde(default)]
+    pub web_project_name: Option<String>,
     /// Derived host path of the task folder. Project mode is
     /// `<project>/.dhi/<task-id>`; legacy mode leaves this `None` because the
     /// folder is rooted at `DHI_WORKSPACE_ROOT` instead of the task row.
@@ -383,6 +421,8 @@ pub struct NewTask {
     pub topology: Option<Topology>,
     pub swarm_workers: Option<usize>,
     pub project_folder: Option<String>,
+    pub web_project_id: Option<Uuid>,
+    pub web_project_name: Option<String>,
     pub load_agents_md: bool,
     pub agents_md_state: AgentsMdState,
 }
@@ -397,6 +437,8 @@ impl NewTask {
             topology: None,
             swarm_workers: None,
             project_folder: None,
+            web_project_id: None,
+            web_project_name: None,
             load_agents_md: false,
             agents_md_state: AgentsMdState::Disabled,
         }
@@ -434,6 +476,18 @@ impl NewTask {
         self.agents_md_state = agents_md_state;
         self
     }
+
+    /// Selects an uploaded web project. The caller resolves the stored root
+    /// and passes the absolute project folder separately.
+    pub fn with_web_project(
+        mut self,
+        web_project_id: Uuid,
+        web_project_name: impl Into<String>,
+    ) -> Self {
+        self.web_project_id = Some(web_project_id);
+        self.web_project_name = Some(web_project_name.into());
+        self
+    }
 }
 
 impl Task {
@@ -451,6 +505,8 @@ impl Task {
             topology: None,
             swarm_workers: None,
             project_folder: None,
+            web_project_id: None,
+            web_project_name: None,
             task_folder: None,
             load_agents_md: false,
             agents_md_state: AgentsMdState::Disabled,
@@ -693,6 +749,118 @@ pub struct Approval {
     pub expires_at: DateTime<Utc>,
     pub decided_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Lifecycle of one `swarm_scale` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScaleApprovalStatus {
+    Pending,
+    Granted,
+    Denied,
+    Expired,
+}
+
+impl ScaleApprovalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Granted => "granted",
+            Self::Denied => "denied",
+            Self::Expired => "expired",
+        }
+    }
+
+    /// Only a granted request raises the swarm cap. Denial and expiry are both
+    /// a denial for the caller.
+    pub fn is_granted(self) -> bool {
+        self == Self::Granted
+    }
+}
+
+impl std::fmt::Display for ScaleApprovalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One `swarm_scale` request: an Auto swarm asking to exceed
+/// [`SWARM_AUTO_WORKERS`], up to [`SWARM_MAX_WORKERS`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScaleApproval {
+    pub id: ScaleApprovalId,
+    pub task_id: TaskId,
+    /// Team the request belongs to, when the team row already exists.
+    #[serde(default)]
+    pub team_id: Option<Uuid>,
+    pub requested_workers: usize,
+    /// The cap the caller may already use without a grant.
+    pub current_cap: usize,
+    pub reason: String,
+    pub status: ScaleApprovalStatus,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub decided_at: Option<DateTime<Utc>>,
+}
+
+impl ScaleApproval {
+    /// The teammate cap this outcome allows. Only a grant raises it to the
+    /// requested count; pending, denied, and expired all keep the current cap.
+    pub fn effective_cap(&self) -> usize {
+        if self.status.is_granted() {
+            self.requested_workers
+        } else {
+            self.current_cap
+        }
+    }
+}
+
+/// Input for one `swarm_scale` request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScaleApprovalRequest {
+    pub task_id: TaskId,
+    #[serde(default)]
+    pub team_id: Option<Uuid>,
+    pub requested_workers: usize,
+    pub current_cap: usize,
+    pub reason: String,
+    /// `None` uses the configured approval timeout, then
+    /// [`SCALE_APPROVAL_TIMEOUT_SECS`].
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// The seam the team runner calls for `swarm_scale`.
+///
+/// `request_scale_approval` persists one pending row. `wait_for_scale_approval`
+/// blocks until the row is granted, denied, or expired. Every non-granted
+/// outcome must keep the swarm at [`SWARM_AUTO_WORKERS`]; a fixed swarm never
+/// calls this gate at all.
+///
+/// Implemented by `dhi_store::Store`; the team runtime only needs this
+/// `dhi-core` trait, not the PostgreSQL store type.
+#[async_trait::async_trait]
+pub trait ScaleApprovalGate: Send + Sync {
+    /// Creates one pending `swarm_scale` request.
+    async fn request_scale_approval(
+        &self,
+        request: ScaleApprovalRequest,
+    ) -> anyhow::Result<ScaleApproval>;
+
+    /// Waits until the request leaves `pending`. Expiry counts as a denial.
+    async fn wait_for_scale_approval(
+        &self,
+        approval_id: ScaleApprovalId,
+    ) -> anyhow::Result<ScaleApproval>;
+
+    /// Requests one approval and waits for its outcome.
+    async fn request_and_wait_scale_approval(
+        &self,
+        request: ScaleApprovalRequest,
+    ) -> anyhow::Result<ScaleApproval> {
+        let approval = self.request_scale_approval(request).await?;
+        self.wait_for_scale_approval(approval.id).await
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

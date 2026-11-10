@@ -849,6 +849,31 @@ async fn swarm_stops_at_max_rounds() {
 }
 
 #[tokio::test]
+async fn zero_seed_swarm_is_refused_by_the_legacy_runner() {
+    let executor = Arc::new(FakeExecutor::new(always_ok_handler()));
+    let plan = plan(
+        Topology::Swarm,
+        vec![worker("a", 2), worker("b", 2)],
+        Vec::new(),
+        limits(2, 2, 2, 16),
+    );
+
+    let error = SwarmRunner::new(executor)
+        .run(&plan)
+        .await
+        .expect_err("a zero-seed legacy swarm has no work to start");
+    let message = error.to_string();
+    assert!(
+        message.contains("at least one seed subtask"),
+        "the runner names the missing seed: {message}"
+    );
+    assert!(
+        message.contains("team runtime"),
+        "the runner points at the shared-state runtime: {message}"
+    );
+}
+
+#[tokio::test]
 async fn swarm_keeps_other_findings_when_one_worker_fails() {
     let handler: Handler = Arc::new(|worker, subtask, _context| {
         Box::pin(async move {
@@ -1049,7 +1074,22 @@ fn plan_validation_is_typed() {
         vec![],
         limits(2, 2, 2, 8),
     );
-    assert_eq!(no_subtasks.validate(), Err(OrchestrationError::NoSubtasks));
+    assert_eq!(
+        no_subtasks.validate(),
+        Ok(()),
+        "a manager plan may start empty for the lead"
+    );
+
+    let single_no_subtasks = plan(
+        Topology::Single,
+        vec![worker("a", 1)],
+        vec![],
+        limits(2, 2, 2, 8),
+    );
+    assert_eq!(
+        single_no_subtasks.validate(),
+        Err(OrchestrationError::NoSubtasks)
+    );
 
     let unknown = plan(
         Topology::ManagerWorker,

@@ -42,9 +42,13 @@ import type {
   SwarmMessageRecord,
   SwarmMessagesResponse,
   Task,
+  TeamMessageRecord,
+  TeamMessagesResponse,
   TaskActivityResponse,
   TaskCapacityPatch,
   TaskListResponse,
+  TaskOutputsResponse,
+  TaskOutputFile,
   TaskUsageResponse,
   TaskWork,
   ToggleRuleResponse,
@@ -52,6 +56,10 @@ import type {
   ToolControlAction,
   ToolControlResponse,
   ToolState,
+  WebProject,
+  WebProjectFileResponse,
+  WebProjectResponse,
+  WebProjectsResponse,
   WebProviderId,
   WebProviderTestResult,
   WebProviderUpdate,
@@ -169,6 +177,63 @@ export function listProjectFolders(): Promise<ProjectFolder[]> {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Web projects (browser-folder snapshots)
+// ---------------------------------------------------------------------------
+
+/** Unwraps the `{ projects: [...] }` envelope of `GET /api/web-projects`. */
+export function listWebProjects(): Promise<WebProject[]> {
+  return request<WebProjectsResponse>("/web-projects").then(
+    (response) => response.projects,
+  );
+}
+
+/** Creates one web project and unwraps the `{ project }` envelope. */
+export function createWebProject(name: string): Promise<WebProject> {
+  return request<WebProjectResponse>("/web-projects", {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  }).then((response) => response.project);
+}
+
+/** Reads one web project and unwraps the `{ project }` envelope. */
+export function getWebProject(id: string): Promise<WebProject> {
+  return request<WebProjectResponse>(
+    `/web-projects/${encodeURIComponent(id)}`,
+  ).then((response) => response.project);
+}
+
+/**
+ * Uploads raw file bytes to `PUT /api/web-projects/{id}/files?path=…`.
+ * The body is the file itself, never JSON; an optional abort signal lets the
+ * caller cancel an in-flight upload.
+ */
+export function uploadWebProjectFile(
+  projectId: string,
+  path: string,
+  bytes: Uint8Array,
+  signal?: AbortSignal,
+): Promise<WebProjectFileResponse> {
+  return request<WebProjectFileResponse>(
+    `/web-projects/${encodeURIComponent(projectId)}/files?path=${encodeURIComponent(path)}`,
+    {
+      method: "PUT",
+      headers: { "content-type": "application/octet-stream" },
+      // Copy into a plain ArrayBuffer-backed view: the DOM BodyInit type does
+      // not accept the generic `Uint8Array<ArrayBufferLike>` parameter.
+      body: new Uint8Array(bytes),
+      signal,
+    },
+  );
+}
+
+/** Unwraps the `{ files: [...] }` envelope of `GET /api/tasks/{id}/outputs`. */
+export function getTaskOutputs(taskId: string): Promise<TaskOutputFile[]> {
+  return request<TaskOutputsResponse>(
+    `/tasks/${encodeURIComponent(taskId)}/outputs`,
+  ).then((response) => response.files);
+}
+
 export function listTasks(opts?: { limit?: number }): Promise<Task[]> {
   const path =
     opts?.limit === undefined ? "/tasks" : `/tasks?limit=${opts.limit}`;
@@ -271,6 +336,26 @@ export function getSwarmMessages(
   return request<SwarmMessagesResponse>(
     `/tasks/${taskId}/swarm-messages?limit=${limit}`,
   ).then((response) => response.messages);
+}
+
+/**
+ * Unwraps the `{ messages }` envelope of `GET /api/tasks/{id}/team/messages`.
+ * The route returns every team message in both directions; `to_agent_id` is
+ * `null` for a broadcast.
+ */
+export function getTeamMessages(
+  taskId: string,
+): Promise<TeamMessageRecord[]> {
+  return request<TeamMessagesResponse>(`/tasks/${taskId}/team/messages`)
+    .then((response) => response.messages)
+    .catch((err: unknown) => {
+      // A task with no persisted team is an empty graph, not an error. This
+      // matches the optional team routes in `team.ts`.
+      if (err instanceof ApiError && (err.status === 404 || err.status === 405)) {
+        return [];
+      }
+      throw err;
+    });
 }
 
 /**

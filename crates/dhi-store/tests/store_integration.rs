@@ -52,6 +52,8 @@ async fn legacy_tasks_keep_project_fields_unset(pool: PgPool) {
     ] {
         assert_eq!(row.project_folder, None);
         assert_eq!(row.task_folder, None);
+        assert_eq!(row.web_project_id, None);
+        assert_eq!(row.web_project_name, None);
         assert!(!row.load_agents_md);
         assert_eq!(row.agents_md_state, AgentsMdState::Disabled);
     }
@@ -79,6 +81,8 @@ async fn migration_defaults_apply_to_a_row_without_project_columns(pool: PgPool)
     let task = store.get_task(id).await.unwrap().expect("legacy row loads");
     assert_eq!(task.project_folder, None);
     assert_eq!(task.task_folder, None);
+    assert_eq!(task.web_project_id, None);
+    assert_eq!(task.web_project_name, None);
     assert!(!task.load_agents_md);
     assert_eq!(task.agents_md_state, AgentsMdState::Disabled);
 }
@@ -127,6 +131,85 @@ async fn project_task_fields_round_trip(pool: PgPool) {
             .agents_md_state,
         AgentsMdState::Truncated
     );
+}
+
+/// Web project metadata round-trips through its own row, with the stored root
+/// kept for audit.
+#[sqlx::test]
+async fn web_project_rows_round_trip(pool: PgPool) {
+    let store = Store::new(pool);
+    let id = Uuid::new_v4();
+    let created = store
+        .create_web_project(id, "Snapshot App", "/srv/web-projects")
+        .await
+        .unwrap();
+    assert_eq!(created.id, id);
+    assert_eq!(created.name, "Snapshot App");
+    assert_eq!(created.root_path, "/srv/web-projects");
+
+    let fetched = store
+        .get_web_project(id)
+        .await
+        .unwrap()
+        .expect("project exists");
+    assert_eq!(fetched.name, "Snapshot App");
+    assert_eq!(fetched.root_path, "/srv/web-projects");
+    assert_eq!(fetched.created_at, created.created_at);
+
+    let listed = store.list_web_projects().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id);
+    assert!(
+        store
+            .get_web_project(Uuid::new_v4())
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A task may select a web project: the derived folder comes from the stored
+/// project path, and both the id and the display name persist.
+#[sqlx::test]
+async fn web_project_task_fields_round_trip(pool: PgPool) {
+    let store = Store::new(pool);
+    let web_project_id = Uuid::new_v4();
+    let project_folder = format!("/srv/web-projects/{web_project_id}");
+    let task = store
+        .create_task_with_pins(
+            NewTask::new("web project task")
+                .with_project(project_folder.clone(), true, AgentsMdState::Loaded)
+                .with_web_project(web_project_id, "Snapshot App"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(task.web_project_id, Some(web_project_id));
+    assert_eq!(task.web_project_name.as_deref(), Some("Snapshot App"));
+    assert_eq!(
+        task.project_folder.as_deref(),
+        Some(project_folder.as_str())
+    );
+    let expected_folder = std::path::Path::new(&project_folder)
+        .join(".dhi")
+        .join(task.id.to_string())
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(task.task_folder.as_deref(), Some(expected_folder.as_str()));
+
+    let persisted = store.get_task(task.id).await.unwrap().expect("task exists");
+    assert_eq!(persisted.web_project_id, Some(web_project_id));
+    assert_eq!(persisted.web_project_name.as_deref(), Some("Snapshot App"));
+    assert_eq!(persisted.project_folder, task.project_folder);
+    assert_eq!(persisted.task_folder, task.task_folder);
+
+    let listed = store.list_tasks(10).await.unwrap();
+    let row = listed
+        .iter()
+        .find(|row| row.id == task.id)
+        .expect("task is listed");
+    assert_eq!(row.web_project_id, Some(web_project_id));
+    assert_eq!(row.web_project_name.as_deref(), Some("Snapshot App"));
 }
 
 /// The claim is a single atomic `UPDATE ... WHERE state = 'open'`.

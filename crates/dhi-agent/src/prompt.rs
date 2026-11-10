@@ -27,12 +27,13 @@ pub const INVARIANT_TAIL: &str = "<!-- INVARIANTS — DO NOT REMOVE -->\n\
 You never decide domain truth. A goal is met only when a confirmed fact proves it.\n\
 Planner: you never run tools. You add one intent or prove one goal from a confirmed fact.\n\
 Worker: you never create intents. Write one fact draft through `record_fact`; domain tool calls are decided by the guard.\n\
-Use only the output mechanism this role is given. Never answer in JSON text.\n";
+Coordinator: you are a worker-role agent with the team tools. You never create or prove goals; return one fact through `record_fact`.\n\
+Teammate: you share the team tools except spawn, shutdown, cleanup, and outcome finalization. Return your run's result through `record_fact`.\n\
+Manager: you are not a worker. Return exactly one LeadDecision; the runtime runs workers and the engine records the fact.\n\
+Use only the output mechanism this role is given. Planner and worker never answer in JSON text; the manager answers only with its decision JSON.\n";
 
-/// The only variables this crate defines: `goal`, `goals`, `facts`,
-/// `open_intents`, `failures`, `required_topology`, `swarm_workers`,
-/// `instructions`, `project_instructions`, `intent`, `context`. Nothing else
-/// is renderable.
+/// The only variables this crate defines: planner, worker, coordinator, and
+/// teammate values. Nothing else is renderable.
 pub const DECLARED_VARIABLES: &[&str] = &[
     "goal",
     "goals",
@@ -45,6 +46,14 @@ pub const DECLARED_VARIABLES: &[&str] = &[
     "project_instructions",
     "intent",
     "context",
+    "manager_contract",
+    "lead_input",
+    "coordinator_contract",
+    "teammate_contract",
+    "objective",
+    "agent_id",
+    "role",
+    "task",
 ];
 
 /// Variables of one planner render. The graph snapshot is `facts` and goes in
@@ -73,6 +82,27 @@ pub struct PlannerVars {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerVars {
     pub intent: String,
+    pub context: String,
+}
+
+/// Variables of one Swarm coordinator render. `coordinator_contract` is the
+/// empty system/user boundary: the static tool contract is the system turn;
+/// the objective, confirmed facts, and roster context are the user turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatorVars {
+    pub objective: String,
+    pub context: String,
+}
+
+/// Variables of one Swarm teammate render. `teammate_contract` is the empty
+/// system/user boundary: the static teammate contract is the system turn; the
+/// id, objective, role, assigned task, and context are the user turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeammateVars {
+    pub agent_id: String,
+    pub role: String,
+    pub objective: String,
+    pub task: String,
     pub context: String,
 }
 
@@ -124,6 +154,46 @@ impl WorkerVars {
     }
 }
 
+impl CoordinatorVars {
+    pub fn to_variables(&self) -> serde_json::Value {
+        serde_json::json!({
+            "objective": self.objective,
+            "context": self.context,
+        })
+    }
+
+    fn pairs(&self) -> [(&'static str, String); 3] {
+        [
+            ("coordinator_contract", String::new()),
+            ("objective", self.objective.clone()),
+            ("context", self.context.clone()),
+        ]
+    }
+}
+
+impl TeammateVars {
+    pub fn to_variables(&self) -> serde_json::Value {
+        serde_json::json!({
+            "agent_id": self.agent_id,
+            "role": self.role,
+            "objective": self.objective,
+            "task": self.task,
+            "context": self.context,
+        })
+    }
+
+    fn pairs(&self) -> [(&'static str, String); 6] {
+        [
+            ("teammate_contract", String::new()),
+            ("agent_id", self.agent_id.clone()),
+            ("role", self.role.clone()),
+            ("objective", self.objective.clone()),
+            ("task", self.task.clone()),
+            ("context", self.context.clone()),
+        ]
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PromptTemplate {
     /// Raw file, for `agent_runs.prompt` reconstruction.
@@ -143,16 +213,35 @@ impl PromptTemplate {
 pub struct PromptSet {
     pub planner: PromptTemplate,
     pub worker: PromptTemplate,
+    /// The manager-worker lead prompt. It is static and receives one JSON
+    /// [`dhi_core::LeadInput`] in the user turn.
+    pub manager: PromptTemplate,
+    /// The Swarm coordinator prompt. The static tool contract is the system
+    /// turn; the objective and context follow in the user turn.
+    pub coordinator: PromptTemplate,
+    /// The Swarm teammate prompt. The static teammate contract is the system
+    /// turn; the id, objective, role, task, and context follow in the user
+    /// turn.
+    pub teammate: PromptTemplate,
 }
 
 impl PromptSet {
-    /// Reads both role templates from `dir` and validates them. Every
-    /// `{{…}}` must be one of the declared variables.
+    /// Reads the role templates from `dir` and validates them. Every `{{…}}`
+    /// must be one of the declared variables.
     pub fn load(dir: &Path) -> Result<Self, PromptError> {
         let planner =
             PromptTemplate::load_file(dir.join(Role::Planner.prompt_file()), Role::Planner)?;
         let worker = PromptTemplate::load_file(dir.join(Role::Worker.prompt_file()), Role::Worker)?;
-        Ok(Self { planner, worker })
+        let manager = PromptTemplate::load_file(dir.join("manager.md"), Role::Planner)?;
+        let coordinator = PromptTemplate::load_file(dir.join("coordinator.md"), Role::Worker)?;
+        let teammate = PromptTemplate::load_file(dir.join("teammate.md"), Role::Worker)?;
+        Ok(Self {
+            planner,
+            worker,
+            manager,
+            coordinator,
+            teammate,
+        })
     }
 
     /// Loads from `DHI_PROMPTS_DIR`, else the nearest `ops/prompts` above
@@ -174,6 +263,39 @@ impl PromptSet {
     /// user turn carries the context.
     pub fn render_worker(&self, vars: &WorkerVars) -> Result<(String, String), PromptError> {
         self.worker.render(Role::Worker, &vars.pairs())
+    }
+
+    /// Swarm coordinator: `(system, user)`. The static tool contract is the
+    /// system turn; the objective and confirmed-fact/team context are the user
+    /// turn.
+    pub fn render_coordinator(
+        &self,
+        vars: &CoordinatorVars,
+    ) -> Result<(String, String), PromptError> {
+        self.coordinator.render(Role::Worker, &vars.pairs())
+    }
+
+    /// Swarm teammate: `(system, user)`. The static contract is the system
+    /// turn; the teammate id, objective, role, task, and context form the user
+    /// turn.
+    pub fn render_teammate(&self, vars: &TeammateVars) -> Result<(String, String), PromptError> {
+        self.teammate.render(Role::Worker, &vars.pairs())
+    }
+
+    /// Lead: `(system, user)`. The contract is static; the serialized
+    /// [`dhi_core::LeadInput`] is the user turn.
+    ///
+    /// `manager_contract` is an explicit system/user boundary: the template
+    /// engine puts the first variable in the system turn, so this empty value
+    /// closes the static contract before the input text begins the user turn.
+    pub fn render_lead(&self, input: &str) -> Result<(String, String), PromptError> {
+        self.manager.render(
+            Role::Planner,
+            &[
+                ("manager_contract", String::new()),
+                ("lead_input", input.to_owned()),
+            ],
+        )
     }
 
     pub fn get(&self, role: Role) -> &PromptTemplate {
@@ -378,12 +500,35 @@ mod tests {
         }
     }
 
+    fn coordinator_vars() -> CoordinatorVars {
+        CoordinatorVars {
+            objective: "ship the swarm runtime".to_string(),
+            context: "- fact 89abcdef: the board is persisted\n- cap: 8 teammates".to_string(),
+        }
+    }
+
+    fn teammate_vars() -> TeammateVars {
+        TeammateVars {
+            agent_id: "worker-1".to_string(),
+            role: "teammate".to_string(),
+            objective: "ship the swarm runtime".to_string(),
+            task: "audit the parser".to_string(),
+            context: "- fact 89abcdef: the board is persisted".to_string(),
+        }
+    }
+
     fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("dhi-prompts-{}-{name}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let source = ops_prompts();
-        for file in ["planner.md", "worker.md"] {
+        for file in [
+            "planner.md",
+            "worker.md",
+            "manager.md",
+            "coordinator.md",
+            "teammate.md",
+        ] {
             std::fs::copy(source.join(file), dir.join(file)).unwrap();
         }
         dir
@@ -393,7 +538,9 @@ mod tests {
     fn ops_prompts_load_and_declare_only_good_variables() {
         let set = loaded();
         assert!(set.planner.hash.len() >= 8);
+        assert!(set.manager.hash.len() >= 8);
         assert_ne!(set.planner.hash, set.worker.hash);
+        assert_ne!(set.manager.hash, set.worker.hash);
         assert_eq!(
             set.planner.version(Role::Planner),
             format!("planner@{}", set.planner.hash)
@@ -522,6 +669,77 @@ mod tests {
     }
 
     #[test]
+    fn manager_render_puts_the_lead_input_in_the_user_turn() {
+        let set = loaded();
+        let input = r#"{"intent":"ship it","workers":[],"tasks":[],"results":[],"round":1}"#;
+        let (system, user) = set.render_lead(input).unwrap();
+
+        assert!(
+            system.contains("manager-worker lead"),
+            "manager contract goes in the system prompt: {system}"
+        );
+        assert!(
+            system.contains("Return exactly one LeadDecision"),
+            "the invariant tail names the manager output: {system}"
+        );
+        for decision in ["final", "continue", "ask_worker", "stop"] {
+            assert!(
+                system.contains(decision),
+                "manager prompt names `{decision}`: {system}"
+            );
+        }
+        assert!(
+            user.contains("ship it"),
+            "the serialized lead input goes in the user turn: {user}"
+        );
+        assert!(
+            !system.contains("ship it"),
+            "the lead input must not leak into the system prompt: {system}"
+        );
+        assert!(!system.contains("{{"));
+        assert!(!user.contains("{{"));
+    }
+
+    #[test]
+    fn coordinator_and_teammate_renders_split_at_the_first_variable() {
+        let set = loaded();
+        let (system, user) = set.render_coordinator(&coordinator_vars()).unwrap();
+        assert!(
+            system.contains("DHI+ Swarm team") && system.contains("team_spawn_teammate"),
+            "the static coordinator contract names the team tools: {system}"
+        );
+        assert!(
+            !system.contains("ship the swarm runtime"),
+            "the objective is the user turn, not the system prompt: {system}"
+        );
+        assert!(
+            !system.contains("{\"actions\""),
+            "no JSON batches: {system}"
+        );
+        assert!(
+            user.contains("ship the swarm runtime") && user.contains("board is persisted"),
+            "the objective and context are the user turn: {user}"
+        );
+
+        let (system, user) = set.render_teammate(&teammate_vars()).unwrap();
+        assert!(
+            system.contains("DHI+ Swarm team"),
+            "the static teammate contract is the system turn: {system}"
+        );
+        assert!(
+            !system.contains("worker-1") && !system.contains("audit the parser"),
+            "the teammate id and task are not in the system prompt: {system}"
+        );
+        assert!(
+            user.contains("worker-1")
+                && user.contains("audit the parser")
+                && user.contains("ship the swarm runtime"),
+            "the id, objective, and task are the user turn: {user}"
+        );
+        assert!(!system.contains("{{") && !user.contains("{{"));
+    }
+
+    #[test]
     fn invariant_tail_is_always_appended() {
         let set = loaded();
         let (planner_system, _) = set.render_planner(&planner_vars()).unwrap();
@@ -538,6 +756,9 @@ mod tests {
         let set = PromptSet {
             planner: hostile,
             worker: set.worker,
+            manager: set.manager,
+            coordinator: set.coordinator,
+            teammate: set.teammate,
         };
         let (system, _) = set.render_planner(&planner_vars()).unwrap();
         assert!(system.ends_with(INVARIANT_TAIL));
@@ -590,7 +811,10 @@ mod tests {
         .unwrap();
         let set = PromptSet {
             planner: template.clone(),
-            worker: template,
+            worker: template.clone(),
+            manager: template.clone(),
+            coordinator: template.clone(),
+            teammate: template,
         };
         // `context` is missing from the data, not from the template.
         let err = set
