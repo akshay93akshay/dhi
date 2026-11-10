@@ -386,18 +386,20 @@ async fn duplicate_exploration_is_rejected(pool: PgPool) {
 /// Migrations from an empty database create the full schema, idempotently.
 /// The schema includes tool control (`tool_catalog`, `tool_visibility`,
 /// `skill_usage`), web-provider settings (`web_provider_settings`), persisted
-/// DHI+ plans (`intent_plans`), swarm audit messages (`swarm_messages`), and
-/// planner-only instructions (`task_instructions`).
+/// DHI+ plans (`intent_plans`), swarm audit messages (`swarm_messages`),
+/// planner-only instructions (`task_instructions`), Cline Teams state
+/// (`team_*`), scale approvals (`scale_approvals`), and browser-folder
+/// projects (`web_projects`).
 #[sqlx::test(migrations = false)]
-async fn migration_creates_26_tables_and_is_idempotent_from_clean_database(pool: PgPool) {
+async fn migration_creates_35_tables_and_is_idempotent_from_clean_database(pool: PgPool) {
     assert_eq!(base_table_count(&pool).await, 0);
 
     let store = Store::new(pool);
     store.migrate().await.expect("first migrate succeeds");
-    assert_eq!(base_table_count(store.pool()).await, 26);
+    assert_eq!(base_table_count(store.pool()).await, 35);
 
     store.migrate().await.expect("second migrate succeeds");
-    assert_eq!(base_table_count(store.pool()).await, 26);
+    assert_eq!(base_table_count(store.pool()).await, 35);
 }
 
 /// A DHI+ plan round-trips through JSONB, an upsert replaces it, and an
