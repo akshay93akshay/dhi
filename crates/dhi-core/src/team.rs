@@ -2438,10 +2438,10 @@ mod tests {
         };
 
         assert_eq!(
-            outcome.missing_sections(&[fragment.clone()]),
+            outcome.missing_sections(std::slice::from_ref(&fragment)),
             vec!["evidence".to_string()]
         );
-        assert!(!outcome.is_ready_to_finalize(&[fragment.clone()]));
+        assert!(!outcome.is_ready_to_finalize(std::slice::from_ref(&fragment)));
 
         let mut second = fragment.clone();
         second.id = Uuid::new_v4();
