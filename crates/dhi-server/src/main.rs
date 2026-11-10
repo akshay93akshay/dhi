@@ -402,6 +402,15 @@ async fn main() -> anyhow::Result<()> {
         folders = ?project_folders.paths(),
         "project folders configured"
     );
+    // The host file browser is opt-in. A configured root must already exist or
+    // be creatable, be a readable directory, and must not be a symlink. It is
+    // the only source of create-time project folders and AGENTS.md paths.
+    let file_browser = Arc::new(dhi_server::file_browser::FileBrowser::from_env()?);
+    info!(
+        root = ?file_browser.root(),
+        enabled = file_browser.enabled(),
+        "host file browser configured"
+    );
     // Browser-folder web projects are opt-in. A configured root must already
     // exist or be creatable, be writable, and must not be a symlink. The same
     // absolute path must be visible to this process and the Docker daemon:
@@ -821,6 +830,7 @@ async fn main() -> anyhow::Result<()> {
         web: web_runtime,
         task_runs,
         project_folders,
+        file_browser,
         web_projects,
         web_project_store: Some(web_project_store),
         team_store: Some(team_store),

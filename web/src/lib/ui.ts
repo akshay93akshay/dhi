@@ -13,9 +13,7 @@ import type {
   CreateTaskInput,
   Health,
   JsonObject,
-  ProjectFolder,
   TaskTopology,
-  WebProject,
 } from "./types.ts";
 
 /** The three visual states of the DHI brand-status block. */
@@ -198,33 +196,6 @@ export function provenanceDetailText(view: ProvenanceView): string | null {
 /** Select value that means "no pin — use the role's pool default". */
 export const PIN_UNSET = "";
 
-/** Select value that means "no project folder — legacy workspace mode". */
-export const PROJECT_FOLDER_UNSET = "";
-
-/**
- * Prefix of the create-form project `<select>` value for an uploaded web
- * project. Absolute Docker-folder paths start with `/`, so the prefix is
- * unambiguous.
- */
-export const WEB_PROJECT_SELECT_PREFIX = "web:";
-
-/** Select value for one uploaded web project. */
-export function webProjectSelectValue(id: string): string {
-  return `${WEB_PROJECT_SELECT_PREFIX}${id}`;
-}
-
-/** Web project id carried by a project-selector value, or `null`. */
-export function webProjectIdFromSelection(
-  value: string | null | undefined,
-): string | null {
-  const trimmed = (value ?? "").trim();
-  if (!trimmed.startsWith(WEB_PROJECT_SELECT_PREFIX)) {
-    return null;
-  }
-  const id = trimmed.slice(WEB_PROJECT_SELECT_PREFIX.length).trim();
-  return id === "" ? null : id;
-}
-
 /**
  * Validates the goal field: trimmed non-empty text is required (the server
  * rejects empty-after-trim goals with `400`). Returns an error message, or
@@ -241,57 +212,6 @@ export function validateGoal(raw: string): string | null {
 export function parsePin(raw: string): number | null {
   const trimmed = raw.trim();
   return /^\d+$/.test(trimmed) ? Number(trimmed) : null;
-}
-
-/**
- * Selector default for the project-folder picker: exactly one available
- * folder is preselected; zero or several leave the picker on legacy workspace
- * mode so the active folder is an explicit choice.
- */
-export function defaultProjectFolderPath(
-  folders: readonly ProjectFolder[],
-): string {
-  return folders.length === 1 ? folders[0].path : PROJECT_FOLDER_UNSET;
-}
-
-/**
- * Selector default for the project picker: exactly one available option (a
- * Docker folder or an uploaded web project) is preselected; zero or several
- * leave the picker on legacy workspace mode so the active project is an
- * explicit choice.
- */
-export function defaultProjectSelection(
-  folders: readonly ProjectFolder[],
-  webProjects: readonly WebProject[],
-): string {
-  const total = folders.length + webProjects.length;
-  if (total !== 1) {
-    return PROJECT_FOLDER_UNSET;
-  }
-  return folders.length === 1
-    ? folders[0].path
-    : webProjectSelectValue(webProjects[0].id);
-}
-
-/**
- * Default of the "Load AGENTS.md" toggle for a selected folder: on only when
- * the folder actually carries the file.
- */
-export function agentsMdDefaultOn(
-  folder:
-    | Pick<ProjectFolder, "agents_md_present">
-    | Pick<WebProject, "agents_md_present">
-    | null
-    | undefined,
-): boolean {
-  return folder?.agents_md_present === true;
-}
-
-/** Presence label for an uploaded web project's `AGENTS.md`. */
-export function webProjectAgentsMdLabel(
-  present: boolean | null | undefined,
-): string {
-  return present === true ? "AGENTS.md present" : "No AGENTS.md";
 }
 
 /**
@@ -343,16 +263,10 @@ export type CreateFormValues = {
    * does not mention Auto gets the planner-decides width.
    */
   swarmWorkersAuto?: boolean;
-  /** Selected project folder path; blank means legacy workspace mode. */
+  /** Selected absolute project folder on the DHI+ host; required. */
   projectFolder?: string;
-  /**
-   * Selected uploaded web project id. Takes precedence over
-   * `projectFolder`: the request sends `web_project_id` and omits
-   * `project_folder` entirely.
-   */
-  webProjectId?: string;
-  /** Create-form Load AGENTS.md toggle. */
-  loadAgentsMd?: boolean;
+  /** Selected absolute AGENTS.md path; blank sends `null`. Independent. */
+  agentsMdPath?: string;
 };
 
 /** Select options for the create-task topology picker, in display order. */
@@ -494,6 +408,8 @@ export type CreateFormResult =
  * Pure form → request-body mapper for `POST /api/tasks`.
  *
  * - the goal is trimmed; empty (after trim) refuses submission;
+ * - the project folder is required: a blank trimmed value refuses submission
+ *   before any other field is parsed;
  * - pins map through {@link parsePin}; unset pins are OMITTED from the body
  *   entirely so the server defaults apply (matching the "omits absent pin
  *   fields" behavior covered in api.test.ts);
@@ -502,10 +418,9 @@ export type CreateFormResult =
  * - `swarm_workers` is ALWAYS sent: a fixed 2–64 count only when the topology
  *   is `swarm` and Auto is off; otherwise (non-swarm, Auto, or blank) `null`.
  *   Out-of-range fixed counts refuse submission with a validation error.
- * - `project_folder` and `load_agents_md` are sent together only when a
- *   Docker folder is selected; legacy workspace mode omits both fields.
- * - a selected web project sends `web_project_id` and `load_agents_md` and
- *   omits `project_folder`, even when a folder value is also present.
+ * - `project_folder` is ALWAYS sent: the trimmed selected folder.
+ * - `agents_md_path` is ALWAYS sent: the trimmed selected AGENTS.md path, or
+ *   `null` when no file is selected. It is independent of the folder.
  */
 export function buildCreateTaskInput(
   values: CreateFormValues,
@@ -513,6 +428,10 @@ export function buildCreateTaskInput(
   const goalError = validateGoal(values.goal);
   if (goalError !== null) {
     return { ok: false, error: goalError };
+  }
+  const projectFolder = (values.projectFolder ?? "").trim();
+  if (projectFolder === "") {
+    return { ok: false, error: "Select a project folder." };
   }
   const topology = parseTopology(values.topology);
   let swarmWorkers: number | null = null;
@@ -523,10 +442,13 @@ export function buildCreateTaskInput(
     }
     swarmWorkers = parseSwarmWorkers(values.swarmWorkers);
   }
+  const agentsMdPath = (values.agentsMdPath ?? "").trim();
   const input: CreateTaskInput = {
     goal: values.goal.trim(),
     topology,
     swarm_workers: swarmWorkers,
+    project_folder: projectFolder,
+    agents_md_path: agentsMdPath === "" ? null : agentsMdPath,
   };
   const planner = parsePin(values.plannerPin);
   if (planner !== null) {
@@ -535,17 +457,6 @@ export function buildCreateTaskInput(
   const worker = parsePin(values.workerPin);
   if (worker !== null) {
     input.worker_profile_id = worker;
-  }
-  const webProjectId = (values.webProjectId ?? "").trim();
-  if (webProjectId !== "") {
-    input.web_project_id = webProjectId;
-    input.load_agents_md = values.loadAgentsMd === true;
-    return { ok: true, input };
-  }
-  const projectFolder = (values.projectFolder ?? "").trim();
-  if (projectFolder !== PROJECT_FOLDER_UNSET) {
-    input.project_folder = projectFolder;
-    input.load_agents_md = values.loadAgentsMd === true;
   }
   return { ok: true, input };
 }

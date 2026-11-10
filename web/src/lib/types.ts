@@ -168,38 +168,16 @@ export type TaskCapacityPatch = Partial<{
  */
 export type AgentsMdState = "loaded" | "truncated" | "not_found" | "disabled";
 
-/** One selectable project folder (`GET /api/project-folders` `folders[]`). */
-export type ProjectFolder = {
-  /** Absolute path used as the `project_folder` create-task value. */
-  path: string;
-  /** Short display name (usually the final path segment). */
+/** One row of `GET /api/fs` — a directory or file on the DHI+ host. */
+export type FileBrowserEntry = {
   name: string;
-  /** True when the folder carries a readable `AGENTS.md`. */
-  agents_md_present: boolean;
-};
-
-/**
- * One uploaded browser-folder snapshot (`GET /api/web-projects`
- * `projects[]`). The folder itself never leaves the browser: only the
- * snapshot bytes and this metadata reach the server.
- */
-export type WebProject = {
-  id: string;
-  name: string;
-  /** True when the uploaded snapshot carried an `AGENTS.md`. */
-  agents_md_present: boolean;
-  file_count?: number;
-  total_bytes?: number;
-  created_at?: string;
-};
-
-/** One result file returned by `GET /api/tasks/{id}/outputs`. */
-export type TaskOutputFile = {
-  /** Relative path under the project, normally `.dhi/<task-id>/…`. */
+  /** Absolute host path (the value a create form submits). */
   path: string;
-  /** File contents as text (`utf8`) or standard base64 (`base64`). */
-  content: string;
-  encoding: "utf8" | "base64";
+  kind: "directory" | "file";
+  /** File size in bytes; present for files. */
+  size?: number;
+  /** RFC 3339 modification time; present when the server reports it. */
+  modified_at?: string;
 };
 
 export type Task = {
@@ -234,20 +212,13 @@ export type Task = {
    * workspace task. Older servers omit the field entirely.
    */
   project_folder?: string | null;
-  /**
-   * Uploaded web project this task works against, or `null`/omitted for
-   * Docker-folder and legacy tasks. Older servers omit the field.
-   */
-  web_project_id?: string | null;
-  /** Display name of `web_project_id`, when the server resolved one. */
-  web_project_name?: string | null;
   /** Per-task scratch folder inside `project_folder`, or `null`/omitted. */
   task_folder?: string | null;
   /**
-   * Whether creation requested the project folder's `AGENTS.md`. Older
-   * servers omit the field.
+   * Absolute host path of the `AGENTS.md` selected at creation, or
+   * `null`/omitted when no file was chosen. Older servers omit the field.
    */
-  load_agents_md?: boolean;
+  agents_md_path?: string | null;
   /**
    * How the `AGENTS.md` load resolved. Older servers omit the field.
    */
@@ -943,30 +914,15 @@ export type ProfilesResponse = {
   profiles: LlmProfile[];
 };
 
-/** `GET /api/project-folders` — the selectable project folders. */
-export type ProjectFoldersResponse = {
-  folders: ProjectFolder[];
-};
-
-/** `GET /api/web-projects` — every uploaded browser-folder snapshot. */
-export type WebProjectsResponse = {
-  projects: WebProject[];
-};
-
-/** `POST /api/web-projects` and `GET /api/web-projects/{id}`. */
-export type WebProjectResponse = {
-  project: WebProject;
-};
-
-/** `PUT /api/web-projects/{id}/files?path=…` — the stored path and size. */
-export type WebProjectFileResponse = {
+/** `GET /api/fs` — the browsable root and one directory listing. */
+export type FileBrowserResponse = {
+  /** Absolute root the browser is confined to. */
+  root: string;
+  /** Absolute path of the listed directory (equals `root` initially). */
   path: string;
-  size: number;
-};
-
-/** `GET /api/tasks/{id}/outputs` — result files written by the task. */
-export type TaskOutputsResponse = {
-  files: TaskOutputFile[];
+  /** Parent directory, or `null` at the root. */
+  parent: string | null;
+  entries: FileBrowserEntry[];
 };
 
 /** `GET /api/intercept/rules` — every rule, evaluation order. */
@@ -1033,21 +989,15 @@ export type CreateTaskInput = {
    */
   swarm_workers?: number | null;
   /**
-   * Absolute project folder selected for the task. Omitted (or `null`) keeps
-   * legacy workspace mode.
+   * Absolute project folder selected on the DHI+ host. The server works in
+   * this folder directly.
    */
-  project_folder?: string | null;
+  project_folder: string;
   /**
-   * Uploaded web project selected for the task. Mutually exclusive with
-   * `project_folder`: when present the server resolves the snapshot and the
-   * browser keeps syncing results back through the folder handle.
+   * Absolute host path of the `AGENTS.md` selected for the planner, or `null`
+   * when no file was chosen.
    */
-  web_project_id?: string | null;
-  /**
-   * Whether to load the project's `AGENTS.md`. Only meaningful (and only sent
-   * by the UI) together with `project_folder` or `web_project_id`.
-   */
-  load_agents_md?: boolean;
+  agents_md_path: string | null;
 };
 
 /**

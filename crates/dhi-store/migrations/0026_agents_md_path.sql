@@ -1,0 +1,1 @@
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS agents_md_path TEXT;

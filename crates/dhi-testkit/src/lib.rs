@@ -222,6 +222,7 @@ impl GraphStore for MemoryStore {
         task.web_project_name = new.web_project_name;
         task.load_agents_md = new.load_agents_md;
         task.agents_md_state = new.agents_md_state;
+        task.agents_md_path = new.agents_md_path;
         task.refresh_task_folder();
         let origin = task.origin_fact();
         let mut inner = self.inner.lock().unwrap();

@@ -3,17 +3,14 @@ import { test } from "node:test";
 import { ApiError } from "./api.ts";
 import {
   PIN_UNSET,
-  PROJECT_FOLDER_UNSET,
   SWARM_WORKERS_AUTO_LABEL,
   SWARM_WORKERS_HELP_TEXT,
   SWARM_WORKERS_MAX,
   SWARM_WORKERS_MIN,
   TOPOLOGY_OPTIONS,
-  agentsMdDefaultOn,
   agentsMdStateLabel,
   agentsMdStateVariant,
   buildCreateTaskInput,
-  defaultProjectFolderPath,
   describeApiError,
   parsePin,
   parseSwarmWorkers,
@@ -31,7 +28,6 @@ import {
   validateGoal,
   validateSwarmWorkers,
 } from "./ui.ts";
-import type { ProjectFolder } from "./types.ts";
 
 // ---------------------------------------------------------------------------
 // shortenId
@@ -105,38 +101,6 @@ test("parsePin maps select values onto ids or null", () => {
   assert.equal(parsePin("2.5"), null);
 });
 
-const folderWithAgents: ProjectFolder = {
-  path: "/srv/projects/build",
-  name: "Build",
-  agents_md_present: true,
-};
-
-const folderWithoutAgents: ProjectFolder = {
-  path: "/srv/projects/other",
-  name: "Other",
-  agents_md_present: false,
-};
-
-test("defaultProjectFolderPath preselects exactly one folder", () => {
-  assert.equal(defaultProjectFolderPath([]), PROJECT_FOLDER_UNSET);
-  assert.equal(
-    defaultProjectFolderPath([folderWithAgents]),
-    folderWithAgents.path,
-  );
-  // Several folders require an explicit choice, so legacy stays the default.
-  assert.equal(
-    defaultProjectFolderPath([folderWithAgents, folderWithoutAgents]),
-    PROJECT_FOLDER_UNSET,
-  );
-});
-
-test("agentsMdDefaultOn follows the folder's presence flag", () => {
-  assert.equal(agentsMdDefaultOn(null), false);
-  assert.equal(agentsMdDefaultOn(undefined), false);
-  assert.equal(agentsMdDefaultOn(folderWithAgents), true);
-  assert.equal(agentsMdDefaultOn(folderWithoutAgents), false);
-});
-
 test("agentsMdStateLabel and variant map every state", () => {
   assert.equal(agentsMdStateLabel("loaded"), "AGENTS.md loaded");
   assert.equal(agentsMdStateLabel("truncated"), "AGENTS.md truncated");
@@ -153,11 +117,14 @@ test("agentsMdStateLabel and variant map every state", () => {
   assert.equal(agentsMdStateVariant(undefined), "muted");
 });
 
+const TEST_PROJECT_FOLDER = "/srv/projects/build";
+
 test("buildCreateTaskInput always sends topology and swarm_workers, defaulting to null", () => {
   const result = buildCreateTaskInput({
     goal: "  mate in two  ",
     plannerPin: "",
     workerPin: "",
+    projectFolder: TEST_PROJECT_FOLDER,
   });
   assert.ok(result.ok);
   // Topology and the swarm width are explicit (`null` = planner decides);
@@ -166,9 +133,13 @@ test("buildCreateTaskInput always sends topology and swarm_workers, defaulting t
     goal: "mate in two",
     topology: null,
     swarm_workers: null,
+    project_folder: TEST_PROJECT_FOLDER,
+    agents_md_path: null,
   });
   assert.deepEqual(Object.keys(result.input).sort(), [
+    "agents_md_path",
     "goal",
+    "project_folder",
     "swarm_workers",
     "topology",
   ]);
@@ -178,12 +149,15 @@ test("buildCreateTaskInput always sends topology and swarm_workers, defaulting t
     plannerPin: "",
     workerPin: "",
     topology: "",
+    projectFolder: TEST_PROJECT_FOLDER,
   });
   assert.ok(blank.ok);
   assert.deepEqual(blank.input, {
     goal: "g",
     topology: null,
     swarm_workers: null,
+    project_folder: TEST_PROJECT_FOLDER,
+    agents_md_path: null,
   });
 });
 
@@ -194,12 +168,15 @@ test("buildCreateTaskInput carries a selected topology enum", () => {
       plannerPin: "",
       workerPin: "",
       topology,
+      projectFolder: TEST_PROJECT_FOLDER,
     });
     assert.ok(result.ok);
     assert.deepEqual(result.input, {
       goal: "g",
       topology,
       swarm_workers: null,
+      project_folder: TEST_PROJECT_FOLDER,
+      agents_md_path: null,
     });
   }
   // Unknown/blank values degrade to "planner decides" instead of failing.
@@ -208,6 +185,7 @@ test("buildCreateTaskInput carries a selected topology enum", () => {
     plannerPin: "",
     workerPin: "",
     topology: "mystery",
+    projectFolder: TEST_PROJECT_FOLDER,
   });
   assert.ok(unknown.ok);
   assert.equal(unknown.input.topology, null);
@@ -223,6 +201,7 @@ test("buildCreateTaskInput sends a fixed swarm_workers only for a swarm topology
       topology: "swarm",
       swarmWorkers: workers,
       swarmWorkersAuto: false,
+      projectFolder: TEST_PROJECT_FOLDER,
     });
     assert.ok(result.ok);
     assert.equal(result.input.swarm_workers, Number(workers));
@@ -241,6 +220,7 @@ test("buildCreateTaskInput sends a fixed swarm_workers only for a swarm topology
       topology: "swarm",
       swarmWorkers: String(workers),
       swarmWorkersAuto: false,
+      projectFolder: TEST_PROJECT_FOLDER,
     });
     assert.ok(result.ok);
     assert.equal(result.input.swarm_workers, workers);
@@ -258,6 +238,7 @@ test("buildCreateTaskInput sends a fixed swarm_workers only for a swarm topology
       plannerPin: "",
       workerPin: "",
       topology: "swarm",
+      projectFolder: TEST_PROJECT_FOLDER,
       ...values,
     });
     assert.ok(result.ok);
@@ -273,6 +254,7 @@ test("buildCreateTaskInput sends a fixed swarm_workers only for a swarm topology
       topology,
       swarmWorkers: "64",
       swarmWorkersAuto: false,
+      projectFolder: TEST_PROJECT_FOLDER,
     });
     assert.ok(result.ok);
     assert.equal(result.input.swarm_workers, null);
@@ -288,6 +270,7 @@ test("buildCreateTaskInput rejects fixed swarm widths outside 2–64", () => {
       topology: "swarm",
       swarmWorkers: workers,
       swarmWorkersAuto: false,
+      projectFolder: TEST_PROJECT_FOLDER,
     });
     assert.equal(result.ok, false, workers);
     if (!result.ok) {
@@ -303,6 +286,7 @@ test("buildCreateTaskInput rejects fixed swarm widths outside 2–64", () => {
     topology: "swarm",
     swarmWorkers: "65",
     swarmWorkersAuto: true,
+    projectFolder: TEST_PROJECT_FOLDER,
   });
   assert.ok(auto.ok);
   assert.equal(auto.input.swarm_workers, null);
@@ -392,64 +376,69 @@ test("buildCreateTaskInput carries numeric pins into the canonical fields", () =
     goal: "g",
     plannerPin: "7",
     workerPin: "9",
+    projectFolder: TEST_PROJECT_FOLDER,
   });
   assert.ok(result.ok);
   assert.deepEqual(result.input, {
     goal: "g",
     topology: null,
     swarm_workers: null,
+    project_folder: TEST_PROJECT_FOLDER,
+    agents_md_path: null,
     planner_profile_id: 7,
     worker_profile_id: 9,
   });
 });
 
-test("buildCreateTaskInput sends project_folder and load_agents_md together", () => {
-  const withAgents = buildCreateTaskInput({
+test("buildCreateTaskInput sends project_folder and agents_md_path, not legacy web fields", () => {
+  const result = buildCreateTaskInput({
     goal: "g",
     plannerPin: "",
     workerPin: "",
     projectFolder: " /srv/projects/build ",
-    loadAgentsMd: true,
+    agentsMdPath: " /srv/projects/build/AGENTS.md ",
   });
-  assert.ok(withAgents.ok);
-  assert.deepEqual(withAgents.input, {
+  assert.ok(result.ok);
+  assert.deepEqual(result.input, {
     goal: "g",
     topology: null,
     swarm_workers: null,
     project_folder: "/srv/projects/build",
-    load_agents_md: true,
+    agents_md_path: "/srv/projects/build/AGENTS.md",
   });
-
-  const withoutAgents = buildCreateTaskInput({
-    goal: "g",
-    plannerPin: "",
-    workerPin: "",
-    projectFolder: "/srv/projects/build",
-    loadAgentsMd: false,
-  });
-  assert.ok(withoutAgents.ok);
-  assert.equal(
-    withoutAgents.input.project_folder,
-    "/srv/projects/build",
-  );
-  // Explicit false is sent, not omitted, once a folder is active.
-  assert.equal(withoutAgents.input.load_agents_md, false);
+  assert.equal("web_project_id" in result.input, false);
+  assert.equal("load_agents_md" in result.input, false);
 });
 
-test("buildCreateTaskInput omits project fields in legacy workspace mode", () => {
+test("buildCreateTaskInput sends the project folder and null for no AGENTS.md", () => {
+  for (const agentsMdPath of [undefined, "", "   "]) {
+    const result = buildCreateTaskInput({
+      goal: "g",
+      plannerPin: "",
+      workerPin: "",
+      projectFolder: TEST_PROJECT_FOLDER,
+      agentsMdPath,
+    });
+    assert.ok(result.ok);
+    assert.equal(result.input.project_folder, TEST_PROJECT_FOLDER);
+    assert.equal(result.input.agents_md_path, null);
+    assert.equal("web_project_id" in result.input, false);
+    assert.equal("load_agents_md" in result.input, false);
+  }
+});
+
+test("buildCreateTaskInput requires a project folder", () => {
   for (const projectFolder of [undefined, "", "   "]) {
-    for (const loadAgentsMd of [undefined, true, false]) {
-      const result = buildCreateTaskInput({
-        goal: "g",
-        plannerPin: "",
-        workerPin: "",
-        projectFolder,
-        loadAgentsMd,
-      });
-      assert.ok(result.ok);
-      assert.equal("project_folder" in result.input, false);
-      assert.equal("load_agents_md" in result.input, false);
-    }
+    const result = buildCreateTaskInput({
+      goal: "g",
+      plannerPin: "",
+      workerPin: "",
+      projectFolder,
+    });
+    assert.deepEqual(result, {
+      ok: false,
+      error: "Select a project folder.",
+    });
   }
 });
 

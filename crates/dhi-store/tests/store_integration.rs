@@ -32,8 +32,8 @@ async fn create_task_writes_one_origin_fact(pool: PgPool) {
 
 /// A task created without a project keeps the legacy row defaults through
 /// every read path. This is the compatibility contract for old tasks: the
-/// migration backfills project_folder null, load_agents_md false, and
-/// agents_md_state disabled.
+/// migration backfills project_folder null, load_agents_md false,
+/// agents_md_state disabled, and agents_md_path null.
 #[sqlx::test]
 async fn legacy_tasks_keep_project_fields_unset(pool: PgPool) {
     let store = Store::new(pool);
@@ -56,6 +56,7 @@ async fn legacy_tasks_keep_project_fields_unset(pool: PgPool) {
         assert_eq!(row.web_project_name, None);
         assert!(!row.load_agents_md);
         assert_eq!(row.agents_md_state, AgentsMdState::Disabled);
+        assert_eq!(row.agents_md_path, None);
     }
 }
 
@@ -85,6 +86,7 @@ async fn migration_defaults_apply_to_a_row_without_project_columns(pool: PgPool)
     assert_eq!(task.web_project_name, None);
     assert!(!task.load_agents_md);
     assert_eq!(task.agents_md_state, AgentsMdState::Disabled);
+    assert_eq!(task.agents_md_path, None);
 }
 
 /// Project selection and instruction state round-trip through the task row,
@@ -94,11 +96,11 @@ async fn project_task_fields_round_trip(pool: PgPool) {
     let store = Store::new(pool);
     let project = "/srv/projects/build".to_string();
     let task = store
-        .create_task_with_pins(NewTask::new("project task").with_project(
-            project.clone(),
-            true,
-            AgentsMdState::Loaded,
-        ))
+        .create_task_with_pins(
+            NewTask::new("project task")
+                .with_project(project.clone(), true, AgentsMdState::Loaded)
+                .with_agents_md("/srv/agents/AGENTS.md", AgentsMdState::Loaded),
+        )
         .await
         .unwrap();
 
@@ -111,12 +113,24 @@ async fn project_task_fields_round_trip(pool: PgPool) {
     assert_eq!(task.task_folder.as_deref(), Some(expected_folder.as_str()));
     assert!(task.load_agents_md);
     assert_eq!(task.agents_md_state, AgentsMdState::Loaded);
+    assert_eq!(
+        task.agents_md_path.as_deref(),
+        Some("/srv/agents/AGENTS.md")
+    );
 
     let persisted = store.get_task(task.id).await.unwrap().expect("task exists");
     assert_eq!(persisted.project_folder, task.project_folder);
     assert_eq!(persisted.task_folder, task.task_folder);
     assert!(persisted.load_agents_md);
     assert_eq!(persisted.agents_md_state, AgentsMdState::Loaded);
+    assert_eq!(persisted.agents_md_path, task.agents_md_path);
+
+    let listed = store.list_tasks(10).await.unwrap();
+    let row = listed
+        .iter()
+        .find(|row| row.id == task.id)
+        .expect("task is listed");
+    assert_eq!(row.agents_md_path, task.agents_md_path);
 
     store
         .set_task_agents_md_state(task.id, AgentsMdState::Truncated)
@@ -131,6 +145,39 @@ async fn project_task_fields_round_trip(pool: PgPool) {
             .agents_md_state,
         AgentsMdState::Truncated
     );
+}
+
+/// A separately selected `AGENTS.md` path round-trips through the task row
+/// even when no project folder is selected.
+#[sqlx::test]
+async fn task_agents_md_path_round_trips(pool: PgPool) {
+    let store = Store::new(pool);
+    let task = store
+        .create_task_with_pins(
+            NewTask::new("instructions only")
+                .with_agents_md("/srv/agents/AGENTS.md", AgentsMdState::Loaded),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(task.project_folder, None);
+    assert_eq!(task.task_folder, None);
+    assert_eq!(
+        task.agents_md_path.as_deref(),
+        Some("/srv/agents/AGENTS.md")
+    );
+    assert!(task.load_agents_md);
+    assert_eq!(task.agents_md_state, AgentsMdState::Loaded);
+
+    let persisted = store.get_task(task.id).await.unwrap().expect("task exists");
+    assert_eq!(persisted.agents_md_path, task.agents_md_path);
+
+    let listed = store.list_tasks(10).await.unwrap();
+    let row = listed
+        .iter()
+        .find(|row| row.id == task.id)
+        .expect("task is listed");
+    assert_eq!(row.agents_md_path, task.agents_md_path);
 }
 
 /// Web project metadata round-trips through its own row, with the stored root

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+pub mod file_browser;
 pub mod mcp;
 mod mcp_api;
 pub mod project_folders;
@@ -23,12 +24,13 @@ mod tool_api;
 pub mod web_projects;
 pub mod web_providers;
 
+pub use file_browser::{DirectoryListing, FileBrowser, FileEntry, FileKind, SelectedAgentsMd};
 pub use project_folders::{ProjectFolder, ProjectFolderInfo, ProjectFolders};
 pub use task_runs::TaskRunRegistry;
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use axum::extract::rejection::JsonRejection;
+use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -108,6 +110,9 @@ pub struct AppState {
     pub task_runs: Arc<TaskRunRegistry>,
     /// The validated project folders a task may select at creation.
     pub project_folders: Arc<project_folders::ProjectFolders>,
+    /// The host file browser used to select a project folder and an optional
+    /// `AGENTS.md`. Disabled when `DHI_FILE_BROWSER_ROOT` is unset.
+    pub file_browser: Arc<file_browser::FileBrowser>,
     /// Browser-folder web project storage configuration. Disabled when
     /// `DHI_WEB_PROJECTS_ROOT` is unset.
     pub web_projects: Arc<web_projects::WebProjects>,
@@ -157,6 +162,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/health", get(health))
         .route("/api/tasks", get(list_tasks).post(create_task))
+        .route("/api/fs", get(list_fs))
         .route("/api/project-folders", get(list_project_folders))
         .route(
             "/api/web-projects",
@@ -316,6 +322,45 @@ async fn health() -> Json<Value> {
         "service": "dhi",
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// `GET /api/fs?path=…` query string.
+#[derive(Debug, Deserialize)]
+struct FsQuery {
+    /// Absolute path to list. Omitted or blank starts at the configured root.
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// Lists one host directory for the project-folder and `AGENTS.md` pickers.
+///
+/// An omitted or blank `path` starts at the configured root. Disabled
+/// deployments answer `404` before looking at the query, exactly as if the
+/// route did not exist. Validation failures are request errors.
+async fn list_fs(
+    State(state): State<AppState>,
+    query: Result<Query<FsQuery>, QueryRejection>,
+) -> Result<Json<file_browser::DirectoryListing>, ApiError> {
+    if !state.file_browser.enabled() {
+        return Err(ApiError::not_found(format!(
+            "file browser is unavailable; set {}",
+            file_browser::FILE_BROWSER_ROOT_ENV
+        )));
+    }
+    let Query(query) = query.map_err(|rejection| ApiError::bad_request(rejection.body_text()))?;
+    let requested = match query.path.as_deref().filter(|path| !path.trim().is_empty()) {
+        Some(path) => path,
+        None => state
+            .file_browser
+            .root()
+            .and_then(|root| root.to_str())
+            .ok_or_else(|| ApiError::internal("file browser root is not valid UTF-8"))?,
+    };
+    state
+        .file_browser
+        .browse(requested)
+        .map(Json)
+        .map_err(ApiError::bad_request)
 }
 
 /// `GET /api/project-folders` output.
@@ -624,11 +669,14 @@ impl IntoResponse for ApiError {
 /// and must be 2 to 64. `null` means Auto. It pins the exact team size for
 /// every swarm plan.
 ///
-/// An optional `project_folder` must exactly match one configured
-/// `DHI_PROJECT_FOLDERS` path. An optional `web_project_id` selects one
-/// uploaded browser-folder project instead; the two fields are mutually
-/// exclusive. `load_agents_md` defaults to true when a folder is selected and
-/// its `AGENTS.md` exists; omitting it otherwise leaves the toggle off.
+/// An optional `project_folder` must be an absolute real directory below
+/// `DHI_FILE_BROWSER_ROOT`; the host is used directly, with no upload copy.
+/// An optional `web_project_id` selects one uploaded browser-folder project
+/// instead; the two fields are mutually exclusive. An optional
+/// `agents_md_path` selects the one `AGENTS.md` the planner may read: an
+/// absolute regular file named exactly `AGENTS.md`, at most 32 KiB, below the
+/// same root. Omitting it loads no instructions, and the legacy
+/// `load_agents_md` request toggle is ignored.
 #[derive(Debug, Deserialize)]
 struct CreateTaskRequest {
     goal: String,
@@ -646,7 +694,7 @@ struct CreateTaskRequest {
     #[serde(default)]
     web_project_id: Option<Uuid>,
     #[serde(default)]
-    load_agents_md: Option<bool>,
+    agents_md_path: Option<String>,
 }
 
 /// `POST /api/tasks/{id}/goals` input.
@@ -975,51 +1023,43 @@ async fn create_task(
         Some(id) => Some(resolve_web_project(&state, id).await?),
         None => None,
     };
-    // Host-folder selection still goes through the configured allowlist. A
-    // web project skips that validation: its folder is server-managed below
+    // Host-folder selection is validated against the live file-browser root.
+    // A web project skips that validation: its folder is server-managed below
     // the validated DHI_WEB_PROJECTS_ROOT.
-    let project = if web_project.is_some() {
-        None
-    } else {
-        match body.project_folder.as_deref() {
-            Some(folder) => Some(
-                state
-                    .project_folders
-                    .resolve(folder)
-                    .map_err(ApiError::bad_request)?,
-            ),
-            None => None,
-        }
+    let project = match (&web_project, body.project_folder.as_deref()) {
+        (None, Some(folder)) => Some(resolve_host_project_folder(&state, folder)?),
+        _ => None,
     };
     let selected_folder = match (&project, &web_project) {
         (Some(folder), None) => Some(folder.clone()),
         (None, Some(record)) => Some(web_projects::record_project_dir(record)),
         _ => None,
     };
-    let (load_agents_md, agents_md_state) = match &selected_folder {
-        Some(folder) => {
-            let found = dhi_core::inspect_agents_md(folder).map_err(|err| {
-                ApiError::bad_request(format!(
-                    "cannot inspect {}/AGENTS.md: {err}",
-                    folder.display()
-                ))
-            })?;
-            match body.load_agents_md {
-                Some(true) => (true, found),
-                Some(false) => (false, AgentsMdState::Disabled),
-                None if found.has_instructions() => (true, found),
-                None => (false, AgentsMdState::Disabled),
+    // The instruction file is selected independently of the project folder.
+    // Its load toggle and state are derived from that one selection, never
+    // from an implicit `<project>/AGENTS.md` lookup.
+    let (agents_md_path, agents_md_state) = match body.agents_md_path.as_deref() {
+        Some(requested) => {
+            if !state.file_browser.enabled() {
+                return Err(ApiError::bad_request(format!(
+                    "agents_md_path requires {}",
+                    file_browser::FILE_BROWSER_ROOT_ENV
+                )));
             }
+            let selected = state
+                .file_browser
+                .resolve_agents_md(requested)
+                .map_err(ApiError::bad_request)?;
+            let path = selected
+                .path
+                .to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| ApiError::bad_request("agents_md_path is not valid UTF-8"))?;
+            (Some(path), selected.state)
         }
-        None => {
-            if body.load_agents_md == Some(true) {
-                return Err(ApiError::bad_request(
-                    "load_agents_md requires project_folder or web_project_id",
-                ));
-            }
-            (false, AgentsMdState::Disabled)
-        }
+        None => (None, AgentsMdState::Disabled),
     };
+    let load_agents_md = agents_md_path.is_some();
 
     // The id is allocated here so the project task folder exists before the
     // row does; a folder failure must not leave a task behind.
@@ -1062,6 +1102,7 @@ async fn create_task(
             web_project_name: web_project.as_ref().map(|record| record.name.clone()),
             load_agents_md,
             agents_md_state,
+            agents_md_path,
         })
         .await
         .map_err(ApiError::internal)?;
@@ -1084,6 +1125,24 @@ async fn create_task(
     spawn_task_loop(&state.store, &state.task_runs, &state.engine, &task);
 
     Ok((StatusCode::CREATED, Json(task)))
+}
+
+/// Validates one host project folder against the live file-browser root.
+///
+/// The selected path is canonicalized and used directly. A deployment without
+/// `DHI_FILE_BROWSER_ROOT` refuses the field instead of falling back to the
+/// legacy allowlist.
+fn resolve_host_project_folder(state: &AppState, requested: &str) -> Result<PathBuf, ApiError> {
+    if !state.file_browser.enabled() {
+        return Err(ApiError::bad_request(format!(
+            "project_folder requires {}",
+            file_browser::FILE_BROWSER_ROOT_ENV
+        )));
+    }
+    state
+        .file_browser
+        .resolve_directory(requested)
+        .map_err(ApiError::bad_request)
 }
 
 /// Loads one web project for task creation and proves its directory is real.
@@ -3419,6 +3478,7 @@ mod tests {
             web: Arc::new(crate::web_providers::WebProviderRuntime::empty()),
             task_runs: Arc::new(TaskRunRegistry::disabled()),
             project_folders: Arc::new(crate::project_folders::ProjectFolders::default()),
+            file_browser: Arc::new(crate::file_browser::FileBrowser::default()),
             web_projects: Arc::new(crate::web_projects::WebProjects::default()),
             web_project_store: None,
             team_store: None,
@@ -4280,6 +4340,7 @@ mod tests {
             web: Arc::new(crate::web_providers::WebProviderRuntime::empty()),
             task_runs: Arc::new(TaskRunRegistry::disabled()),
             project_folders: Arc::new(crate::project_folders::ProjectFolders::default()),
+            file_browser: Arc::new(crate::file_browser::FileBrowser::default()),
             web_projects: Arc::new(crate::web_projects::WebProjects::default()),
             web_project_store: None,
             team_store: None,
@@ -4330,6 +4391,7 @@ mod tests {
             web: Arc::new(crate::web_providers::WebProviderRuntime::empty()),
             task_runs: Arc::new(TaskRunRegistry::disabled()),
             project_folders: Arc::new(crate::project_folders::ProjectFolders::default()),
+            file_browser: Arc::new(crate::file_browser::FileBrowser::default()),
             web_projects: Arc::new(crate::web_projects::WebProjects::default()),
             web_project_store: None,
             team_store: None,
@@ -4817,6 +4879,7 @@ mod tests {
         assert!(json["project_folder"].is_null(), "{json}");
         assert!(json["web_project_id"].is_null(), "{json}");
         assert!(json["web_project_name"].is_null(), "{json}");
+        assert!(json["agents_md_path"].is_null(), "{json}");
         assert!(json["task_folder"].is_null(), "{json}");
         assert_eq!(json["load_agents_md"], false, "{json}");
         assert_eq!(json["agents_md_state"], "disabled", "{json}");
@@ -4825,6 +4888,7 @@ mod tests {
         let (status, detail) = send(app, get_uri(&format!("/api/tasks/{id}"))).await;
         assert_eq!(status, StatusCode::OK, "{detail}");
         assert!(detail["project_folder"].is_null(), "{detail}");
+        assert!(detail["agents_md_path"].is_null(), "{detail}");
         assert!(detail["task_folder"].is_null(), "{detail}");
         assert_eq!(detail["load_agents_md"], false, "{detail}");
         assert_eq!(detail["agents_md_state"], "disabled", "{detail}");
@@ -4872,17 +4936,132 @@ mod tests {
         assert_eq!(folders[1]["agents_md_present"], false);
     }
 
+    fn state_with_file_browser(store: Arc<MemoryStore>, root: &std::path::Path) -> AppState {
+        let mut state = test_state_with_store(store);
+        state.file_browser = Arc::new(
+            file_browser::FileBrowser::parse(Some(root.to_str().unwrap()))
+                .expect("test file browser root is valid"),
+        );
+        state
+    }
+
+    fn fs_uri(path: &std::path::Path) -> String {
+        format!("/api/fs?path={}", path.display())
+    }
+
     #[tokio::test]
-    async fn create_task_selects_a_project_folder_and_creates_its_task_dir() {
+    async fn fs_route_returns_404_when_the_browser_is_disabled() {
+        let app = router(test_state());
+        let (status, body) = send(app.clone(), get_uri("/api/fs?path=/")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unavailable"),
+            "{body}"
+        );
+
+        // The disabled check runs before query handling: even a request with
+        // no path looks like a missing route.
+        let (status, _) = send(app, get_uri("/api/fs")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn fs_route_defaults_to_the_root_for_omitted_and_blank_paths() {
         let temp = tempfile::tempdir().unwrap();
-        let project = temp.path().join("project");
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        std::fs::write(root.join("notes.txt"), "hello").unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let app = router(state_with_file_browser(store, &root));
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let root_text = canonical_root.display().to_string();
+
+        for uri in ["/api/fs", "/api/fs?path=", "/api/fs?path=%20%20"] {
+            let (status, body) = send(app.clone(), get_uri(uri)).await;
+            assert_eq!(status, StatusCode::OK, "{uri} -> {body}");
+            assert_eq!(body["root"], root_text, "{uri} -> {body}");
+            assert_eq!(body["path"], root_text, "{uri} -> {body}");
+            assert!(body["parent"].is_null(), "{uri} -> {body}");
+            let names: Vec<&str> = body["entries"]
+                .as_array()
+                .expect("entries array")
+                .iter()
+                .map(|entry| entry["name"].as_str().unwrap())
+                .collect();
+            assert_eq!(names, ["project", "notes.txt"], "{uri} -> {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_route_lists_a_directory_and_rejects_escapes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        std::fs::create_dir_all(root.join("alpha")).unwrap();
+        std::fs::write(root.join("notes.txt"), "hello").unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let app = router(state_with_file_browser(store, &root));
+        let canonical_root = std::fs::canonicalize(&root).unwrap();
+        let root_text = canonical_root.display().to_string();
+
+        let (status, body) = send(app.clone(), get_uri(&fs_uri(&canonical_root))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["root"], root_text);
+        assert_eq!(body["path"], root_text);
+        assert!(body["parent"].is_null(), "{body}");
+        let entries = body["entries"].as_array().expect("entries array");
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["alpha", "project", "notes.txt"]);
+        assert_eq!(entries[0]["kind"], "directory");
+        assert_eq!(entries[2]["kind"], "file");
+        assert_eq!(entries[2]["size"], 5);
+        assert!(entries[2]["modified_at"].is_string(), "{body}");
+
+        let child = canonical_root.join("project");
+        let (status, body) = send(app.clone(), get_uri(&fs_uri(&child))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["path"], child.display().to_string());
+        assert_eq!(body["parent"], root_text);
+
+        let mut invalid = vec![
+            outside.display().to_string(),
+            canonical_root
+                .join("..")
+                .join("outside")
+                .display()
+                .to_string(),
+            "relative".to_string(),
+        ];
+        #[cfg(unix)]
+        {
+            let link = canonical_root.join("link");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            invalid.push(link.display().to_string());
+        }
+        for path in invalid {
+            let (status, body) = send(app.clone(), get_uri(&format!("/api/fs?path={path}"))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} -> {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn create_task_selects_a_host_project_folder_and_creates_its_task_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let project = root.join("project");
         std::fs::create_dir_all(&project).unwrap();
+        // An implicit `<project>/AGENTS.md` must no longer load by itself.
         std::fs::write(project.join("AGENTS.md"), "use the project style").unwrap();
         let store = Arc::new(MemoryStore::new());
-        let app = router(state_with_project_folders(
-            store.clone(),
-            &[project.as_path()],
-        ));
+        let app = router(state_with_file_browser(store.clone(), &root));
 
         let (status, json) = send(
             app.clone(),
@@ -4891,6 +5070,7 @@ mod tests {
                 json!({
                     "goal": "read the project",
                     "project_folder": project.display().to_string(),
+                    "load_agents_md": true,
                 }),
             ),
         )
@@ -4906,8 +5086,9 @@ mod tests {
             Some(canonical_text.as_str())
         );
         assert_eq!(json["task_folder"].as_str(), Some(folder_text.as_str()));
-        assert_eq!(json["load_agents_md"], true, "{json}");
-        assert_eq!(json["agents_md_state"], "loaded", "{json}");
+        assert!(json["agents_md_path"].is_null(), "{json}");
+        assert_eq!(json["load_agents_md"], false, "{json}");
+        assert_eq!(json["agents_md_state"], "disabled", "{json}");
         assert!(expected_folder.is_dir(), "the task folder exists at create");
         assert_eq!(
             std::fs::read_to_string(canonical.join(".dhi").join(".gitignore")).unwrap(),
@@ -4921,34 +5102,49 @@ mod tests {
             Some(canonical_text.as_str())
         );
         assert_eq!(detail["task_folder"].as_str(), Some(folder_text.as_str()));
-        assert_eq!(detail["load_agents_md"], true);
-        assert_eq!(detail["agents_md_state"], "loaded");
+        assert!(detail["agents_md_path"].is_null(), "{detail}");
+        assert_eq!(detail["load_agents_md"], false);
+        assert_eq!(detail["agents_md_state"], "disabled");
+
+        let persisted = store.get_task(id).await.unwrap().expect("task row");
+        assert_eq!(
+            persisted.project_folder.as_deref(),
+            Some(canonical_text.as_str())
+        );
+        assert_eq!(persisted.agents_md_path, None);
+        assert!(!persisted.load_agents_md);
+        assert_eq!(persisted.agents_md_state, AgentsMdState::Disabled);
     }
 
     #[tokio::test]
-    async fn create_task_rejects_an_unconfigured_project_folder() {
+    async fn create_task_rejects_project_folders_outside_the_browser_root() {
         let temp = tempfile::tempdir().unwrap();
-        let configured = temp.path().join("configured");
-        let other = temp.path().join("other");
-        std::fs::create_dir_all(&configured).unwrap();
-        std::fs::create_dir_all(&other).unwrap();
+        let root = temp.path().join("root");
+        let project = root.join("project");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = root.join("file.txt");
+        std::fs::write(&file, "not a folder").unwrap();
         let store = Arc::new(MemoryStore::new());
-        let app = router(state_with_project_folders(
-            store.clone(),
-            &[configured.as_path()],
-        ));
+        let app = router(state_with_file_browser(store.clone(), &root));
 
-        for folder in [
-            other.display().to_string(),
-            configured.join("nested").display().to_string(),
-            configured
-                .join("..")
-                .join("configured")
-                .display()
-                .to_string(),
+        let mut invalid = vec![
+            outside.display().to_string(),
+            root.join("missing").display().to_string(),
+            project.join("..").join("project").display().to_string(),
+            file.display().to_string(),
             "relative/project".to_string(),
             String::new(),
-        ] {
+        ];
+        #[cfg(unix)]
+        {
+            let link = root.join("link");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            invalid.push(link.display().to_string());
+        }
+
+        for folder in invalid {
             let (status, json) = send(
                 app.clone(),
                 post_json(
@@ -4966,42 +5162,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_task_with_missing_agents_md_and_explicit_toggle_is_not_found() {
+    async fn create_task_project_folder_requires_the_file_browser() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         let store = Arc::new(MemoryStore::new());
+        // The legacy allowlist is configured and still must not be used.
         let app = router(state_with_project_folders(
             store.clone(),
             &[project.as_path()],
         ));
-
         let (status, json) = send(
             app,
             post_json(
                 "/api/tasks",
                 json!({
-                    "goal": "no instructions",
+                    "goal": "no browser",
                     "project_folder": project.display().to_string(),
-                    "load_agents_md": true,
                 }),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::CREATED, "{json}");
-        assert_eq!(json["load_agents_md"], true, "{json}");
-        assert_eq!(json["agents_md_state"], "not_found", "{json}");
-    }
-
-    #[tokio::test]
-    async fn create_task_without_project_rejects_enabling_agents_md() {
-        let store = Arc::new(MemoryStore::new());
-        let app = router(test_state_with_store(store));
-        let (status, json) = send(
-            app,
-            post_json(
-                "/api/tasks",
-                json!({"goal": "no folder", "load_agents_md": true}),
             ),
         )
         .await;
@@ -5010,8 +5188,189 @@ mod tests {
             json["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("project_folder")
+                .contains(file_browser::FILE_BROWSER_ROOT_ENV),
+            "{json}"
         );
+        assert!(store.list_tasks(10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_task_selects_agents_md_path_separately() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let project = root.join("project");
+        let instructions = root.join("instructions");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&instructions).unwrap();
+        // Keep the project's own file present too: the running engine may
+        // refresh `agents_md_state` before this test reads the row back.
+        std::fs::write(project.join("AGENTS.md"), "project rules\n").unwrap();
+        let agents = instructions.join("AGENTS.md");
+        std::fs::write(&agents, "read the house rules\n").unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let app = router(state_with_file_browser(store.clone(), &root));
+        let canonical_project = std::fs::canonicalize(&project).unwrap();
+        let canonical_agents = std::fs::canonicalize(&agents).unwrap();
+
+        let (status, json) = send(
+            app.clone(),
+            post_json(
+                "/api/tasks",
+                json!({
+                    "goal": "use separate instructions",
+                    "project_folder": project.display().to_string(),
+                    "agents_md_path": agents.display().to_string(),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert_eq!(
+            json["project_folder"].as_str(),
+            Some(canonical_project.to_str().unwrap())
+        );
+        assert_eq!(
+            json["agents_md_path"].as_str(),
+            Some(canonical_agents.to_str().unwrap())
+        );
+        assert_eq!(json["load_agents_md"], true, "{json}");
+        assert_eq!(json["agents_md_state"], "loaded", "{json}");
+
+        let id: Uuid = json["id"].as_str().unwrap().parse().unwrap();
+        let persisted = store.get_task(id).await.unwrap().expect("task row");
+        assert_eq!(
+            persisted.agents_md_path.as_deref(),
+            Some(canonical_agents.to_str().unwrap())
+        );
+        assert!(persisted.load_agents_md);
+        assert_eq!(persisted.agents_md_state, AgentsMdState::Loaded);
+
+        let (status, detail) = send(app, get_uri(&format!("/api/tasks/{id}"))).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(
+            detail["agents_md_path"].as_str(),
+            Some(canonical_agents.to_str().unwrap())
+        );
+        assert_eq!(detail["load_agents_md"], true);
+        assert_eq!(detail["agents_md_state"], "loaded");
+    }
+
+    #[tokio::test]
+    async fn create_task_with_agents_md_path_alone_is_valid() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let agents = root.join("AGENTS.md");
+        std::fs::write(&agents, "rules\n").unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let app = router(state_with_file_browser(store.clone(), &root));
+
+        let (status, json) = send(
+            app,
+            post_json(
+                "/api/tasks",
+                json!({
+                    "goal": "instructions only",
+                    "agents_md_path": agents.display().to_string(),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{json}");
+        assert!(json["project_folder"].is_null(), "{json}");
+        assert_eq!(
+            json["agents_md_path"].as_str(),
+            Some(std::fs::canonicalize(&agents).unwrap().to_str().unwrap())
+        );
+        assert_eq!(json["load_agents_md"], true, "{json}");
+        assert_eq!(json["agents_md_state"], "loaded", "{json}");
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_invalid_agents_md_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir_all(root.join("valid")).unwrap();
+        std::fs::create_dir_all(root.join("wrong-name")).unwrap();
+        std::fs::create_dir_all(root.join("oversize")).unwrap();
+        std::fs::create_dir_all(root.join("directory")).unwrap();
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        std::fs::write(root.join("valid/AGENTS.md"), "ok").unwrap();
+        std::fs::write(root.join("wrong-name/agents.md"), "lowercase").unwrap();
+        std::fs::write(root.join("wrong-name/OTHER.md"), "other").unwrap();
+        std::fs::write(
+            root.join("oversize/AGENTS.md"),
+            vec![b'a'; dhi_core::AGENTS_MD_MAX_BYTES + 1],
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("directory/AGENTS.md")).unwrap();
+        std::fs::write(outside.join("AGENTS.md"), "outside").unwrap();
+
+        let store = Arc::new(MemoryStore::new());
+        let app = router(state_with_file_browser(store.clone(), &root));
+        let mut invalid = vec![
+            outside.join("AGENTS.md").display().to_string(),
+            root.join("wrong-name/agents.md").display().to_string(),
+            root.join("wrong-name/OTHER.md").display().to_string(),
+            root.join("oversize/AGENTS.md").display().to_string(),
+            root.join("directory/AGENTS.md").display().to_string(),
+            root.join("missing/AGENTS.md").display().to_string(),
+            "relative/AGENTS.md".to_string(),
+            String::new(),
+        ];
+        #[cfg(unix)]
+        {
+            let link = root.join("AGENTS.md");
+            std::os::unix::fs::symlink(outside.join("AGENTS.md"), &link).unwrap();
+            invalid.push(link.display().to_string());
+        }
+
+        for path in invalid {
+            let (status, json) = send(
+                app.clone(),
+                post_json(
+                    "/api/tasks",
+                    json!({"goal": "bad instructions", "agents_md_path": path}),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} -> {json}");
+        }
+        assert!(
+            store.list_tasks(10).await.unwrap().is_empty(),
+            "no invalid create may persist a task"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_task_agents_md_path_requires_the_file_browser() {
+        let temp = tempfile::tempdir().unwrap();
+        let agents = temp.path().join("AGENTS.md");
+        std::fs::write(&agents, "rules").unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let app = router(test_state_with_store(store.clone()));
+        let (status, json) = send(
+            app,
+            post_json(
+                "/api/tasks",
+                json!({
+                    "goal": "no browser",
+                    "agents_md_path": agents.display().to_string(),
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(file_browser::FILE_BROWSER_ROOT_ENV),
+            "{json}"
+        );
+        assert!(store.list_tasks(10).await.unwrap().is_empty());
     }
 
     /// In-memory `web_projects` table for route tests.
@@ -5281,13 +5640,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_task_with_a_web_project_sets_folder_and_agents_md() {
+    async fn create_task_with_a_web_project_keeps_compatibility_fields() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let projects = Arc::new(FakeWebProjectStore::default());
         let project_id = Uuid::new_v4();
         let project_dir = root.join(project_id.to_string());
         std::fs::create_dir_all(&project_dir).unwrap();
+        // A web project's own AGENTS.md is no longer loaded implicitly.
         std::fs::write(project_dir.join("AGENTS.md"), "use the snapshot").unwrap();
         projects.insert(web_project_record(root, project_id, "Snapshot App"));
 
@@ -5314,13 +5674,16 @@ mod tests {
             json["project_folder"].as_str(),
             Some(expected_project.as_str())
         );
-        assert_eq!(json["load_agents_md"], true, "{json}");
-        assert_eq!(json["agents_md_state"], "loaded", "{json}");
+        assert!(json["agents_md_path"].is_null(), "{json}");
+        assert_eq!(json["load_agents_md"], false, "{json}");
+        assert_eq!(json["agents_md_state"], "disabled", "{json}");
         assert!(project_dir.join(".dhi").join(task_id.to_string()).is_dir());
 
         let persisted = store.get_task(task_id).await.unwrap().expect("task row");
         assert_eq!(persisted.web_project_id, Some(project_id));
         assert_eq!(persisted.web_project_name.as_deref(), Some("Snapshot App"));
+        assert_eq!(persisted.agents_md_path, None);
+        assert_eq!(persisted.agents_md_state, AgentsMdState::Disabled);
 
         // Missing projects are a request error, not a silent host-folder task.
         let (status, body) = send(
@@ -6928,6 +7291,7 @@ mod tests {
             web: Arc::new(crate::web_providers::WebProviderRuntime::empty()),
             task_runs: Arc::new(TaskRunRegistry::disabled()),
             project_folders: Arc::new(crate::project_folders::ProjectFolders::default()),
+            file_browser: Arc::new(crate::file_browser::FileBrowser::default()),
             web_projects: Arc::new(crate::web_projects::WebProjects::default()),
             web_project_store: None,
             team_store: None,

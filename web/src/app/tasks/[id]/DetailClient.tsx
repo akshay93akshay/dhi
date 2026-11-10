@@ -39,7 +39,6 @@ import {
 import { RecentActivityFeed } from "@/app/_components/ActivityLog";
 import { MarkdownMath } from "@/components/markdown-math";
 import { ProjectContext } from "@/components/project-context";
-import { WebProjectSyncCard } from "@/components/web-project-sync";
 import { SideQuestions } from "./SideQuestions";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -396,8 +395,6 @@ function TaskDetail() {
           </Button>
         </div>
       </header>
-
-      <WebProjectSyncCard task={task} className="mt-6" />
 
       {pageError !== null ? (
         <p

@@ -395,13 +395,18 @@ pub struct Task {
     /// folder is rooted at `DHI_WORKSPACE_ROOT` instead of the task row.
     #[serde(default)]
     pub task_folder: Option<String>,
-    /// Whether the planner receives the project's `AGENTS.md` instructions.
+    /// Whether the planner receives `AGENTS.md` instructions.
     #[serde(default)]
     pub load_agents_md: bool,
     /// The instruction-file state computed at creation and refreshed when the
     /// engine reads it at task start.
     #[serde(default)]
     pub agents_md_state: AgentsMdState,
+    /// Absolute path of a separately selected `AGENTS.md`, chosen
+    /// independently of the project folder. `None` means the task loads no
+    /// instructions.
+    #[serde(default)]
+    pub agents_md_path: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -425,6 +430,9 @@ pub struct NewTask {
     pub web_project_name: Option<String>,
     pub load_agents_md: bool,
     pub agents_md_state: AgentsMdState,
+    /// Absolute `AGENTS.md` path selected independently of the project
+    /// folder. `None` means no instructions are loaded.
+    pub agents_md_path: Option<String>,
 }
 
 impl NewTask {
@@ -441,6 +449,7 @@ impl NewTask {
             web_project_name: None,
             load_agents_md: false,
             agents_md_state: AgentsMdState::Disabled,
+            agents_md_path: None,
         }
     }
 
@@ -488,6 +497,15 @@ impl NewTask {
         self.web_project_name = Some(web_project_name.into());
         self
     }
+
+    /// Selects a separately validated `AGENTS.md` file. The load toggle and
+    /// state are derived from the selection, matching the API contract.
+    pub fn with_agents_md(mut self, path: impl Into<String>, state: AgentsMdState) -> Self {
+        self.agents_md_path = Some(path.into());
+        self.load_agents_md = true;
+        self.agents_md_state = state;
+        self
+    }
 }
 
 impl Task {
@@ -510,6 +528,7 @@ impl Task {
             task_folder: None,
             load_agents_md: false,
             agents_md_state: AgentsMdState::Disabled,
+            agents_md_path: None,
             created_at: now,
             updated_at: now,
         }
@@ -933,6 +952,7 @@ mod tests {
         assert_eq!(task.task_folder, None);
         assert!(!task.load_agents_md);
         assert_eq!(task.agents_md_state, AgentsMdState::Disabled);
+        assert_eq!(task.agents_md_path, None);
 
         let mut project = Task::new("project");
         project.project_folder = Some("/srv/project".to_string());

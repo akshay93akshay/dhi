@@ -30,7 +30,7 @@ pub trait GraphStore: Send + Sync {
     async fn create_task_with_pins(&self, task: NewTask) -> anyhow::Result<Task>;
 
     /// Records the instruction-file state found when a task start reads (or
-    /// skips) its project `AGENTS.md`. Test stores may ignore this.
+    /// skips) the selected `agents_md_path`. Test stores may ignore this.
     async fn set_task_agents_md_state(
         &self,
         _task_id: TaskId,

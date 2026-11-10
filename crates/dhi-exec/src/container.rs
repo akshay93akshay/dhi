@@ -1195,11 +1195,12 @@ fn project_request_relative(requested: &str) -> Option<&str> {
 
 /// The host paths Docker mounts for `task_id`.
 ///
-/// Deployment requirement: project bind sources are passed to Docker exactly
-/// as configured in `DHI_PROJECT_FOLDERS`. The server process and the Docker
-/// daemon must therefore see the project folder at the same absolute path.
-/// Unlike the legacy workspace root, project folders have no host-root
-/// remapping variable; configure the same path on both sides.
+/// Deployment requirement: project bind sources are the absolute folder the
+/// user selected through the host file browser. The server process and the
+/// Docker daemon must therefore see the project folder at the same absolute
+/// path. `DHI_PROJECT_FOLDERS` is legacy task metadata, not the selector.
+/// Unlike the workspace root, project folders have no host-root remapping
+/// variable; configure the same path on both sides.
 fn task_mounts(
     root: &Path,
     host_root: Option<&Path>,

@@ -98,6 +98,7 @@ impl Store {
         task.web_project_name = new.web_project_name;
         task.load_agents_md = new.load_agents_md;
         task.agents_md_state = new.agents_md_state;
+        task.agents_md_path = new.agents_md_path;
         task.refresh_task_folder();
         let origin = task.origin_fact();
         let capacity =
@@ -108,9 +109,9 @@ impl Store {
             "INSERT INTO tasks (id, goal, state, exploration_id, origin_fact_id, \
              pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, \
              swarm_workers, project_folder, web_project_id, web_project_name, \
-             load_agents_md, agents_md_state, \
+             load_agents_md, agents_md_state, agents_md_path, \
              created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
         )
         .bind(task.id)
         .bind(&task.goal)
@@ -127,6 +128,7 @@ impl Store {
         .bind(&task.web_project_name)
         .bind(task.load_agents_md)
         .bind(task.agents_md_state.as_str())
+        .bind(&task.agents_md_path)
         .bind(task.created_at)
         .bind(task.updated_at)
         .execute(&mut *tx)
@@ -165,7 +167,7 @@ impl Store {
         let row = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, state, exploration_id, origin_fact_id, \
                     pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
-                    project_folder, web_project_id, web_project_name, load_agents_md, agents_md_state, \
+                    project_folder, web_project_id, web_project_name, agents_md_path, load_agents_md, agents_md_state, \
                     created_at, updated_at
              FROM tasks WHERE id = $1",
         )
@@ -179,7 +181,7 @@ impl Store {
         let rows = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, state, exploration_id, origin_fact_id, \
                     pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
-                    project_folder, web_project_id, web_project_name, load_agents_md, agents_md_state, \
+                    project_folder, web_project_id, web_project_name, agents_md_path, load_agents_md, agents_md_state, \
                     created_at, updated_at
              FROM tasks ORDER BY created_at DESC LIMIT $1",
         )
@@ -239,7 +241,7 @@ impl Store {
              WHERE id = $1
              RETURNING id, goal, state, exploration_id, origin_fact_id, \
                        pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
-                    project_folder, web_project_id, web_project_name, load_agents_md, agents_md_state, \
+                    project_folder, web_project_id, web_project_name, agents_md_path, load_agents_md, agents_md_state, \
                        created_at, updated_at",
         )
         .bind(task_id)
@@ -396,7 +398,7 @@ impl Store {
         let row = sqlx::query_as::<_, TaskRow>(
             "SELECT id, goal, state, exploration_id, origin_fact_id, \
                     pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
-                    project_folder, web_project_id, web_project_name, load_agents_md, agents_md_state, \
+                    project_folder, web_project_id, web_project_name, agents_md_path, load_agents_md, agents_md_state, \
                     created_at, updated_at
              FROM tasks WHERE id = $1 FOR UPDATE",
         )
@@ -449,7 +451,7 @@ impl Store {
              WHERE id = $1
              RETURNING id, goal, state, exploration_id, origin_fact_id, \
                        pinned_planner_profile_id, pinned_worker_profile_id, capacity, topology, swarm_workers, \
-                    project_folder, web_project_id, web_project_name, load_agents_md, agents_md_state, \
+                    project_folder, web_project_id, web_project_name, agents_md_path, load_agents_md, agents_md_state, \
                        created_at, updated_at",
         )
         .bind(task_id)
@@ -1756,6 +1758,7 @@ struct TaskRow {
     project_folder: Option<String>,
     web_project_id: Option<Uuid>,
     web_project_name: Option<String>,
+    agents_md_path: Option<String>,
     load_agents_md: bool,
     agents_md_state: String,
     created_at: DateTime<Utc>,
@@ -1786,6 +1789,7 @@ impl TryFrom<TaskRow> for Task {
             web_project_name: r.web_project_name,
             load_agents_md: r.load_agents_md,
             agents_md_state: parse_agents_md_state(&r.agents_md_state)?,
+            agents_md_path: r.agents_md_path,
             created_at: r.created_at,
             updated_at: r.updated_at,
         })

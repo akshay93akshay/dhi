@@ -385,33 +385,29 @@ fn cap_swarm_plan(mut plan: dhi_core::IntentPlan, cap: usize) -> dhi_core::Inten
     plan
 }
 
-/// Reads the selected project's one `AGENTS.md` for a task start.
+/// Reads the one `AGENTS.md` the user selected for a task start.
+///
+/// `task.agents_md_path` is the entire selection: the engine reads that exact
+/// file and never joins or searches `task.project_folder`, so the selected
+/// file may live outside the project folder. `task.load_agents_md` is kept
+/// only for stored-row compatibility and does not decide anything here.
 ///
 /// The engine calls this once per `run_task`, before the first planner round.
-/// A missing file is `not_found` and adds no prompt section. A read failure
-/// is logged, recorded as `not_found`, and never blocks the task. The state is
+/// No selection is `disabled` and adds no prompt section. A missing or
+/// unreadable file is `not_found` and never blocks the task. The state is
 /// written back only when it changed, so a file that grew past the cap after
-/// creation becomes `truncated`.
+/// creation becomes `truncated`. This function only ever reads the file.
 async fn load_project_instructions(
     store: &dyn GraphStore,
     task: &mut dhi_core::Task,
 ) -> Option<String> {
-    if !task.load_agents_md {
+    let Some(path) = task.agents_md_path.clone() else {
+        record_agents_md_state(store, task, dhi_core::AgentsMdState::Disabled).await;
         return None;
-    }
-    let folder = task.project_folder.as_deref()?;
-    match dhi_core::read_agents_md(std::path::Path::new(folder)) {
+    };
+    match read_selected_agents_md(std::path::Path::new(&path)) {
         Ok(content) => {
-            if task.agents_md_state != content.state {
-                if let Err(err) = store.set_task_agents_md_state(task.id, content.state).await {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        error = %err,
-                        "could not record the AGENTS.md state"
-                    );
-                }
-                task.agents_md_state = content.state;
-            }
+            record_agents_md_state(store, task, content.state).await;
             let mut text = content.text;
             if content.state == dhi_core::AgentsMdState::Truncated {
                 text.push_str(
@@ -423,26 +419,95 @@ async fn load_project_instructions(
         Err(err) => {
             tracing::warn!(
                 task_id = %task.id,
-                folder,
+                path = %path,
                 error = %err,
-                "could not read the project AGENTS.md; continuing without it"
+                "could not read the selected AGENTS.md; continuing without it"
             );
-            if task.agents_md_state != dhi_core::AgentsMdState::NotFound {
-                if let Err(err) = store
-                    .set_task_agents_md_state(task.id, dhi_core::AgentsMdState::NotFound)
-                    .await
-                {
-                    tracing::warn!(
-                        task_id = %task.id,
-                        error = %err,
-                        "could not record the missing AGENTS.md state"
-                    );
-                }
-                task.agents_md_state = dhi_core::AgentsMdState::NotFound;
-            }
+            record_agents_md_state(store, task, dhi_core::AgentsMdState::NotFound).await;
             None
         }
     }
+}
+
+/// Persists one `AGENTS.md` state and mirrors it on the in-memory task.
+///
+/// A failed write is logged but never fails the task: the planner can still
+/// run with the text that was read.
+async fn record_agents_md_state(
+    store: &dyn GraphStore,
+    task: &mut dhi_core::Task,
+    state: dhi_core::AgentsMdState,
+) {
+    if task.agents_md_state == state {
+        return;
+    }
+    if let Err(err) = store.set_task_agents_md_state(task.id, state).await {
+        tracing::warn!(
+            task_id = %task.id,
+            error = %err,
+            "could not record the AGENTS.md state"
+        );
+    }
+    task.agents_md_state = state;
+}
+
+/// Reads one exact `AGENTS.md` path with the shared 32 KiB cap.
+///
+/// This mirrors `dhi_core::read_agents_md` without the project-folder join:
+/// only the selected path is inspected. A missing path, a symlink, and a
+/// non-regular file are `not_found`. At most `AGENTS_MD_MAX_BYTES + 4` bytes
+/// are read, and a longer file is cut at the last UTF-8 boundary that fits.
+fn read_selected_agents_md(path: &std::path::Path) -> std::io::Result<dhi_core::AgentsMdContent> {
+    use std::io::Read as _;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(empty_agents_md(dhi_core::AgentsMdState::NotFound));
+        }
+        Err(err) => return Err(err),
+    };
+    // Refuse a link instead of reading through it, matching the project
+    // reader's rule that only a regular selected file is read.
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(empty_agents_md(dhi_core::AgentsMdState::NotFound));
+    }
+
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::with_capacity(dhi_core::AGENTS_MD_MAX_BYTES + 4);
+    file.by_ref()
+        .take((dhi_core::AGENTS_MD_MAX_BYTES + 4) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > dhi_core::AGENTS_MD_MAX_BYTES {
+        let end = agents_md_utf8_boundary(&bytes, dhi_core::AGENTS_MD_MAX_BYTES);
+        Ok(dhi_core::AgentsMdContent {
+            text: String::from_utf8_lossy(&bytes[..end]).into_owned(),
+            state: dhi_core::AgentsMdState::Truncated,
+        })
+    } else {
+        Ok(dhi_core::AgentsMdContent {
+            text: String::from_utf8_lossy(&bytes).into_owned(),
+            state: dhi_core::AgentsMdState::Loaded,
+        })
+    }
+}
+
+fn empty_agents_md(state: dhi_core::AgentsMdState) -> dhi_core::AgentsMdContent {
+    dhi_core::AgentsMdContent {
+        text: String::new(),
+        state,
+    }
+}
+
+/// The largest index at or below `max` that is a UTF-8 character boundary.
+fn agents_md_utf8_boundary(bytes: &[u8], max: usize) -> usize {
+    let mut end = max.min(bytes.len());
+    // Continuation bytes (`10xxxxxx`) belong to a character that started
+    // before `end`; move back to that character's first byte and cut there.
+    while end > 0 && end < bytes.len() && (bytes[end] & 0b1100_0000) == 0b1000_0000 {
+        end -= 1;
+    }
+    end
 }
 
 /// The persisted `kind` of one typed swarm message.
@@ -3779,26 +3844,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planner_receives_the_project_agents_md_once() {
+    async fn planner_receives_the_selected_agents_md_once() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(
             project.join("AGENTS.md"),
-            "PROJECT-MARKER: keep the public API stable",
+            "PROJECT-DEFAULT: this file was not selected",
         )
         .unwrap();
+        // The selected file is deliberately outside the project folder.
+        let selected = temp.path().join("shared").join("AGENTS.md");
+        std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        std::fs::write(&selected, "SELECTED-MARKER: keep the public API stable").unwrap();
         let store = Arc::new(MemoryStore::new());
-        let task = GraphStore::create_task_with_pins(
-            store.as_ref(),
-            dhi_core::NewTask::new("project task").with_project(
+        let mut new_task = dhi_core::NewTask::new("project task")
+            .with_project(
                 project.display().to_string(),
-                true,
-                AgentsMdState::Loaded,
-            ),
-        )
-        .await
-        .unwrap();
+                false,
+                AgentsMdState::Disabled,
+            )
+            .with_agents_md(selected.display().to_string(), AgentsMdState::Loaded);
+        // The compatibility toggle is false on purpose: only the path decides.
+        new_task.load_agents_md = false;
+        let task = GraphStore::create_task_with_pins(store.as_ref(), new_task)
+            .await
+            .unwrap();
         let goal = seed_goal(&store, &task).await;
         store
             .record_fact(task.id, "confirmed project evidence".to_string(), json!({}))
@@ -3821,15 +3892,22 @@ mod tests {
         assert!(!inputs.is_empty(), "the planner ran");
         assert_eq!(
             inputs[0].project_instructions.as_deref(),
-            Some("PROJECT-MARKER: keep the public API stable"),
-            "the planner receives the bounded AGENTS.md text"
+            Some("SELECTED-MARKER: keep the public API stable"),
+            "the planner receives the selected file's bounded text"
         );
         assert!(
             inputs[1..]
                 .iter()
                 .all(|input| input.project_instructions.as_deref()
-                    == Some("PROJECT-MARKER: keep the public API stable")),
+                    == Some("SELECTED-MARKER: keep the public API stable")),
             "later planner rounds reuse the text read at task start"
+        );
+        assert!(
+            inputs.iter().all(|input| input
+                .project_instructions
+                .as_deref()
+                .is_none_or(|text| !text.contains("PROJECT-DEFAULT"))),
+            "the unselected <project>/AGENTS.md is never read"
         );
         assert_eq!(
             store
@@ -3843,16 +3921,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_oversized_agents_md_is_truncated_and_marked_in_the_planner_input() {
+    async fn no_selected_agents_md_loads_no_instructions() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(
             project.join("AGENTS.md"),
-            "a".repeat(dhi_core::AGENTS_MD_MAX_BYTES + 64),
+            "PROJECT-DEFAULT: never loaded without a selection",
         )
         .unwrap();
         let store = Arc::new(MemoryStore::new());
+        // `load_agents_md` is still true here on purpose: only the path decides.
         let task = GraphStore::create_task_with_pins(
             store.as_ref(),
             dhi_core::NewTask::new("project task").with_project(
@@ -3860,6 +3939,57 @@ mod tests {
                 true,
                 AgentsMdState::Loaded,
             ),
+        )
+        .await
+        .unwrap();
+        let goal = seed_goal(&store, &task).await;
+        store
+            .record_fact(
+                task.id,
+                "confirmed no-selection evidence".to_string(),
+                json!({}),
+            )
+            .await
+            .unwrap();
+        let agent = Arc::new(ScriptedAgent::with_plans(
+            vec![ScriptedPlan::ProveFirstConfirmed { goal_id: goal.id }],
+            vec![],
+        ));
+        let engine = Engine::new(store.clone(), Arc::clone(&agent) as Arc<dyn AgentRuntime>);
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(agent.plan_inputs()[0].project_instructions, None);
+        assert_eq!(
+            store
+                .get_task(task.id)
+                .await
+                .unwrap()
+                .expect("task exists")
+                .agents_md_state,
+            AgentsMdState::Disabled
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_selected_agents_md_is_truncated_and_marked_in_the_planner_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let selected = temp.path().join("shared").join("AGENTS.md");
+        std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        std::fs::write(&selected, "a".repeat(dhi_core::AGENTS_MD_MAX_BYTES + 64)).unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new("project task")
+                .with_project(
+                    project.display().to_string(),
+                    false,
+                    AgentsMdState::Disabled,
+                )
+                .with_agents_md(selected.display().to_string(), AgentsMdState::Loaded),
         )
         .await
         .unwrap();
@@ -3908,18 +4038,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_missing_agents_md_is_not_found_and_does_not_block_the_plan() {
+    async fn a_missing_selected_agents_md_is_not_found_and_does_not_block_the_plan() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("AGENTS.md"),
+            "PROJECT-DEFAULT: not a fallback for a missing selection",
+        )
+        .unwrap();
+        let selected = temp.path().join("missing").join("AGENTS.md");
         let store = Arc::new(MemoryStore::new());
         let task = GraphStore::create_task_with_pins(
             store.as_ref(),
-            dhi_core::NewTask::new("project task").with_project(
-                project.display().to_string(),
-                true,
-                AgentsMdState::Loaded,
-            ),
+            dhi_core::NewTask::new("project task")
+                .with_project(project.display().to_string(), true, AgentsMdState::Loaded)
+                .with_agents_md(selected.display().to_string(), AgentsMdState::Loaded),
         )
         .await
         .unwrap();
@@ -3950,6 +4084,60 @@ mod tests {
                 .expect("task exists")
                 .agents_md_state,
             AgentsMdState::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn dhi_plus_reads_the_selected_agents_md_without_modifying_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let selected = temp.path().join("shared").join("AGENTS.md");
+        std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+        let original = b"SELECTED-MARKER: read-only instructions\n";
+        std::fs::write(&selected, original).unwrap();
+        let before = std::fs::metadata(&selected).unwrap();
+
+        let store = Arc::new(MemoryStore::new());
+        let task = GraphStore::create_task_with_pins(
+            store.as_ref(),
+            dhi_core::NewTask::new("dhi plus task")
+                .with_topology(Some(Topology::ManagerWorker))
+                .with_project(
+                    project.display().to_string(),
+                    false,
+                    AgentsMdState::Disabled,
+                )
+                .with_agents_md(selected.display().to_string(), AgentsMdState::Loaded),
+        )
+        .await
+        .unwrap();
+        let goal = seed_goal(&store, &task).await;
+        let plan = two_worker_plan("dhi plus task", Topology::ManagerWorker);
+        let agent = Arc::new(TeamAgent::new(
+            team_completion_plans("dhi plus task", plan, goal.id),
+            vec![
+                ("subtask one", TeamWorker::Success("finding one")),
+                ("subtask two", TeamWorker::Success("finding two")),
+            ],
+        ));
+        let engine = Engine::new(store.clone(), agent.clone());
+
+        let result = engine.run_task(task.id).await.unwrap();
+
+        assert_eq!(result.task.state, TaskState::Done);
+        assert_eq!(
+            agent.plan_inputs()[0].project_instructions.as_deref(),
+            Some("SELECTED-MARKER: read-only instructions\n"),
+            "the DHI+ planner received the selected file"
+        );
+        let after = std::fs::metadata(&selected).unwrap();
+        assert_eq!(std::fs::read(&selected).unwrap(), original.to_vec());
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            after.modified().unwrap(),
+            before.modified().unwrap(),
+            "DHI+ only reads the selected AGENTS.md"
         );
     }
 

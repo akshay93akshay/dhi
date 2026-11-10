@@ -31,7 +31,7 @@ services:
       DHI_WORKSPACE_ROOT: /app/workspace
       DHI_WORKSPACE_HOST_ROOT: ${DHI_WORKSPACE_HOST_ROOT:-${PWD}/workspace}
       DHI_PROJECT_FOLDERS: ${DHI_PROJECT_FOLDERS:-}
-      DHI_WEB_PROJECTS_ROOT: ${DHI_WEB_PROJECTS_ROOT:-}
+      DHI_FILE_BROWSER_ROOT: ${DHI_FILE_BROWSER_ROOT:-}
       RUST_LOG: dhi=info,tower_http=info
       DHI_LLM_BASE_URL: ${DHI_LLM_BASE_URL:-}
       DHI_LLM_API_KEY: ${DHI_LLM_API_KEY:-}
@@ -43,14 +43,16 @@ services:
     volumes:
       - ./workspace:/app/workspace
       - /var/run/docker.sock:/var/run/docker.sock
-      # Mount each folder listed in DHI_PROJECT_FOLDERS at the same absolute
-      # path, read-write. Repeat one line per folder. See README "Project
-      # folders". Example:
+      # Legacy project folders from DHI_PROJECT_FOLDERS: mount each folder at
+      # the same absolute path, read-write, so tasks created before the file
+      # browser still resolve their projects. Repeat one line per folder. New
+      # tasks select a folder through the file browser instead. See README
+      # "Project folders and AGENTS.md". Example:
       # - /srv/projects/build:/srv/projects/build
       #
-      # Browser-folder web projects need DHI_WEB_PROJECTS_ROOT mounted at the
-      # same absolute path, read-write. Use docker-compose.web.yml, which only
-      # applies when that variable is set. See docs/deploy-web-projects.md.
+      # The host file browser needs DHI_FILE_BROWSER_ROOT mounted at the same
+      # absolute path, read-write. Use docker-compose.fs.yml, which only
+      # applies when that variable is set. See docs/project-file-browser.md.
     restart: unless-stopped
 
 volumes:

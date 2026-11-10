@@ -239,25 +239,38 @@ Main settings:
 - `DHI_WEB_DIR` — static UI directory; when unset, `web/out` is used if present
 - `DHI_WORKSPACE_ROOT` — workspace root visible to the server; defaults to `workspace`
 - `DHI_WORKSPACE_HOST_ROOT` — host path of that root, used as the bind-mount source for task containers; set it when the server runs in a container
-- `DHI_PROJECT_FOLDERS` — comma-separated absolute paths of project folders; each must be mounted into the server at the same absolute path
-- `DHI_WEB_PROJECTS_ROOT` — absolute root for browser-folder web projects; unset disables them, and the server and Docker daemon must see the same path
+- `DHI_PROJECT_FOLDERS` — legacy comma-separated absolute paths kept for tasks created before the host file browser; each must remain mounted into the server at the same absolute path
+- `DHI_FILE_BROWSER_ROOT` — absolute host root listed by the task file browser; the server creates it when missing and refuses a symlink, and the server and Docker daemon must see the same path; unset disables the browser
 - `DHI_MCP_CONFIG` — MCP config path; when unset, the nearest `ops/mcp.json`
 - `DHI_LLM_BASE_URL`, `DHI_LLM_API_KEY`, `DHI_LLM_PLANNER_MODEL`, `DHI_LLM_WORKER_MODEL` — LLM endpoint and models; other OpenAI-compatible endpoints work
 - `TINYFISH_API_KEY`, `PARALLEL_API_KEY`, `FIRECRAWL_API_KEY`, `DHI_WEB_PROVIDER` — web tool providers
 
-### Project folders
+### Project folders and AGENTS.md
 
-Set `DHI_PROJECT_FOLDERS` to a comma-separated list of absolute paths. Mount each folder into `dhi-server` at the same absolute path, read-write (for example `-v /path:/path` in `docker run`, or the equivalent compose volume), so the server and the task containers it creates resolve the same source. Each path must exist, be a directory, not be a symlink, and be writable by the server.
+Set `DHI_FILE_BROWSER_ROOT` to an absolute host directory. The server creates it when missing and requires a real directory rather than a symlink. The task form's file browser lists directories and files under that root through `GET /api/fs`. The user selects a project folder and, optionally, an `AGENTS.md` under the same root; the selected absolute host paths become the task's `project_folder` and `agents_md_path` (`null` when no file is selected). The `AGENTS.md` may be inside or outside the selected project folder. DHI<sup>+</sup> uses the selected folder directly, with no upload or copied snapshot.
 
-DHI<sup>+</sup> creates `<project>/.dhi/<task-id>/` for each task in a project folder. The task container mounts the project root at `/project` read-only and the task folder at `/work` read-write. One configured folder is selected per task.
+Mount the root into `dhi-server` at the same absolute path, read-write. `docker-compose.fs.yml` adds exactly that mount:
 
-`AGENTS.md` is read from the selected project root only. It is planner-only: no global or nested file is read, and the file is capped at 32 KiB.
+```bash
+docker compose -f docker-compose.yml -f docker-compose.fs.yml up -d
+```
 
-### Browser-folder web projects
+```yaml
+services:
+  dhi-server:
+    volumes:
+      - ${DHI_FILE_BROWSER_ROOT}:${DHI_FILE_BROWSER_ROOT}
+```
 
-Set `DHI_WEB_PROJECTS_ROOT` to one absolute directory to enable browser-folder projects. The server validates it at startup: it must exist or be creatable, be writable by the server, and not be a symlink. The same absolute path must be visible to the server process and to the Docker daemon, because each project's folder, `<root>/<id>`, is passed to the existing project bind mount unchanged. There is no host-root remapping variable for this root; mount it into `dhi-server` at the same path, read-write, and make that path meaningful to the daemon (for example with the Docker socket's host filesystem visible under the same path).
+The same absolute path must be visible to the server process and to the Docker daemon, because each task's project bind-mount source is the selected host path exactly as the server sees it. On Docker Desktop, share the root with the daemon; on a remote daemon, create the same path on that host.
 
-When the variable is unset, web projects are disabled: `GET /api/web-projects` answers `404` so the UI treats the feature as unavailable, and creates or tasks that name a web project answer `400`. Uploads are capped server-side at 8 MB per file and 256 MB for the snapshot tree; the server-generated `.dhi` directory is excluded from snapshot counts and the total cap. Upload paths are relative and must not target `.dhi`. `GET /api/tasks/{id}/outputs` reads the task's `.dhi/<task-id>` folder from the web project, skips symlinks, returns UTF-8 as text and other bytes as base64, and excludes files over its per-file or total response cap. Output reads revalidate that the task folder is a real directory below the configured root before reading.
+DHI<sup>+</sup> creates `<project>/.dhi/<task-id>/` for each task. The task container mounts the project root at `/project` read-only and the task folder at `/work` read-write. Existing files in the project are left unchanged; agent writes stay under `/work` and land in `.dhi/<task-id>` on the host.
+
+The selected `AGENTS.md` must be named exactly `AGENTS.md`, live under `DHI_FILE_BROWSER_ROOT`, and be at most 32 KiB. It may be inside or outside the selected project folder. It is planner context: the server reads that exact file and does not search global or nested locations for another one. When no file is selected, `agents_md_path` is `null` and the task starts without `AGENTS.md` context.
+
+`GET /api/fs` answers `404` when `DHI_FILE_BROWSER_ROOT` is unset, and task creation rejects a selected project folder or `AGENTS.md`.
+
+`DHI_PROJECT_FOLDERS` is no longer the task-creation selector. It and the same-path mounts for each listed folder remain supported so tasks created before the file browser still resolve their projects. Keep those mounts while such tasks exist.
 
 On first boot, DHI<sup>+</sup> seeds guard rules plus LLM profiles and settings when an LLM key is configured. After that, PostgreSQL is the source of truth and profiles and rules are managed from the settings UI or API.
 
@@ -293,8 +306,8 @@ Keep `ops/mcp.json` local. `ops/mcp.example.json` and `ops/mcp.docker.json` are 
 All API routes are under `/api`. Most return JSON; `/api/stream` is a server-sent event stream. The static UI is the fallback for non-API paths.
 
 - **Health** — `GET /api/health`
-- **Tasks** — `GET|POST /api/tasks`; `GET|DELETE /api/tasks/{id}`; `POST /api/tasks/{id}/stop`; bulk `POST /api/tasks/stop` and `POST /api/tasks/delete`; `GET /api/tasks/{id}/work`, `/activity`, `/usage`, and `/outputs`
-- **Web projects** — `GET|POST /api/web-projects`; `GET /api/web-projects/{id}`; `PUT /api/web-projects/{id}/files?path=…`
+- **Tasks** — `GET|POST /api/tasks`; `GET|DELETE /api/tasks/{id}`; `POST /api/tasks/{id}/stop`; bulk `POST /api/tasks/stop` and `POST /api/tasks/delete`; `GET /api/tasks/{id}/work`, `/activity`, and `/usage`; `GET /api/tasks/{id}/outputs` for legacy web-project tasks
+- **File browser** — `GET /api/fs?path=…` lists host files and directories under `DHI_FILE_BROWSER_ROOT` for project and `AGENTS.md` selection
 - **Goals** — `POST /api/tasks/{id}/goals`
 - **Side questions** — `GET|POST /api/tasks/{id}/side-questions`
 - **Approvals** — `GET /api/approvals`; `POST /api/approvals/{id}/decision`

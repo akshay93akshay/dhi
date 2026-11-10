@@ -45,6 +45,7 @@ fn app_state() -> AppState {
         web: Arc::new(WebProviderRuntime::empty()),
         task_runs: Arc::new(TaskRunRegistry::disabled()),
         project_folders: Arc::new(dhi_server::project_folders::ProjectFolders::default()),
+        file_browser: Arc::new(dhi_server::file_browser::FileBrowser::default()),
         web_projects: Arc::new(dhi_server::web_projects::WebProjects::default()),
         web_project_store: None,
         team_store: None,

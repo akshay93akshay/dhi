@@ -1,10 +1,12 @@
-//! Project folders and their planner-only `AGENTS.md` instructions.
+//! Project folders and planner-only `AGENTS.md` instructions.
 //!
 //! A project folder is an absolute directory the user selected at task
-//! creation. The one instruction file DHI reads is `<project>/AGENTS.md`:
-//! there is deliberately no global file, no nested file, and no upward search.
-//! The file is capped at [`AGENTS_MD_MAX_BYTES`] and truncated on a UTF-8
-//! boundary.
+//! creation. The task's instruction file is the selected `agents_md_path`,
+//! which can be inside or outside that folder. There is deliberately no
+//! global file, no automatic nested file, and no upward search. This module
+//! also inspects legacy `<project>/AGENTS.md` metadata for old project-folder
+//! rows. The file is capped at [`AGENTS_MD_MAX_BYTES`] and truncated on a
+//! UTF-8 boundary.
 
 use std::fs::{self, File};
 use std::io::{self, Read};

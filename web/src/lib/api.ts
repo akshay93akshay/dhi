@@ -11,6 +11,7 @@ import type {
   CreateTaskInput,
   DeleteResponse,
   DeleteTasksResponse,
+  FileBrowserResponse,
   GuardRule,
   GuardRuleInput,
   Health,
@@ -29,8 +30,6 @@ import type {
   PoolResetInput,
   PoolStatus,
   ProfilesResponse,
-  ProjectFolder,
-  ProjectFoldersResponse,
   RulesResponse,
   SaveProfileInput,
   SaveProfileResponse,
@@ -47,8 +46,6 @@ import type {
   TaskActivityResponse,
   TaskCapacityPatch,
   TaskListResponse,
-  TaskOutputsResponse,
-  TaskOutputFile,
   TaskUsageResponse,
   TaskWork,
   ToggleRuleResponse,
@@ -56,10 +53,6 @@ import type {
   ToolControlAction,
   ToolControlResponse,
   ToolState,
-  WebProject,
-  WebProjectFileResponse,
-  WebProjectResponse,
-  WebProjectsResponse,
   WebProviderId,
   WebProviderTestResult,
   WebProviderUpdate,
@@ -170,68 +163,15 @@ export function getHealth(): Promise<Health> {
   return request<Health>("/health");
 }
 
-/** Unwraps the `{ folders: [...] }` envelope of `GET /api/project-folders`. */
-export function listProjectFolders(): Promise<ProjectFolder[]> {
-  return request<ProjectFoldersResponse>("/project-folders").then(
-    (response) => response.folders,
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Web projects (browser-folder snapshots)
-// ---------------------------------------------------------------------------
-
-/** Unwraps the `{ projects: [...] }` envelope of `GET /api/web-projects`. */
-export function listWebProjects(): Promise<WebProject[]> {
-  return request<WebProjectsResponse>("/web-projects").then(
-    (response) => response.projects,
-  );
-}
-
-/** Creates one web project and unwraps the `{ project }` envelope. */
-export function createWebProject(name: string): Promise<WebProject> {
-  return request<WebProjectResponse>("/web-projects", {
-    method: "POST",
-    body: JSON.stringify({ name }),
-  }).then((response) => response.project);
-}
-
-/** Reads one web project and unwraps the `{ project }` envelope. */
-export function getWebProject(id: string): Promise<WebProject> {
-  return request<WebProjectResponse>(
-    `/web-projects/${encodeURIComponent(id)}`,
-  ).then((response) => response.project);
-}
-
 /**
- * Uploads raw file bytes to `PUT /api/web-projects/{id}/files?path=…`.
- * The body is the file itself, never JSON; an optional abort signal lets the
- * caller cancel an in-flight upload.
+ * Lists one directory on the DHI+ host. An absent/empty `path` starts at the
+ * server's browse root; every other path is sent URL-encoded.
  */
-export function uploadWebProjectFile(
-  projectId: string,
-  path: string,
-  bytes: Uint8Array,
-  signal?: AbortSignal,
-): Promise<WebProjectFileResponse> {
-  return request<WebProjectFileResponse>(
-    `/web-projects/${encodeURIComponent(projectId)}/files?path=${encodeURIComponent(path)}`,
-    {
-      method: "PUT",
-      headers: { "content-type": "application/octet-stream" },
-      // Copy into a plain ArrayBuffer-backed view: the DOM BodyInit type does
-      // not accept the generic `Uint8Array<ArrayBufferLike>` parameter.
-      body: new Uint8Array(bytes),
-      signal,
-    },
-  );
-}
-
-/** Unwraps the `{ files: [...] }` envelope of `GET /api/tasks/{id}/outputs`. */
-export function getTaskOutputs(taskId: string): Promise<TaskOutputFile[]> {
-  return request<TaskOutputsResponse>(
-    `/tasks/${encodeURIComponent(taskId)}/outputs`,
-  ).then((response) => response.files);
+export function listFileBrowser(path?: string): Promise<FileBrowserResponse> {
+  const trimmed = (path ?? "").trim();
+  const query =
+    trimmed === "" ? "" : `?path=${encodeURIComponent(trimmed)}`;
+  return request<FileBrowserResponse>(`/fs${query}`);
 }
 
 export function listTasks(opts?: { limit?: number }): Promise<Task[]> {

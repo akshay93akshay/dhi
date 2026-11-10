@@ -26,7 +26,6 @@ import {
   listInstructions,
   listModels,
   listProfiles,
-  listProjectFolders,
   listRules,
   listSideQuestions,
   listTasks,
@@ -175,30 +174,6 @@ test("listTasks forwards the limit query parameter", async () => {
   ]);
 });
 
-test("listProjectFolders unwraps the { folders } envelope", async () => {
-  const folder = {
-    path: "/srv/projects/build",
-    name: "Build",
-    agents_md_present: true,
-  };
-  const recorder = stubFetch(() => jsonResponse({ folders: [folder] }));
-
-  const folders = await listProjectFolders();
-
-  assert.equal(recorder.urls[0], "/api/project-folders");
-  assert.equal(recorder.calls[0]?.init?.method, undefined);
-  assert.deepEqual(folders, [folder]);
-});
-
-test("listProjectFolders keeps an empty listing", async () => {
-  const recorder = stubFetch(() => jsonResponse({ folders: [] }));
-
-  const folders = await listProjectFolders();
-
-  assert.equal(recorder.urls[0], "/api/project-folders");
-  assert.deepEqual(folders, []);
-});
-
 test("getHealth reads the bare health object", async () => {
   const recorder = stubFetch(() =>
     jsonResponse({ status: "ok", service: "dhi", version: "0.1.0" }),
@@ -220,6 +195,8 @@ test("createTask posts the goal/pins body to POST /api/tasks", async () => {
     goal: "mate in two",
     planner_profile_id: 7,
     worker_profile_id: null,
+    project_folder: "",
+    agents_md_path: null,
   });
 
   assert.equal(recorder.urls[0], "/api/tasks");
@@ -229,6 +206,8 @@ test("createTask posts the goal/pins body to POST /api/tasks", async () => {
       goal: "mate in two",
       planner_profile_id: 7,
       worker_profile_id: null,
+      project_folder: "",
+      agents_md_path: null,
     }),
   );
   assert.deepEqual(task, sampleTask);
@@ -237,43 +216,74 @@ test("createTask posts the goal/pins body to POST /api/tasks", async () => {
 test("createTask omits absent pin fields (server defaults apply)", async () => {
   const recorder = stubFetch(() => jsonResponse(sampleTask, 201));
 
-  await createTask({ goal: "solo" });
+  await createTask({
+    goal: "solo",
+    project_folder: "",
+    agents_md_path: null,
+  });
 
-  assert.equal(recorder.calls[0]?.init?.body, JSON.stringify({ goal: "solo" }));
+  assert.equal(
+    recorder.calls[0]?.init?.body,
+    JSON.stringify({
+      goal: "solo",
+      project_folder: "",
+      agents_md_path: null,
+    }),
+  );
 });
 
 test("createTask forwards topology and swarm_workers, including explicit nulls", async () => {
   const recorder = stubFetch(() => jsonResponse(sampleTask, 201));
 
-  await createTask({ goal: "swarm task", topology: "swarm", swarm_workers: 4 });
+  await createTask({
+    goal: "swarm task",
+    topology: "swarm",
+    swarm_workers: 4,
+    project_folder: "/srv/build",
+    agents_md_path: "/srv/build/AGENTS.md",
+  });
   await createTask({
     goal: "planner task",
     topology: null,
     swarm_workers: null,
+    project_folder: "",
+    agents_md_path: null,
   });
 
   assert.deepEqual(
     recorder.calls.map((call) => JSON.parse(String(call.init?.body))),
     [
-      { goal: "swarm task", topology: "swarm", swarm_workers: 4 },
-      { goal: "planner task", topology: null, swarm_workers: null },
+      {
+        goal: "swarm task",
+        topology: "swarm",
+        swarm_workers: 4,
+        project_folder: "/srv/build",
+        agents_md_path: "/srv/build/AGENTS.md",
+      },
+      {
+        goal: "planner task",
+        topology: null,
+        swarm_workers: null,
+        project_folder: "",
+        agents_md_path: null,
+      },
     ],
   );
 });
 
-test("createTask forwards project_folder and load_agents_md", async () => {
+test("createTask forwards project_folder and agents_md_path", async () => {
   const recorder = stubFetch(() => jsonResponse(sampleTask, 201));
 
   await createTask({
     goal: "project task",
     project_folder: "/srv/projects/build",
-    load_agents_md: true,
+    agents_md_path: "/srv/projects/build/AGENTS.md",
   });
 
   assert.deepEqual(JSON.parse(String(recorder.calls[0]?.init?.body)), {
     goal: "project task",
     project_folder: "/srv/projects/build",
-    load_agents_md: true,
+    agents_md_path: "/srv/projects/build/AGENTS.md",
   });
 });
 
