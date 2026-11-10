@@ -392,8 +392,9 @@ impl<E: WorkerExecutor + 'static> ManagerRunner<E> {
                     .depends_on
                     .iter()
                     .find(|dependency| failed.contains(*dependency))
+                    .cloned()
                 {
-                    blocked.push((task, dependency.clone()));
+                    blocked.push((task, dependency));
                 } else if task
                     .depends_on
                     .iter()
