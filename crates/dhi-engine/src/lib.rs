@@ -816,6 +816,7 @@ impl Engine {
     /// whether a zero-worker final result is valid. The stored plan is never
     /// changed. The caller owns the model-call counter so a lead/team `Stop`
     /// still charges the calls it made before ending the intent.
+    #[allow(clippy::too_many_arguments)]
     async fn run_team_plan(
         &self,
         task_id: Uuid,

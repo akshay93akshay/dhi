@@ -23,14 +23,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use async_trait::async_trait;
-use dhi_agent::team_tools::{
-    TeamAction, TeamFragmentReview, TeamRunMode, team_tool_specs, teammate_task_text,
-};
+use dhi_agent::team_tools::{TeamAction, TeamFragmentReview, TeamRunMode, team_tool_specs};
 use dhi_agent::{AgentRuntime, ExecuteInput, ToolServerView};
-use dhi_core::team::{
-    MissionLogKind, TeamActionKind, TeamError, TeamMemberSpec, TeamPermissions, TeamRole, TeamRun,
-    TeamSnapshot, TeamStore, TeamTask,
-};
+use dhi_core::team::{MissionLogKind, TeamError, TeamPermissions, TeamRole, TeamStore};
 use dhi_orchestrator::{
     Subtask, TeamActionOutcome, TeamActor, TeamRunConfig, TeamRunner, TeamSession, WorkerExecutor,
     WorkerResult, WorkerSpec,
@@ -46,10 +41,7 @@ use crate::team::worker_result_from_call;
 /// The live team behind one intent.
 pub struct TeamService {
     session: Arc<TeamSession<TeammateExecutor>>,
-    agent: Arc<dyn AgentRuntime>,
     task_id: Uuid,
-    intent_id: Uuid,
-    objective: String,
     config: TeamRunConfig,
     max_teammates: usize,
     stopped: AtomicBool,
@@ -83,10 +75,7 @@ impl TeamService {
         let session = Arc::new(runner.start(config.clone()).await?);
         let service = Arc::new(Self {
             session,
-            agent,
             task_id,
-            intent_id,
-            objective,
             config,
             max_teammates,
             stopped: AtomicBool::new(false),
@@ -95,30 +84,6 @@ impl TeamService {
         slot.set(Arc::downgrade(&service))
             .map_err(|_| anyhow::anyhow!("team service cycle was initialized twice"))?;
         Ok(service)
-    }
-
-    pub fn task_id(&self) -> Uuid {
-        self.task_id
-    }
-
-    pub fn intent_id(&self) -> Uuid {
-        self.intent_id
-    }
-
-    pub fn objective(&self) -> &str {
-        &self.objective
-    }
-
-    pub fn config(&self) -> &TeamRunConfig {
-        &self.config
-    }
-
-    pub fn max_teammates(&self) -> usize {
-        self.max_teammates
-    }
-
-    pub fn agent(&self) -> &Arc<dyn AgentRuntime> {
-        &self.agent
     }
 
     /// The full coordinator view: all team tools.
@@ -563,29 +528,16 @@ impl TeamService {
         let _ = self.session.cleanup(&actor).await;
     }
 
-    /// Snapshot accessor used by tests and the engine's stop path.
-    pub async fn snapshot(&self) -> anyhow::Result<TeamSnapshot> {
-        self.session.snapshot().await
-    }
-
-    /// Every run row, used by the engine's provenance and stop handling.
-    pub async fn runs(&self) -> anyhow::Result<Vec<TeamRun>> {
-        self.session.runs().await
-    }
-
     /// The board, used by tests and resumability checks.
-    pub async fn tasks(&self) -> anyhow::Result<Vec<TeamTask>> {
+    #[cfg(test)]
+    pub async fn tasks(&self) -> anyhow::Result<Vec<dhi_core::team::TeamTask>> {
         self.session.tasks().await
     }
 
     /// The persisted roster, used by tests.
+    #[cfg(test)]
     pub async fn members(&self) -> anyhow::Result<Vec<dhi_core::team::TeamMember>> {
         Ok(self.session.snapshot().await?.members)
-    }
-
-    /// The active spawn cap for this run.
-    pub fn coordinator_spec(&self) -> TeamMemberSpec {
-        self.config.lead.clone()
     }
 
     /// The result of a coordinator `team_stop`, after cancelling active runs.
@@ -840,35 +792,11 @@ fn optional_bool(args: &Value, key: &str) -> Result<Option<bool>, ToolExecutionE
     }
 }
 
-/// A task card's text, used by the teammate executor and tests.
-pub fn task_text(task: &TeamTask) -> String {
-    teammate_task_text(task)
-}
-
-/// The action kind a tool mutates, for permission checks in tests and hosts.
-pub fn tool_action_kind(tool: &str) -> Option<TeamActionKind> {
-    match tool {
-        "team_spawn_teammate" => Some(TeamActionKind::SpawnTeammate),
-        "team_shutdown_teammate" => Some(TeamActionKind::ShutdownTeammate),
-        "team_run_task" => Some(TeamActionKind::RunTask),
-        "team_send_message" => Some(TeamActionKind::SendMessage),
-        "team_broadcast" => Some(TeamActionKind::Broadcast),
-        "team_mission_log" => Some(TeamActionKind::MissionLog),
-        "team_create_outcome" => Some(TeamActionKind::CreateOutcome),
-        "team_attach_outcome_fragment" => Some(TeamActionKind::AttachOutcomeFragment),
-        "team_review_outcome_fragment" => Some(TeamActionKind::ReviewOutcomeFragment),
-        "team_finalize_outcome" => Some(TeamActionKind::FinalizeOutcome),
-        "team_cleanup" => Some(TeamActionKind::Cleanup),
-        "team_stop" => Some(TeamActionKind::Stop),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use dhi_agent::MockAgentRuntime;
-    use dhi_core::team::MemoryTeamStore;
+    use dhi_core::team::{MemoryTeamStore, TeamMemberSpec};
     use serde_json::{Value, json};
     use std::time::Duration;
 
