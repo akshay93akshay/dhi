@@ -7897,7 +7897,7 @@ mod tests {
 
     async fn manager_task(store: &MemoryStore, goal: &str) -> (Task, Goal) {
         let task = GraphStore::create_task_with_pins(
-            store.as_ref(),
+            store,
             dhi_core::NewTask::new(goal).with_topology(Some(Topology::ManagerWorker)),
         )
         .await
