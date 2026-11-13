@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Read-only check for machine-specific paths in product files.
+# Read-only check for non-macOS machine-specific paths in product files.
+# `/Users/` is valid on this macOS-only branch; `/home/` and `C:\` are not.
 # Prints path:line only; it never prints file contents.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -30,7 +31,7 @@ RG_ARGS=(
 
 matches=""
 if command -v rg >/dev/null 2>&1; then
-  matches="$(rg "${RG_ARGS[@]}" -e '/Users/' -e '/home/' -e 'C:\' 2>/dev/null || true)"
+  matches="$(rg "${RG_ARGS[@]}" -e '/home/' -e 'C:\' 2>/dev/null || true)"
 else
   matches="$(grep -rInF \
     --exclude-dir=.git \
@@ -41,16 +42,10 @@ else
     --exclude-dir=backups \
     --exclude-dir=workspace \
     --exclude=check-paths.sh \
-    -e '/Users/' -e '/home/' -e 'C:\' . 2>/dev/null || true)"
+    -e '/home/' -e 'C:\' . 2>/dev/null || true)"
 fi
 
-# `/home/linuxbrew` is a path inside the task image, not a host path. The
-# task container hides it with a read-only tmpfs. Remove only that token;
-# a line that also contains another `/home/`, `/Users/`, or `C:\` path still
-# fails.
-matches="$(printf '%s\n' "$matches" \
-  | sed 's#/home/linuxbrew##g' \
-  | grep -E '(/home/|/Users/|C:\\)' || true)"
+matches="$(printf '%s\n' "$matches" | grep -E '(/home/|C:\\)' || true)"
 
 if [ -n "$matches" ]; then
   printf '%s\n' "$matches" | awk -F: 'NF >= 2 { print $1 ":" $2 }'

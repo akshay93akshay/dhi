@@ -1060,9 +1060,9 @@ impl super::Store {
     ///   MCP rules (`mcp__chess__createGame`, `mcp__chess__joinGame`,
     ///   `mcp__chess__waitForNextTurn`, `mcp__chess__finishTurn`), the four web
     ///   tools (web_search, web_read, web_research, web_parse), the six
-    ///   Docker-per-task coding tools (read, write, edit, search, list,
-    ///   shell), and the five persistent terminal tools (shell_open,
-    ///   shell_send, shell_read, shell_close, shell_list).
+    ///   per-task coding tools (read, write, edit, search, list, shell), and
+    ///   the five persistent terminal tools (shell_open, shell_send,
+    ///   shell_read, shell_close, shell_list).
     ///
     /// A second boot is a no-op: existing rows are never overwritten, so
     /// operator edits survive restarts. When the process has no LLM config
@@ -1167,17 +1167,16 @@ impl super::Store {
                     "web_parse",
                     "parse a PDF/DOCX document through the compatibility alias",
                 ),
-                // Coding tools run inside one Docker container per task; the
+                // Coding tools run inside one native sandbox per task; the
                 // guard still records every call.
                 ("read", "read a file in the task workspace"),
                 ("write", "write a file in the task workspace"),
                 ("edit", "edit a file in the task workspace"),
                 ("search", "search files in the task workspace"),
                 ("list", "list files in the task workspace"),
-                ("shell", "run a command in the task container"),
-                // Persistent terminals. One Python PTY proxy per session
-                // inside the same task container; the guard still records
-                // every call.
+                ("shell", "run a command in the task sandbox"),
+                // Persistent terminals. One shell per session inside the
+                // same task sandbox; the guard still records every call.
                 ("shell_open", "open a persistent terminal"),
                 ("shell_send", "send text to a persistent terminal"),
                 ("shell_read", "read new output from a persistent terminal"),

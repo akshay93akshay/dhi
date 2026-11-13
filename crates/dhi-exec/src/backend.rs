@@ -9,18 +9,10 @@
 //! registered through the generic [`dhi_agent::guarded_dynamic_tool`] path
 //! cannot forge a task.
 //!
-//! In production the call is resolved to that task's container or native
-//! sandbox runtime. In container mode every file tool goes through its
-//! [`Remote`](rig_tools::remote::Remote) workspace: the file tools use
-//! `/work` as their base and the shell starts in `/work`; there the task
-//! sees the task folder, with `.dhi` and `.dhi/spill` read-only. A project
-//! task can also read its project root through `/project`; read-style tools
-//! are confined to that root, and writes stay confined to `/work`.
-//!
-//! In native sandbox mode the file tools run on the host against the task's
-//! real work directory and project root, and the shell launcher wraps every
-//! command in `/usr/bin/sandbox-exec`. The shell therefore uses [`Local`] and
-//! does not double-wrap the transport.
+//! In production the call is resolved to that task's native sandbox runtime.
+//! The file tools run on the host against the task's real work directory and
+//! real project root, and the shell launcher wraps every command in
+//! `/usr/bin/sandbox-exec`. The shell therefore uses [`Local`] directly.
 //!
 //! Local test mode also uses [`Local`]. There the file tools are confined
 //! to the host task directory and `write`/`edit` also refuse a target, or a
@@ -111,9 +103,7 @@ impl CodingBackend {
             }
             "write" => {
                 let args: WriteArgs = parse_args(tool, input)?;
-                if !runtime.is_container {
-                    checked_target(&runtime.host_dir, &args.path, "write")?;
-                }
+                checked_target(&runtime.host_dir, &args.path, "write")?;
                 Write {
                     workspace: Arc::clone(&runtime.workspace),
                     base: Some(runtime.base.clone()),
@@ -125,9 +115,7 @@ impl CodingBackend {
             }
             "edit" => {
                 let args: EditArgs = parse_args(tool, input)?;
-                if !runtime.is_container {
-                    checked_target(&runtime.host_dir, &args.path, "edit")?;
-                }
+                checked_target(&runtime.host_dir, &args.path, "edit")?;
                 Edit {
                     workspace: Arc::clone(&runtime.workspace),
                     base: Some(runtime.base.clone()),
@@ -170,29 +158,23 @@ impl CodingBackend {
             "shell" => {
                 let args: ShellArgs = parse_args(tool, input)?;
                 let mut shell = shell_template();
-                if runtime.sandbox.is_some() {
-                    // The sandbox launcher already wraps every command in
-                    // `sandbox-exec`; running it through `Local` applies that
-                    // wrapper directly. A `Remote` would prepend the launcher
-                    // to its own transport and wrap it twice.
-                    shell.workspace = Arc::new(Local);
-                } else {
-                    shell.workspace = Arc::clone(&runtime.workspace);
-                }
+                // The sandbox launcher already wraps every command in
+                // `sandbox-exec`; running it through `Local` applies that
+                // wrapper directly.
+                shell.workspace = Arc::new(Local);
                 shell.launcher = shell_launcher(&runtime);
                 shell.spill = Some(runtime.spill.clone());
                 // `Shell::call` hides the status in its context. `run`
                 // returns it, so a timeout or an output-limit kill can be
-                // followed by a container restart that kills anything the
-                // stopped command left running in the container.
+                // followed by a runtime restart that kills anything the
+                // stopped command left in its process group.
                 let ran = shell.run(args).await?;
-                let mut output = translate_spill(ran.output, &runtime);
-                if runtime.is_container
-                    && matches!(ran.status, ExitStatus::TimedOut | ExitStatus::Killed)
+                let mut output = ran.output;
+                if matches!(ran.status, ExitStatus::TimedOut | ExitStatus::Killed)
                     && let Err(err) = self.containers.restart(task_id).await
                 {
                     output.push_str(&format!(
-                        "\n[dhi-exec: the command was stopped but its task container \
+                        "\n[dhi-exec: the command was stopped but its task runtime \
                          could not be restarted: {err}]"
                     ));
                 }
@@ -265,44 +247,17 @@ fn parse_args<T: DeserializeOwned>(tool: &str, input: serde_json::Value) -> anyh
     serde_json::from_value(input).map_err(|err| anyhow!("invalid arguments for {tool}: {err}"))
 }
 
-/// Maps a `/project/...` read path to the project root as this runtime names
-/// it, with a path relative to that root.
-///
-/// A legacy task has no project root. A path that merely starts with the same
-/// letters (`/project-x`) does not match. `..` stays in the relative path and
-/// is refused by the tool's confinement check, so it cannot escape the root.
-fn project_read_target(runtime: &TaskRuntime, requested: &str) -> Option<(PathBuf, String)> {
-    let root = runtime.project_dir.as_ref()?;
-    let rest = requested.strip_prefix("/project")?;
-    if !rest.is_empty() && !rest.starts_with('/') {
-        return None;
-    }
-    let relative = rest.trim_start_matches('/');
-    Some((
-        root.clone(),
-        if relative.is_empty() {
-            ".".to_string()
-        } else {
-            relative.to_string()
-        },
-    ))
-}
-
 /// The base and path a read-style tool uses.
 ///
 /// An absolute path below the task's own work directory is read with the work
 /// directory as its base, so `<work>/.dhi/<task-id>/note.md` and any other
-/// absolute work path resolve to the same file the work base names. Then
-/// `/project/...` and an absolute path below the task's real project root are
-/// confined to that root; every other read stays confined to the task's work
-/// directory. In native sandbox mode the project root and the work directory
-/// are the task's real host paths, so both spellings of a project path work.
+/// absolute work path resolve to the same file the work base names. An
+/// absolute path below the task's real project root is confined to that root;
+/// every other read stays confined to the task's work directory. The project
+/// root and the work directory are real host paths.
 fn read_base_and_path(runtime: &TaskRuntime, requested: &str) -> (PathBuf, String) {
     if let Some(relative) = absolute_below(&runtime.base, requested) {
         return (runtime.base.clone(), relative);
-    }
-    if let Some((root, relative)) = project_read_target(runtime, requested) {
-        return (root, relative);
     }
     if let Some(root) = runtime.project_dir.as_ref()
         && let Some(relative) = absolute_below(root, requested)
@@ -351,8 +306,6 @@ fn read_base_and_path_option(
 /// (including a dangling one) and any symlink component below the task
 /// directory on the requested path, even when that link points back inside.
 ///
-/// Container mode does not run these checks: its paths are container paths,
-/// and the container boundary is the control.
 fn checked_target(task_dir: &Path, requested: &str, action: &str) -> anyhow::Result<PathBuf> {
     let workspace: &dyn Workspace = &Local;
     let resolved = workspace
@@ -440,12 +393,6 @@ const INHERITED_VARIABLES: &[&str] = &[
 /// appends `sh -c <line>` after it. The parent environment is removed first,
 /// then the same small allowlist as local mode is kept.
 ///
-/// In container mode the command runs inside the task container: `HOME`,
-/// `TMPDIR` and `CARGO_HOME` are below `/work`, so tools that execute
-/// temporary binaries work even though the root filesystem is read-only and
-/// `/tmp` is a `noexec` tmpfs. No host environment is inherited into the
-/// container.
-///
 /// In local test mode the parent environment is removed wholesale, then a
 /// small allowlist is preserved: certificate and proxy settings, the locale,
 /// and a Rust toolchain location. `HOME`, `TMPDIR`, and `CARGO_HOME` point
@@ -457,29 +404,6 @@ fn shell_launcher(runtime: &TaskRuntime) -> Launcher {
     if runtime.sandbox.is_some() {
         return sandbox_launcher(runtime);
     }
-    if runtime.is_container {
-        let mut launcher = Launcher::default()
-            .in_dir(runtime.base.clone())
-            .with_env("HOME", runtime.base.join(".home"))
-            .with_env("TMPDIR", runtime.base.join(".tmp"))
-            .with_env("CARGO_HOME", runtime.base.join(".cargo"))
-            .with_env("TERM", "dumb")
-            .with_env("NO_COLOR", "1")
-            .with_env("CI", "1")
-            .with_env("PYTHONDONTWRITEBYTECODE", "1");
-        // The same launcher starts the host `docker` transport. Give that
-        // process the host's home back so Docker Desktop can find its
-        // context and configuration; the command inside the container still
-        // gets `HOME=/work/.home` from the launcher's environment, which
-        // `Remote::spawn` passes into the container explicitly.
-        if let Some(home) = parent_var("HOME") {
-            let mut assignment = OsString::from("HOME=");
-            assignment.push(home);
-            launcher = launcher.wrapped([OsString::from("env"), assignment]);
-        }
-        return launcher;
-    }
-
     local_shell_launcher(&runtime.base)
 }
 
@@ -565,22 +489,6 @@ fn sandbox_launcher(runtime: &TaskRuntime) -> Launcher {
     launcher.wrapped(sandbox_prefix(sandbox))
 }
 
-/// Rewrites the host spill path in cut output to the container path.
-///
-/// The spill file itself lives on the host below the mounted task directory,
-/// so it is the same file inside the container at `runtime.base`. The model
-/// sees container paths, so the path printed in the cut notice must be the
-/// container path it can `read`. Native sandbox and local mode already use
-/// host paths, so the output is returned unchanged.
-fn translate_spill(output: String, runtime: &TaskRuntime) -> String {
-    if !runtime.is_container {
-        return output;
-    }
-    let host = runtime.host_dir.to_string_lossy();
-    let guest = runtime.base.to_string_lossy();
-    output.replace(host.as_ref(), guest.as_ref())
-}
-
 fn parent_var(name: &str) -> Option<OsString> {
     std::env::var_os(name).filter(|value| !value.is_empty())
 }
@@ -643,7 +551,6 @@ mod tests {
             project_dir: Some(project.clone()),
             seen: rig_tools::Seen::default(),
             spill: rig_tools::Spill(work.join(".dhi/spill")),
-            is_container: false,
             sandbox: None,
         };
 
@@ -651,11 +558,6 @@ mod tests {
             read_base_and_path(&runtime, "/tmp/dhi/project/src/main.rs"),
             (project.clone(), "src/main.rs".to_owned()),
             "an absolute project path maps to the project root"
-        );
-        assert_eq!(
-            read_base_and_path(&runtime, "/project/README.md"),
-            (project.clone(), "README.md".to_owned()),
-            "the /project name still works"
         );
         assert_eq!(
             read_base_and_path(&runtime, "/tmp/dhi/project"),
@@ -693,7 +595,6 @@ mod tests {
             project_dir: Some(project),
             seen: rig_tools::Seen::default(),
             spill: rig_tools::Spill(work.join(".dhi/spill")),
-            is_container: false,
             sandbox: None,
         };
 
@@ -882,19 +783,24 @@ mod tests {
         fs::write(project.join("README.md"), "project text\n").unwrap();
         let task = Uuid::new_v4();
         containers.set_task_project(task, Some(&project)).unwrap();
+        let root = fs::canonicalize(&project).unwrap();
 
         let read = backend
             .execute_for_task(
                 task,
                 "read",
-                serde_json::json!({ "path": "/project/README.md" }),
+                serde_json::json!({ "path": root.join("README.md").to_string_lossy() }),
             )
             .await
             .unwrap();
         assert_eq!(read, serde_json::json!("project text\n"));
 
         let listed = backend
-            .execute_for_task(task, "list", serde_json::json!({ "path": "/project" }))
+            .execute_for_task(
+                task,
+                "list",
+                serde_json::json!({ "path": root.to_string_lossy() }),
+            )
             .await
             .unwrap();
         assert!(
@@ -964,8 +870,7 @@ mod tests {
                 .expect_err("a symlink out of the project is refused");
             assert!(err.to_string().contains("outside"), "{err}");
         }
-        // A project file is still readable by its absolute path, both as
-        // the task gets it and by its `/project` name.
+        // A project file is readable by its absolute path.
         let project_absolute = fs::canonicalize(&project)
             .unwrap()
             .join("README.md")
@@ -981,29 +886,29 @@ mod tests {
             .unwrap();
         assert_eq!(read, serde_json::json!("project text\n"));
 
+        // A write stays confined to the task's own work folder.
+        let outside_work = project.join("new.txt");
         let err = backend
             .execute_for_task(
                 task,
                 "write",
-                serde_json::json!({ "path": "/project/new.txt", "content": "no\n" }),
+                serde_json::json!({ "path": outside_work.to_string_lossy(), "content": "no\n" }),
             )
             .await
-            .expect_err("/project is read-only");
-        assert!(
-            err.to_string().contains("outside") || err.to_string().contains("permission"),
-            "{err}"
-        );
-        assert!(!project.join("new.txt").exists());
+            .expect_err("the project root is outside the task work folder");
+        assert!(err.to_string().contains("outside"), "{err}");
+        assert!(!outside_work.exists());
 
         // A project read cannot escape upward through `..`.
+        let escape = root.join("..").join("AGENTS.md");
         let err = backend
             .execute_for_task(
                 task,
                 "read",
-                serde_json::json!({ "path": "/project/../AGENTS.md" }),
+                serde_json::json!({ "path": escape.to_string_lossy() }),
             )
             .await
-            .expect_err("the project read is confined to /project");
+            .expect_err("the project read is confined to the project root");
         assert!(err.to_string().contains("outside"), "{err}");
     }
 
@@ -1020,15 +925,16 @@ mod tests {
         symlink(&outside, project.join("escape.txt")).unwrap();
         let task = Uuid::new_v4();
         containers.set_task_project(task, Some(&project)).unwrap();
+        let escape = fs::canonicalize(&project).unwrap().join("escape.txt");
 
         let err = backend
             .execute_for_task(
                 task,
                 "read",
-                serde_json::json!({ "path": "/project/escape.txt" }),
+                serde_json::json!({ "path": escape.to_string_lossy() }),
             )
             .await
-            .expect_err("the symlink target is outside /project");
+            .expect_err("the symlink target is outside the project root");
         assert!(err.to_string().contains("outside"), "{err}");
     }
 

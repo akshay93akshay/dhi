@@ -19,5 +19,18 @@ ALTER DEFAULT PRIVILEGES FOR ROLE dhi_owner IN SCHEMA public
     GRANT USAGE, SELECT ON SEQUENCES TO dhi_app;
 
 -- The activity table is append-only for the application role.
-REVOKE UPDATE, DELETE ON activity FROM dhi_app;
-GRANT SELECT, INSERT ON activity TO dhi_app;
+--
+-- This file is safe before or after the server migrations. On a fresh
+-- database the table does not exist yet: skip the lock, because the event
+-- trigger from 01-roles.sql applies it when dhi-server creates the table.
+DO $$
+BEGIN
+    IF to_regclass('public.activity') IS NULL THEN
+        RAISE NOTICE 'activity table absent; 01-roles.sql event trigger installs the lock at creation';
+        RETURN;
+    END IF;
+
+    REVOKE UPDATE, DELETE ON activity FROM dhi_app;
+    GRANT SELECT, INSERT ON activity TO dhi_app;
+END
+$$;

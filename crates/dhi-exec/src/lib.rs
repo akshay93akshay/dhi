@@ -4,7 +4,7 @@
 //! (`read`, `write`, `edit`, `search`, `list`, `shell`) come from that crate.
 //! This crate adds what DHI needs:
 //!
-//! - one container or native sandbox per task ([`TaskContainers`]);
+//! - one native sandbox runtime per task ([`TaskContainers`]);
 //! - the [`CodingTools`] facade that stamps the trusted task id and a per-task
 //!   MAC into every guarded request;
 //! - guarded dynamic tools registered on a Rig server
@@ -12,57 +12,38 @@
 //! - a [`dhi_guard::ToolBackend`] that runs the `rig-tools` implementation
 //!   for that task ([`CodingBackend`]).
 //!
-//! # Design B: one container per task
+//! # One runtime per task
 //!
-//! Every task gets its own Docker container, named `dhi-task-<task-id>`. In
-//! legacy mode the only host paths visible in it are the task's own folder,
-//! `root/<task-id>`, mounted at `/work` read-write, and its private `.dhi`
-//! folder and `.dhi/spill` folder, mounted at `/work/.dhi` and
-//! `/work/.dhi/spill` read-only. In project mode the task folder is
-//! `<project>/.dhi/<task-id>` at `/work`, and the selected project root is
-//! mounted read-only at `/project`. The nested read-only mounts are what keep
-//! the container from replacing the spill folder, or the `.dhi` folder that
-//! contains it, with a symbolic link and making the host spill writer write
-//! elsewhere. The container runs read-only apart from `/work` and a tmpfs at
-//! `/tmp`, drops all capabilities, sets `no-new-privileges`, limits memory,
-//! memory-plus-swap, CPUs, open files, and process count, and runs as the
-//! invoking user (on Unix). It has no Docker socket, no host root, no host
-//! home, and no repository write mount, and no host environment secrets are
-//! passed in.
+//! Every task gets its own runtime under a task root. In native sandbox mode
+//! a task is the same macOS user as the server, confined by
+//! `/usr/bin/sandbox-exec` with the configured profile. Its files live at
+//! real host paths: `root/<task-id>` in legacy mode, or
+//! `<project>/.dhi/<task-id>` with the real project root in project mode.
+//! There are no `/work` or `/project` aliases, no `synthetic.conf`, no
+//! dedicated task user, no ACLs, and no `sudo`, so nothing has to be
+//! installed and no reboot is needed.
 //!
-//! All coding tools run **inside** that container. The file tools and the
-//! shell use a [`rig_tools::remote::Remote`] workspace whose transport is
-//! `docker exec -i dhi-task-<task-id> sh -c`, so:
+//! The coding tools act on those real host paths. The file tools use
+//! [`rig_tools::workspace::Local`] against the task's work directory, and a
+//! read of the task's real project root is allowed for a project task.
+//! `shell` starts in the work directory, with `HOME=<work>/.home`,
+//! `CARGO_HOME=<work>/.cargo`, and `TMPDIR=<work>/.tmp`, behind the
+//! `sandbox-exec` wrapper.
 //!
-//! - every file operation is a short `sh` script run in the container;
-//! - `read`, `write`, `edit`, `search` and `list` resolve paths against
-//!   `/work`;
-//! - `shell` starts in `/work`, with `HOME=/work/.home`,
-//!   `CARGO_HOME=/work/.cargo`, and `TMPDIR=/work/.tmp`. The temporary
-//!   directory is under the read-write mount so tools that execute temporary
-//!   binaries work; `/tmp` stays a `noexec` tmpfs for general use.
-//!
-//! The container is the boundary: the host is not visible from it beyond the
-//! mounted task folder. Output the tools cut is spilled on the host to
-//! `root/<task-id>/.dhi/spill`, which the container sees read-only at
-//! `/work/.dhi/spill`; the path shown to the model is translated from the
-//! host path so the model can read it back inside the container.
+//! The profile is the boundary: it must let a task read and write its own
+//! work directory, read its project root without seeing `<project>/.dhi`,
+//! read but not write its spill directory, and reach nothing else. Output the
+//! tools cut is spilled on the host to `<work>/.dhi/spill`.
 //!
 //! A `shell` call that times out, or that is killed for producing too much
-//! output, restarts the task container after its output is captured. That
-//! kills every process the command left in the old container. A background
-//! process started by a command that exits normally can still survive until
-//! the next restart or until the task is removed.
-//!
-//! Containers carry `dhi.managed`, `dhi.task`, `dhi.root`, and `dhi.config`
-//! labels. A running container is reused only when all four match. A
-//! container with the derived name that is not managed for this task, or that
-//! belongs to a different root, is refused and left untouched; a managed
-//! container whose configuration changed is replaced.
+//! output, restarts the task runtime after its output is captured. That kills
+//! every process group the old runtime recorded. A background process started
+//! by a command that exits normally can still survive until the next restart
+//! or until the task is removed.
 //!
 //! # Guard
 //!
-//! The guard stays outside the container and records every call. The task id
+//! The guard stays outside the sandbox and records every call. The task id
 //! comes from [`dhi_agent::RunScope`], which the runtime stamps into the
 //! dispatch context. [`CodingTools`] holds a private random secret and stamps
 //! `HMAC-SHA256(secret, task_id)`; only its own [`CodingTools::backend`]
@@ -70,16 +51,6 @@
 //! accessor and is never shown to the model. A coding tool registered through
 //! the generic [`dhi_agent::guarded_dynamic_tool`] path does not carry a MAC
 //! and is refused before it runs.
-//!
-//! # Images and network
-//!
-//! The image must contain the runtimes a task needs. The default,
-//! `python:3.12-slim`, has Python; a task that needs another language or
-//! toolchain must configure a different image with `DHI_EXEC_IMAGE`.
-//! Network is disabled by default (`--network none`); a task that needs the
-//! network must opt in with `DHI_EXEC_NETWORK`. Memory, CPU, and process
-//! limits are configurable through [`ContainerConfig`] or the matching
-//! `DHI_EXEC_*` environment variables.
 //!
 //! # Shutdown
 //!
@@ -91,25 +62,15 @@
 //! # Local test mode
 //!
 //! [`TaskContainers::local`] exists only for tests. It creates the same
-//! private host layout but uses [`rig_tools::workspace::Local`] instead of
-//! Docker. In that mode the host is still reachable and the file-tool path
-//! checks and symlink checks are the control; `shell` is not an OS sandbox.
+//! private host layout and runs the tools with
+//! [`rig_tools::workspace::Local`] and no `sandbox-exec`. In that mode the
+//! host is still reachable and the file-tool path checks and symlink checks
+//! are the control; `shell` is not an OS sandbox.
 //!
 //! # Native macOS sandbox
 //!
-//! [`TaskContainers::sandbox`] runs tasks without Docker or a VM. Every task
-//! runs as the same macOS user as the server under `/usr/bin/sandbox-exec`,
-//! with its own real host paths: `root/<task-id>` in legacy mode, or
-//! `<project>/.dhi/<task-id>` with the real project root in project mode.
-//! There are no `/work` or `/project` aliases, no `synthetic.conf`, no
-//! dedicated task user, no ACLs, and no `sudo`, so nothing has to be
-//! installed and no reboot is needed.
-//!
-//! Because each task names its own paths, any number of sandbox tasks can run
-//! at the same time. The profile is the boundary; it must let a task read and
-//! write its own work directory, read its project root without seeing
-//! `<project>/.dhi`, read but not write its spill directory, and reach nothing
-//! else.
+//! [`TaskContainers::sandbox`] is the production mode. Because each task names
+//! its own paths, any number of sandbox tasks can run at the same time.
 //!
 //! Every sandboxed command is wrapped to record its session-leader pid in a
 //! server-owned pidfile below `root/pids`. [`TaskContainers::remove`] kills
@@ -128,7 +89,7 @@ mod tools;
 
 pub use backend::CodingBackend;
 pub use container::{
-    ContainerConfig, SandboxConfig, SandboxRuntime, TaskContainers, TaskRuntime,
-    prepare_project_task_dir, sandbox_prefix,
+    SandboxConfig, SandboxRuntime, TaskContainers, TaskRuntime, prepare_project_task_dir,
+    sandbox_prefix,
 };
 pub use tools::{CodingTools, SCOPE_MAC_FIELD, TASK_ID_FIELD, ToolDefinition, tool_definitions};

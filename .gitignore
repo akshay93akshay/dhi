@@ -34,4 +34,3 @@ web.env
 /ops/mcp.json
 
 # Optional compose overrides
-docker-compose.override.yml

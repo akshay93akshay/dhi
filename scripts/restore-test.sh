@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # Rehearse a restore into a throwaway database and compare row counts.
+# Requires prebuilt PostgreSQL 16 client tools on PATH.
+#   export PG_BIN="/Applications/Postgres.app/Contents/Versions/16/bin"   # Postgres.app
+#   # or: export PG_BIN="/path/to/pgsql/bin"                              # EDB binaries
+#   export PATH="$PG_BIN:$PATH"
+#
 # Usage: scripts/restore-test.sh [dump-file]
+# Env:   MIGRATION_DATABASE_URL  owner connection string used to reach the
+#                               server (default postgres://dhi_owner:dhi_owner@127.0.0.1:5432/dhi)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-CONTAINER="dhi-postgres-1"
-DB="dhi"
-DB_OWNER="dhi_owner"
+MIGRATION_DATABASE_URL="${MIGRATION_DATABASE_URL:-postgres://dhi_owner:dhi_owner@127.0.0.1:5432/dhi}"
 TMP_PREFIX="dhi_restore_test_"
 
 usage() {
@@ -15,6 +20,37 @@ usage() {
 }
 
 [ "$#" -le 1 ] || usage
+
+missing=""
+for tool in psql createdb dropdb pg_restore; do
+  command -v "$tool" >/dev/null 2>&1 || missing="$missing $tool"
+done
+if [ -n "$missing" ]; then
+  echo "error: PostgreSQL client tools not found:$missing" >&2
+  echo "install prebuilt PostgreSQL 16 (Postgres.app or EDB binaries) and add its bin" >&2
+  echo "directory to PATH, for example:" >&2
+  echo '  export PG_BIN="/Applications/Postgres.app/Contents/Versions/16/bin"   # Postgres.app' >&2
+  echo '  # or: export PG_BIN="/path/to/pgsql/bin"                              # EDB binaries' >&2
+  echo '  export PATH="$PG_BIN:$PATH"' >&2
+  exit 1
+fi
+
+# Connections to the server, then to the live and temporary databases.
+server_url="${MIGRATION_DATABASE_URL%%\?*}"
+case "$server_url" in
+  postgres://*/*)
+    server_base="${server_url%/*}"
+    ;;
+  postgres://*:*)
+    echo "error: MIGRATION_DATABASE_URL has no database name: $MIGRATION_DATABASE_URL" >&2
+    exit 1
+    ;;
+  *)
+    echo "error: unsupported MIGRATION_DATABASE_URL: $MIGRATION_DATABASE_URL" >&2
+    exit 1
+    ;;
+esac
+live_url="$server_url"
 
 if [ "$#" -eq 1 ]; then
   dump="$1"
@@ -48,10 +84,11 @@ case "$TMPDB" in
     exit 1
     ;;
 esac
-if [ "$TMPDB" = "$DB" ]; then
+if [ "$server_base/$TMPDB" = "$live_url" ]; then
   echo "error: refusing to use the live database as a restore target" >&2
   exit 1
 fi
+tmp_url="$server_base/$TMPDB"
 
 tmp_log=""
 TMPDB_CREATED=0
@@ -68,7 +105,7 @@ cleanup() {
     else
       case "$TMPDB" in
         "$TMP_PREFIX"*)
-          if docker exec "$CONTAINER" dropdb -U "$DB_OWNER" --if-exists "$TMPDB" >/dev/null 2>&1; then
+          if dropdb --if-exists --maintenance-db="$server_url" "$TMPDB" >/dev/null 2>&1; then
             echo "temporary database dropped: $TMPDB"
           else
             echo "warning: failed to drop temporary database: $TMPDB" >&2
@@ -93,13 +130,13 @@ trap cleanup EXIT
 echo "dump: $dump"
 echo "temporary database: $TMPDB"
 
-docker exec "$CONTAINER" createdb -U "$DB_OWNER" "$TMPDB"
+createdb --maintenance-db="$server_url" "$TMPDB"
 TMPDB_CREATED=1
 
 tmp_log="$(mktemp "${TMPDIR:-/tmp}/dhi-restore-test.XXXXXX")"
-if ! docker exec -i "$CONTAINER" pg_restore -U "$DB_OWNER" -d "$TMPDB" \
+if ! pg_restore -d "$tmp_url" \
   --single-transaction --exit-on-error --no-owner --no-privileges \
-  <"$dump" 2>"$tmp_log"; then
+  "$dump" 2>"$tmp_log"; then
   echo "error: pg_restore failed" >&2
   sed 's/^/  /' "$tmp_log" >&2 || true
   exit 1
@@ -114,10 +151,10 @@ counts_sql="select
   (select count(*) from results)::text"
 
 read -r live_tasks live_facts live_intents live_results < <(
-  docker exec "$CONTAINER" psql -U "$DB_OWNER" -d "$DB" -Atc "$counts_sql"
+  psql "$live_url" -Atc "$counts_sql"
 )
 read -r test_tasks test_facts test_intents test_results < <(
-  docker exec "$CONTAINER" psql -U "$DB_OWNER" -d "$TMPDB" -Atc "$counts_sql"
+  psql "$tmp_url" -Atc "$counts_sql"
 )
 
 printf '%-8s %10s %10s\n' "table" "live" "restored"

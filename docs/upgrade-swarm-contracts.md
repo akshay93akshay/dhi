@@ -57,26 +57,24 @@ POST /api/tasks
   (`null` at the root), and `entries[]`. Each entry has `name`, the absolute
   host `path` used for selection, `kind` (`directory` or `file`), and
   optional `size` and `modified_at`. Symlink entries are skipped.
-- `project_folder` is the absolute host path of the selected project folder.
-  The task form requires it. The API keeps the legacy no-folder path for
+- `project_folder` is the absolute path of the selected project folder on this
+  Mac. The task form requires it. The API keeps the legacy no-folder path for
   compatibility with old clients. It replaces membership in
-  `DHI_PROJECT_FOLDERS` as the task-creation selector. The server and the
-  Docker daemon must resolve it to the same directory.
-- `agents_md_path` is the absolute host path of the selected `AGENTS.md`. It
+  `DHI_PROJECT_FOLDERS` as the task-creation selector. The server and the task
+  sandbox run as the same macOS user and resolve it to the same directory.
+- `agents_md_path` is the absolute path of the selected `AGENTS.md`. It
   may be inside or outside `project_folder`, but it must resolve below
   `DHI_FILE_BROWSER_ROOT`, avoid symlinks, name the file exactly
   `AGENTS.md`, and be at most 32 KiB. It is `null` when no file is selected.
   The server reads only that path and does not search for another
   `AGENTS.md`.
-- The task folder is `<project_folder>/.dhi/<task-id>`. The task container
-  mounts `project_folder` at `/project` read-only and the task folder at
-  `/work` read-write. Existing project files are unchanged.
+- The task folder is `<project_folder>/.dhi/<task-id>`. The task sandbox reads
+  `project_folder` and writes only in the task folder. Existing project files
+  are unchanged.
 - `DHI_FILE_BROWSER_ROOT` is required for the file-browser routes. The server
-  creates a missing root, refuses a symlinked root, and keeps the base Compose
-  file valid when the variable is unset; `docker-compose.fs.yml` adds the
-  same-path mount when it is set.
+  creates a missing root and refuses a symlinked root.
 - `DHI_PROJECT_FOLDERS` remains only for tasks created before this contract.
-  Keep its same-path mounts while those tasks exist.
+  Keep its paths valid while those tasks exist.
 
 ## Manager-worker lead (unchanged)
 
@@ -247,7 +245,7 @@ Strict ownership. The main agent coordinates any cross-owner change.
 
 - No commit, push, or merge without approval.
 - No local cargo builds.
-- No local Docker image builds.
+- No local image builds.
 - Use subagents for implementation.
 - Do not delete `target/`.
 - Do not touch `master`.

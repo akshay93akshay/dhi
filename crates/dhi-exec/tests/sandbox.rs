@@ -195,7 +195,10 @@ async fn a_project_task_uses_its_real_paths() {
         runtime.project_dir.as_deref(),
         Some(canonical_project.as_path())
     );
-    assert!(!runtime.is_container, "sandbox mode is not a container");
+    assert!(
+        runtime.sandbox.is_some(),
+        "sandbox mode runs under sandbox-exec"
+    );
     let sandbox = runtime.sandbox.as_ref().expect("a sandbox runtime");
     assert_eq!(sandbox.task_id, task);
     assert_eq!(sandbox.host_work, expected);
@@ -227,7 +230,7 @@ async fn a_legacy_task_uses_the_task_root() {
     assert_eq!(runtime.base, containers.root().join(task.to_string()));
     assert_eq!(runtime.host_dir, runtime.base);
     assert_eq!(runtime.project_dir, None);
-    assert!(!runtime.is_container);
+    assert!(runtime.sandbox.is_some());
     let sandbox = runtime.sandbox.as_ref().expect("a sandbox runtime");
     assert_eq!(sandbox.task_id, task);
     assert_eq!(sandbox.host_project, None);

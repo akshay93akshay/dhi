@@ -1,12 +1,12 @@
 # Native macOS sandbox
 
-DHI<sup>+</sup> runs task tools on macOS without Docker and without a VM. Every
-sandboxed command runs as the **same macOS user** as the server under
+DHI<sup>+</sup> runs task tools on macOS with no container runtime and no VM.
+Every sandboxed command runs as the **same macOS user** as the server under
 `/usr/bin/sandbox-exec` against a profile in this repository.
 
-There is no privileged setup step and nothing to install: no task user, no
-ACLs, no `sudo`, no reboot, and no install script. The server only needs the
-profile path in `DHI_SANDBOX_PROFILE`:
+There is no privileged setup step and nothing extra to install: no task user,
+no ACLs, no `sudo`, no reboot, and no install script. The server only needs the
+profile path in `DHI_SANDBOX_PROFILE`, which is required:
 
 - the value is trimmed; an empty or unset value fails startup;
 - a value containing `~` (including `~/...`) is rejected — no shell expansion
@@ -15,6 +15,8 @@ profile path in `DHI_SANDBOX_PROFILE`:
   so symlinks are resolved once at startup), and it must name an existing
   regular file; otherwise startup fails with the raw value and the reason;
 - the canonical path is what the backend logs and passes to `sandbox-exec`.
+
+The profile in this repository is `ops/macos/dhi-task.sb`.
 
 ## Real paths, one per task
 
@@ -77,40 +79,202 @@ stop:
 
 ## Required `.env`
 
-The native block below is the complete native configuration and matches
-`.env.example` exactly. Uncomment it; the `DATABASE_URL` and
-`MIGRATION_DATABASE_URL` lines are the runtime defaults and stay commented:
+The block below is the complete native configuration and matches
+`.env.example`:
 
 ```dotenv
-# Host file browser (Docker only): absolute host root listed by the task
-# file browser. The server and the Docker daemon must see the same absolute
-# path; mount it with docker-compose.fs.yml. Unset disables the file browser.
-# Example: /srv/dhi/projects
-# DHI_FILE_BROWSER_ROOT=/srv/dhi/projects
-
-# Native macOS sandbox backend (no Docker, no VM). See docs/macos-native.md.
-# This block is the complete native configuration: it replaces the Docker
-# DHI_FILE_BROWSER_ROOT example above when the sandbox backend is selected.
-# DHI_EXEC_BACKEND=sandbox
-# DHI_SANDBOX_PROFILE=/Users/drakshayr/Desktop/dhi/ops/macos/dhi-task.sb
-# DHI_WORKSPACE_ROOT=/Users/Shared/dhi/work
-# DHI_FILE_BROWSER_ROOT=/Users/Shared/dhi/projects
+# Native macOS task sandbox. See docs/macos-native.md.
+# DHI_SANDBOX_PROFILE is the profile in this checkout. Replace <you>; no
+# ~ expansion is done.
+DHI_SANDBOX_PROFILE=/Users/<you>/Desktop/dhi/ops/macos/dhi-task.sb
+DHI_WORKSPACE_ROOT=/Users/Shared/dhi/work
+DHI_FILE_BROWSER_ROOT=/Users/Shared/dhi/projects
 ```
 
-The Docker `/srv/dhi/projects` example above is Docker-only; it is not a
-native default. `DHI_SANDBOX_PROFILE` must be absolute (see above).
+`DHI_SANDBOX_PROFILE` points at `ops/macos/dhi-task.sb` inside this
+checkout. There is no install copy; do not copy the profile elsewhere. Replace
+`<you>` with your macOS user name, and adjust the path if the checkout lives
+somewhere other than `~/Desktop/dhi`. The value must be absolute, and `~` is
+not expanded.
+
 `DHI_FILE_BROWSER_ROOT` must already exist or be creatable, and
 `/Users/Shared/dhi/projects` is preferred over `~/Desktop`, `~/Documents`, and
 `~/Downloads` because those folders are subject to TCC (see Limits).
 
-## Native services
+## PostgreSQL
 
-Everything else runs natively too; Docker is not required:
+PostgreSQL 16 runs natively on the same Mac. The server applies the app
+migrations itself at startup, so the database, the roles, and the grants must
+exist before the first server start.
 
-- **PostgreSQL 16** — run it natively and point `DATABASE_URL` and
-  `MIGRATION_DATABASE_URL` at it. The server applies migrations itself at
-  startup. `scripts/migrate.sh` is Docker-only; do not use it.
-- **Rust server** — build with `cargo build -p dhi-server`.
+The roles are `dhi_owner` (schema owner and migrations), `dhi_app` (runtime),
+and `dhi_test` (test databases). The role and grant SQL lives in `ops/postgres/`:
+
+- `ops/postgres/01-roles.sql`
+- `ops/postgres/02-grants.sql`
+
+`scripts/migrate.sh` connects with `psql` as `dhi_owner`, applies both files in
+order, and verifies that `dhi_app` cannot update or delete `activity`. It never
+applies the app schema.
+
+### Install PostgreSQL 16
+
+Use a prebuilt PostgreSQL 16 build. Both options ship complete `bin/`
+directories, so nothing compiles on this Mac:
+
+- **Postgres.app** — download PostgreSQL 16 from postgresapp.com, move it to
+  `/Applications`, and let it initialize a cluster on first launch.
+- **EDB PostgreSQL 16 binaries** — download the macOS PostgreSQL 16 package
+  from enterprisedb.com and unpack it, for example to
+  `/Users/Shared/pgsql`. There is no installer step in this guide; every step
+  below uses paths inside the unpacked tree.
+
+Then point `PG_BIN` at that directory and put it on `PATH` for the shell that
+runs these steps. Every command below uses `"$PG_BIN/..."`, so it works the
+same for both options:
+
+```sh
+export PG_BIN="/Applications/Postgres.app/Contents/Versions/16/bin"
+# or: export PG_BIN="/path/to/pgsql/bin"
+export PATH="$PG_BIN:$PATH"
+```
+
+Use `/path/to/pgsql/bin` for an EDB unpack, such as
+`/Users/Shared/pgsql/bin`.
+
+Homebrew is optional and only on systems where Homebrew ships bottles. On
+Intel macOS 14, Homebrew has no PostgreSQL 16 bottle, so
+`brew install postgresql@16` compiles from source. Prebuilt binaries are the
+primary path here.
+
+### Cluster, database, roles
+
+1. Create a cluster owned by `dhi_owner`. `initdb` also creates the
+   maintenance database `postgres`:
+
+   ```sh
+   "$PG_BIN/initdb" -D /Users/Shared/dhi/pgdata -U dhi_owner --auth=scram-sha-256
+   ```
+
+   Use a data directory your user owns. Skip this step if Postgres.app already
+   initialized a cluster you want to use, and point `-D` at that cluster for
+   the `pg_ctl` commands.
+
+2. Start the server on `127.0.0.1:5432`:
+
+   ```sh
+   "$PG_BIN/pg_ctl" -D /Users/Shared/dhi/pgdata -l /Users/Shared/dhi/pg.log start
+   ```
+
+3. Confirm the owner role can log in with a password. `initdb -U dhi_owner`
+   already created that superuser in the new cluster; this block only creates
+   the login role when the cluster came from Postgres.app or another owner:
+
+   ```sh
+   "$PG_BIN/psql" "postgres://dhi_owner@127.0.0.1:5432/postgres" \
+     -v ON_ERROR_STOP=1 <<'SQL'
+   DO $$
+   BEGIN
+       IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'dhi_owner') THEN
+           CREATE ROLE dhi_owner LOGIN CREATEDB PASSWORD 'dhi_owner';
+       END IF;
+   END
+   $$;
+   SQL
+   ```
+
+   If the cluster's superuser has another name, connect as that user first.
+
+4. Create the database owned by `dhi_owner`:
+
+   ```sh
+   "$PG_BIN/createdb" -h 127.0.0.1 -p 5432 -U dhi_owner -O dhi_owner dhi
+   ```
+
+5. Run the role and grant script. It applies `ops/postgres/01-roles.sql` and
+   `ops/postgres/02-grants.sql` and verifies the activity lock. The server
+   applies the app schema at startup. If the `activity` table does not exist
+   yet, the script says so and the server installs the lock on its first run.
+
+   ```sh
+   scripts/migrate.sh
+   ```
+
+   The script needs `psql` and `pg_isready` on `PATH`, so run it in a shell
+   where `PATH="$PG_BIN:$PATH"` is still set. It uses
+   `MIGRATION_DATABASE_URL`, which defaults to
+   `postgres://dhi_owner:dhi_owner@127.0.0.1:5432/dhi`.
+
+6. Put the runtime and migration URLs in `.env`. With the sample passwords
+   from `.env.example`:
+
+   ```dotenv
+   DATABASE_URL=postgres://dhi_app:dhi_app@127.0.0.1:5432/dhi
+   MIGRATION_DATABASE_URL=postgres://dhi_owner:dhi_owner@127.0.0.1:5432/dhi
+   TEST_DATABASE_URL=postgres://dhi_test:dhi_test@127.0.0.1:5432/dhi
+   ```
+
+   If you choose your own passwords, change them in `ops/postgres/01-roles.sql`
+   before running the script, or set them with `ALTER ROLE` afterwards. The
+   server needs both URLs: it migrates as `dhi_owner` and serves and runs tasks
+   as `dhi_app`.
+
+### Start PostgreSQL after a reboot
+
+`pg_ctl` does not survive a reboot. Either start the server by hand after each
+boot:
+
+```sh
+"$PG_BIN/pg_ctl" -D /Users/Shared/dhi/pgdata -l /Users/Shared/dhi/pg.log start
+"$PG_BIN/pg_ctl" -D /Users/Shared/dhi/pgdata stop
+```
+
+or load a per-user LaunchAgent. This is optional and needs no root; it starts
+PostgreSQL when you log in. Save it as
+`~/Library/LaunchAgents/local.dhi.postgres.plist`, replacing `<you>` and the
+data directory:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>local.dhi.postgres</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Postgres.app/Contents/Versions/16/bin/postgres</string>
+        <string>-D</string>
+        <string>/Users/Shared/dhi/pgdata</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/<you>/Library/Logs/dhi-postgres.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/<you>/Library/Logs/dhi-postgres.log</string>
+</dict>
+</plist>
+```
+
+Load and unload it with:
+
+```sh
+launchctl bootstrap gui/"$(id -u)" ~/Library/LaunchAgents/local.dhi.postgres.plist
+launchctl bootout gui/"$(id -u)" ~/Library/LaunchAgents/local.dhi.postgres.plist
+```
+
+The `ProgramArguments` path must stay absolute; `launchd` does not read your
+shell `PATH`. Use the EDB `bin/postgres` path instead when that is the install.
+
+## Server and UI
+
+- **Rust server** — build with `cargo build -p dhi-server`, then run
+  `./target/debug/dhi-server`, or use `cargo run -p dhi-server`. The server
+  loads `.env` from its working directory.
 - **UI** — build the static export with
   `cd web && npm ci && NEXT_EXPORT=1 npm run build`. The server serves
   `web/out`; `scripts/dev.sh` runs the development UI instead.

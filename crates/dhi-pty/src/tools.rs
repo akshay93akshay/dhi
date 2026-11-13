@@ -122,8 +122,8 @@ impl PtyTools {
     /// Closes every terminal session of `task_id`.
     ///
     /// This is the production way to stop a task's terminals before its
-    /// container is removed. A session whose container-side cleanup fails
-    /// stays registered so the call can be retried.
+    /// runtime is removed. A session whose process cleanup fails stays
+    /// registered so the call can be retried.
     pub async fn close_task(&self, task_id: Uuid) -> anyhow::Result<()> {
         self.sessions.close_task(task_id).await
     }
@@ -131,7 +131,7 @@ impl PtyTools {
     /// Closes every terminal session and refuses any new one.
     ///
     /// Production calls this when the runtime stops, before
-    /// [`TaskContainers::shutdown`]. It does not stop task containers.
+    /// [`TaskContainers::shutdown`]. It does not stop task runtimes.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         self.sessions.shutdown().await
     }

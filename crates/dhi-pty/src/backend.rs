@@ -9,8 +9,8 @@
 //! registered through the generic [`dhi_agent::guarded_dynamic_tool`] path
 //! cannot forge a task.
 //!
-//! The session itself lives in the task's runtime: a container PTY behind
-//! the Python proxy in production, or a local `/bin/sh` in test mode.
+//! The session itself lives in the task's runtime: a `/bin/sh` under
+//! `sandbox-exec` in production, or a local `/bin/sh` in test mode.
 
 use std::sync::Arc;
 

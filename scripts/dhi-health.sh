@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Read-only health check for a running DHI deployment.
+# Read-only health check for a running native DHI deployment.
 # Never restarts services or writes files.
+#
+# Requires prebuilt PostgreSQL 16 client tools (pg_isready, psql) on PATH.
+#   export PG_BIN="/Applications/Postgres.app/Contents/Versions/16/bin"   # Postgres.app
+#   # or: export PG_BIN="/path/to/pgsql/bin"                              # EDB binaries
+#   export PATH="$PG_BIN:$PATH"
 #
 # Usage: scripts/dhi-health.sh [--api-only]
 set -euo pipefail
@@ -9,9 +14,7 @@ cd "$(dirname "$0")/.."
 DHI_API_URL="${DHI_API_URL:-http://127.0.0.1:8080}"
 DHI_CHESS_URL="${DHI_CHESS_URL:-http://127.0.0.1:8090}"
 DHI_MIN_FREE_GB="${DHI_MIN_FREE_GB:-5}"
-DHI_PG_SERVICE="${DHI_PG_SERVICE:-postgres}"
-DHI_PG_USER="${DHI_PG_USER:-dhi_owner}"
-DHI_PG_DB="${DHI_PG_DB:-dhi}"
+DHI_PG_URL="${MIGRATION_DATABASE_URL:-postgres://dhi_owner:dhi_owner@127.0.0.1:5432/dhi}"
 
 ok_count=0
 warn_count=0
@@ -106,33 +109,26 @@ else
   fail "ui" "$ui_detail"
 fi
 
-# 3. Postgres (required).
-container=""
-if compose_out="$(docker compose ps -q "$DHI_PG_SERVICE" 2>/dev/null)"; then
-  container="$(printf '%s\n' "$compose_out" | head -n 1)"
-fi
-[ -n "$container" ] || container="dhi-postgres-1"
+# 3. Postgres (required). Native server: ask pg_isready, then confirm the
+# runtime role can read the database.
+pg_host="$(printf '%s' "$DHI_PG_URL" | sed -E 's#^[a-z]+://([^@/]*@)?([^:/]+).*#\2#')"
+pg_port="$(printf '%s' "$DHI_PG_URL" | sed -E 's#^[a-z]+://([^@/]*@)?[^:/]+:([0-9]+).*#\2#')"
+[ -n "$pg_host" ] || pg_host="127.0.0.1"
+case "$pg_port" in
+  ''|*[!0-9]*) pg_port=5432 ;;
+esac
 
-inspect="$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container" 2>/dev/null || true)"
-pg_state="${inspect%% *}"
-pg_health="${inspect#* }"
-[ -n "$pg_health" ] || pg_health="none"
-
-if [ "$pg_state" = "running" ] && { [ "$pg_health" = "healthy" ] || [ "$pg_health" = "none" ]; }; then
-  pg_ready=0
-  if docker compose exec -T "$DHI_PG_SERVICE" pg_isready -U "$DHI_PG_USER" -d "$DHI_PG_DB" >/dev/null 2>&1; then
-    pg_ready=1
-  elif docker exec "$container" pg_isready -U "$DHI_PG_USER" -d "$DHI_PG_DB" >/dev/null 2>&1; then
-    pg_ready=1
-  fi
-
-  if [ "$pg_ready" -eq 1 ]; then
-    ok "postgres" "$container running $pg_health"
-  else
-    fail "postgres" "$container running $pg_health but pg_isready failed"
-  fi
+if ! command -v pg_isready >/dev/null 2>&1; then
+  fail "postgres" "pg_isready not found on PATH; install PostgreSQL 16"
+elif ! pg_isready -q -h "$pg_host" -p "$pg_port" -d "$DHI_PG_URL" >/dev/null 2>&1; then
+  fail "postgres" "pg_isready -h $pg_host -p $pg_port failed (server not accepting connections)"
+elif ! command -v psql >/dev/null 2>&1; then
+  fail "postgres" "pg_isready ok but psql not found on PATH; cannot verify the database"
+elif ! pg_db="$(psql "$DHI_PG_URL" -Atc 'select current_database()' 2>/dev/null)" \
+     || [ -z "$pg_db" ]; then
+  fail "postgres" "pg_isready ok at $pg_host:$pg_port but psql could not connect"
 else
-  fail "postgres" "${inspect:-$container not found}"
+  ok "postgres" "$pg_host:$pg_port accepting connections; database $pg_db reachable"
 fi
 
 # 4. Disk (required).

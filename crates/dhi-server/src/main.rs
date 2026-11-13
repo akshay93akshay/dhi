@@ -10,7 +10,7 @@ use dhi_agent::{
 use dhi_core::team::TeamStore;
 use dhi_core::{GraphStore, GuardStore, ScaleApprovalGate};
 use dhi_engine::Engine;
-use dhi_exec::{CodingTools, ContainerConfig, SandboxConfig, TaskContainers};
+use dhi_exec::{CodingTools, SandboxConfig, TaskContainers};
 use dhi_guard::{GuardedExecutor, SharedPolicy, ToolBackend};
 use dhi_pty::PtyTools;
 use dhi_server::{
@@ -160,9 +160,8 @@ fn resolve_sandbox_profile(raw: Option<&str>) -> anyhow::Result<std::path::PathB
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "DHI_SANDBOX_PROFILE is required when DHI_EXEC_BACKEND=sandbox; set it to \
-             the absolute path of the sandbox profile (for example \
-             ops/macos/dhi-task.sb)"
+                "DHI_SANDBOX_PROFILE is required; set it to the absolute path of the \
+             sandbox profile (for example ops/macos/dhi-task.sb)"
             )
         })?;
     if raw.contains('~') {
@@ -464,10 +463,8 @@ async fn main() -> anyhow::Result<()> {
         "host file browser configured"
     );
     // Browser-folder web projects are opt-in. A configured root must already
-    // exist or be creatable, be writable, and must not be a symlink. The same
-    // absolute path must be visible to this process and the Docker daemon:
-    // each web project's folder is passed to the existing project mount
-    // unchanged.
+    // exist or be creatable, be writable, and must not be a symlink. Each web
+    // project's folder is passed to its tasks as the real project root.
     let web_projects = Arc::new(dhi_server::web_projects::WebProjects::from_env()?);
     info!(
         root = ?web_projects.root(),
@@ -581,71 +578,36 @@ async fn main() -> anyhow::Result<()> {
     let skills_runtime = dhi_skills::SkillsRuntime::from_env();
     let custom_tools_runtime = dhi_custom_tools::CustomToolsRuntime::from_env();
     // Coding tools: one managed task boundary per task, rooted at
-    // DHI_WORKSPACE_ROOT (default `workspace`). The default backend is one
-    // Docker container per task; DHI_EXEC_BACKEND=sandbox selects the native
-    // macOS sandbox instead: the same macOS user, no Docker daemon, no VM,
-    // no task user, and no reboot. Runtimes left by a process that died
-    // without shutdown are cleaned up best effort here, before any task runs;
-    // a runtime failure only warns and the server still boots.
+    // DHI_WORKSPACE_ROOT (default `workspace`). The backend is always the
+    // native macOS sandbox: the same macOS user as the server, no VM, no task
+    // user, and no reboot. The sandbox profile is required at startup.
+    // Runtimes left by a process that died without shutdown are cleaned up
+    // best effort here, before any task runs; a runtime failure only warns and
+    // the server still boots.
     let workspace_root =
         std::env::var("DHI_WORKSPACE_ROOT").unwrap_or_else(|_| "workspace".to_string());
-    let exec_backend = std::env::var("DHI_EXEC_BACKEND").unwrap_or_default();
-    let use_sandbox = exec_backend.trim().eq_ignore_ascii_case("sandbox");
-    // The server normally runs in its own container and reaches the host
-    // Docker daemon through /var/run/docker.sock. The daemon resolves bind
-    // mount sources on the host, so it needs the real host path of
-    // DHI_WORKSPACE_ROOT: DHI_WORKSPACE_HOST_ROOT. When it is unset the task
-    // root is used as before, which is correct only when this process sees
-    // the host filesystem directly (local development and tests).
-    let workspace_host_root = std::env::var("DHI_WORKSPACE_HOST_ROOT")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    let task_containers = if use_sandbox {
-        // The profile is validated and canonicalized here, before any task
-        // runs: an unset, empty, relative, `~`-relative, missing, or
-        // non-file value fails startup with the raw value in the message.
-        let raw_profile = std::env::var("DHI_SANDBOX_PROFILE").ok();
-        let profile = resolve_sandbox_profile(raw_profile.as_deref())?;
-        info!(
-            backend = "sandbox",
-            profile = %profile.display(),
-            workspace_root = %workspace_root,
-            "native macOS sandbox backend selected: tasks run as the same macOS user under \
-             sandbox-exec"
-        );
-        TaskContainers::sandbox(workspace_root.clone(), SandboxConfig { profile })?
-    } else {
-        let mut containers =
-            TaskContainers::new(workspace_root.clone(), ContainerConfig::default())?;
-        if let Some(host_root) = &workspace_host_root {
-            containers = containers.with_host_root(host_root.clone())?;
-        } else {
-            warn!(
-                workspace_root = %workspace_root,
-                "DHI_WORKSPACE_HOST_ROOT is unset; task container bind mounts use the task root \
-                 as their host path, which is only correct when this process sees the host \
-                 filesystem directly"
-            );
-        }
-        info!(
-            backend = "docker",
-            workspace_root = %workspace_root,
-            workspace_host_root = %workspace_host_root.as_deref().unwrap_or(workspace_root.as_str()),
-            "task container workspace roots configured"
-        );
-        containers
-    };
+    // The profile is validated and canonicalized here, before any task runs:
+    // an unset, empty, relative, `~`-relative, missing, or non-file value fails
+    // startup with the raw value in the message.
+    let raw_profile = std::env::var("DHI_SANDBOX_PROFILE").ok();
+    let profile = resolve_sandbox_profile(raw_profile.as_deref())?;
+    info!(
+        backend = "sandbox",
+        profile = %profile.display(),
+        workspace_root = %workspace_root,
+        "native macOS sandbox backend: tasks run as the same macOS user under sandbox-exec"
+    );
+    let task_containers =
+        TaskContainers::sandbox(workspace_root.clone(), SandboxConfig { profile })?;
     let task_containers = Arc::new(task_containers);
     if let Err(err) = task_containers.reap_orphans().await {
         warn!(error = %err, "task runtime orphan cleanup failed; continuing");
     }
     let coding = Arc::new(CodingTools::new(task_containers.clone()));
     let coding_backend = Arc::new(coding.backend());
-    // Persistent terminals: the PTY sessions share the same task runtimes
-    // (Docker containers or the native sandbox) as the coding tools, so a
-    // terminal sees the task workspace and the runtime is removed only after
-    // its terminals are closed.
+    // Persistent terminals: the PTY sessions share the same task runtimes as
+    // the coding tools, so a terminal sees the task workspace and the runtime
+    // is removed only after its terminals are closed.
     let pty = Arc::new(PtyTools::new(task_containers.clone()));
     let pty_backend = Arc::new(pty.backend());
     // The registry owns the hard-kill cleanup handles: a loop that ignores

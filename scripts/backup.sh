@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
-# Create a compressed logical backup of the live DHI database.
+# Create a compressed logical backup of the live DHI database with pg_dump.
+# Requires prebuilt PostgreSQL 16 client tools on PATH.
+#   export PG_BIN="/Applications/Postgres.app/Contents/Versions/16/bin"   # Postgres.app
+#   # or: export PG_BIN="/path/to/pgsql/bin"                              # EDB binaries
+#   export PATH="$PG_BIN:$PATH"
+#
 # Usage: scripts/backup.sh [output-dir]
+# Env:   MIGRATION_DATABASE_URL  owner connection string used by pg_dump
+#                               (default postgres://dhi_owner:dhi_owner@127.0.0.1:5432/dhi)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 umask 077
 
-CONTAINER="dhi-postgres-1"
-DB="dhi"
-DB_OWNER="dhi_owner"
+MIGRATION_DATABASE_URL="${MIGRATION_DATABASE_URL:-postgres://dhi_owner:dhi_owner@127.0.0.1:5432/dhi}"
 
 usage() {
   echo "usage: $0 [output-dir]" >&2
@@ -16,6 +21,16 @@ usage() {
 }
 
 [ "$#" -le 1 ] || usage
+
+if ! command -v pg_dump >/dev/null 2>&1; then
+  echo "error: pg_dump not found on PATH" >&2
+  echo "install prebuilt PostgreSQL 16 (Postgres.app or EDB binaries) and add its bin" >&2
+  echo "directory to PATH, for example:" >&2
+  echo '  export PG_BIN="/Applications/Postgres.app/Contents/Versions/16/bin"   # Postgres.app' >&2
+  echo '  # or: export PG_BIN="/path/to/pgsql/bin"                              # EDB binaries' >&2
+  echo '  export PATH="$PG_BIN:$PATH"' >&2
+  exit 1
+fi
 
 out_dir="${1:-backups}"
 
@@ -44,15 +59,8 @@ if [ -e "$dump" ]; then
   exit 1
 fi
 
-run_pg_dump() {
-  if docker compose version >/dev/null 2>&1; then
-    docker compose exec -T postgres pg_dump -U "$DB_OWNER" -d "$DB" -Fc
-  else
-    docker exec "$CONTAINER" pg_dump -U "$DB_OWNER" -d "$DB" -Fc
-  fi
-}
-
-if ! run_pg_dump >"$tmp"; then
+if ! pg_dump --format=custom --no-owner --no-privileges \
+  -d "$MIGRATION_DATABASE_URL" >"$tmp"; then
   echo "error: pg_dump failed; no backup written" >&2
   exit 1
 fi

@@ -1,6 +1,17 @@
-# DHI<sup>+</sup>
+# DHI+ — Native macOS (No Docker)
 
 **Dynamic Heuristic Intelligence<sup>+</sup>**
+
+This branch runs DHI<sup>+</sup> natively on macOS. Task tools run as the same
+macOS user as the server, under `/usr/bin/sandbox-exec` and a profile in this
+repository.
+
+- It does not use Docker Desktop, the Docker daemon, a Linux VM, or any other
+  container runtime.
+- It has no Dockerfile, no Compose file, and no Docker backend.
+- The Docker version of DHI<sup>+</sup> remains on the `master` branch.
+
+This branch is macOS only. It is tested on an Intel Mac.
 
 DHI<sup>+</sup> is the team-execution upgrade to DHI. A goal still becomes a task and a plan, but the planner can choose a team, not only one worker. The team runs through a planner-selected topology, aggregates its work into one deterministic fact, and proves the goal with that fact. LLMs reason, tools act, PostgreSQL remembers, and the guard checks every action.
 
@@ -105,36 +116,123 @@ flowchart TD
 - Teammates get the same team tools except `team_spawn_teammate`, `team_shutdown_teammate`, `team_cleanup`, and `team_finalize_outcome`.
 - Only the coordinator can spawn, shut down, clean up, or finalize an outcome.
 
+## Requirements
+
+- macOS 14 or later, on Apple silicon or Intel. Tested on an Intel Mac.
+- Xcode Command Line Tools, for `/usr/bin/sandbox-exec` and the system toolchain.
+- Rust 1.99.1 (pinned in `rust-toolchain.toml`).
+- Node.js 22, for the web UI.
+- Native PostgreSQL 16 from prebuilt binaries (Postgres.app or EDB), on the same Mac and listening on `127.0.0.1:5432`.
+- Optional: `uv`/`uvx` on the host for the chess MCP server.
+
+## Quick start (native)
+
+1. **Install PostgreSQL 16 from prebuilt binaries and create the database.** Use
+   Postgres.app or the EDB PostgreSQL 16 binaries, set `PG_BIN` to its `bin`
+   directory, and add it to `PATH`. Then run `initdb`, `pg_ctl`, and
+   `createdb` as shown in
+   [docs/macos-native.md](docs/macos-native.md#install-postgresql-16).
+   On Intel macOS 14, Homebrew has no PostgreSQL 16 bottle and compiles from
+   source; Homebrew is optional only on systems that have one.
+
+2. **Apply roles and grants.** `scripts/migrate.sh` connects to the native
+   PostgreSQL with `psql` as `dhi_owner`. It applies
+   `ops/postgres/01-roles.sql` and `ops/postgres/02-grants.sql`, then verifies
+   the activity lock. The server applies the application schema migrations at
+   startup.
+
+   ```bash
+   scripts/migrate.sh
+   ```
+
+3. **Configure the environment.** Copy `.env.example` to `.env` (ignored by
+   Git, mode 600) and fill in:
+
+   - `DATABASE_URL`, `MIGRATION_DATABASE_URL`, `TEST_DATABASE_URL`
+   - `DHI_SANDBOX_PROFILE` — absolute path to the profile in this checkout:
+     `/Users/<you>/Desktop/dhi/ops/macos/dhi-task.sb`. Replace `<you>` with
+     your macOS user name; `~` is not expanded. There is no install copy
+   - `DHI_WORKSPACE_ROOT` — absolute path for legacy task work folders and
+     per-task pidfiles
+   - `DHI_FILE_BROWSER_ROOT` — absolute path for the project file browser
+   - `DHI_LLM_BASE_URL`, `DHI_LLM_API_KEY`, `DHI_LLM_PLANNER_MODEL`,
+     `DHI_LLM_WORKER_MODEL`
+
+   The server reads `.env` from its working directory.
+
+4. **Build and run.**
+
+   ```bash
+   cargo build -p dhi-server
+   ./target/debug/dhi-server
+   ```
+
+   Or in one step:
+
+   ```bash
+   cargo run -p dhi-server
+   ```
+
+   The server applies the app migrations on startup, seeds guard rules and LLM
+   profiles when an LLM key is set, and serves the exported UI from `web/out`
+   when it exists.
+
+5. **Verify the sandbox.**
+
+   ```bash
+   scripts/check-sandbox.sh
+   scripts/check-sandbox.sh /path/to/project
+   ```
+
+   The script prints `PASS`, `FAIL`, or `SKIP` per test and exits nonzero on
+   any `FAIL`. It needs no root.
+
+6. **Open the UI and API** at http://127.0.0.1:8080. Health:
+   `curl -fsS http://127.0.0.1:8080/api/health`.
+
+## Isolation
+
+Each task starts its own task sandbox. Details are in
+[docs/macos-native.md](docs/macos-native.md).
+
+- **Same macOS user.** Sandboxed commands run as the same macOS user as the
+  server, under `/usr/bin/sandbox-exec` and the profile named by
+  `DHI_SANDBOX_PROFILE`.
+- **No privileged setup.** There is no `sudo`, no separate task user, no
+  ACLs, no `/work` or `/project` aliases, and no reboot.
+- **Real paths.** The profile receives the real absolute host paths for the
+  project and the work folder.
+- **Project read-only.** The project root is readable and never writable. A
+  write into the project fails with `Operation not permitted`.
+- **Writes confined.** Writes go only in `<project>/.dhi/<task-id>`, or the
+  legacy `<DHI_WORKSPACE_ROOT>/<task-id>`, plus `/dev` and the server-owned
+  per-task pidfile. The spill directory `<WORK>/.dhi` is write- and
+  delete-denied.
+- **No file content outside project and work.** File contents and directory
+  listings outside the project and work folder are denied, including home
+  directories and `~/.ssh`. `file-read-metadata` stays broad so tools can
+  `stat` parent directories.
+- **Network is allowed.** There is no network rule and no egress filtering.
+- **Process cleanup.** Cleanup uses the per-task pidfile and the recorded
+  process group. A leader whose command no longer contains
+  `dhi-pids <pidfile>` is treated as a reused PID and is not killed.
+  `DHI_TASK_ID` is diagnostic only. A child that deliberately calls `setsid`
+  leaves the group and can survive.
+
+The task runs with your user's privileges. This is a usability boundary
+against accidents, not a security boundary against malicious code.
+
 ## Project folder and AGENTS.md
 
-The user selects one absolute project folder on the DHI<sup>+</sup> host. The server-side file browser lists host folders through `GET /api/fs`. DHI<sup>+</sup> uses the selected folder directly. There is no upload copy.
+The user selects one absolute project folder in the DHI<sup>+</sup> UI. The file browser lists folders on the same Mac through `GET /api/fs`, under `DHI_FILE_BROWSER_ROOT`. DHI<sup>+</sup> uses the selected folder directly. There is no upload copy.
 
 The user selects one `AGENTS.md` file when the task needs it. The planner reads that file. The selected rules also travel with the work as context, so the work can use a file outside the project folder. DHI<sup>+</sup> does not change the selected `AGENTS.md`. The file must be named exactly `AGENTS.md`, live under `DHI_FILE_BROWSER_ROOT`, and be at most 32 KiB. It may be inside or outside the selected project folder.
 
-The task folder is `<project>/.dhi/<task-id>`. The task container mounts `<project>` at `/project` read-only and the task folder at `/work` read-write. Existing project files do not change. DHI<sup>+</sup> writes only in `/work`.
+The task folder is `<project>/.dhi/<task-id>`. The task sandbox reads `<project>` and writes only in the task folder. Existing project files do not change.
 
-`DHI_FILE_BROWSER_ROOT` sets the host root. The server and the Docker daemon must see the same absolute path. Mount the root into `dhi-server` at the same path, read-write:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.fs.yml up -d
-```
-
-```yaml
-services:
-  dhi-server:
-    volumes:
-      - ${DHI_FILE_BROWSER_ROOT}:${DHI_FILE_BROWSER_ROOT}
-```
+The server and the task sandbox run on the same Mac and use the same real absolute paths. `DHI_FILE_BROWSER_ROOT` is a normal directory on this Mac, and the server creates it when missing. Unset disables the file browser. `/Users/Shared/dhi/projects` is the preferred root: it avoids TCC restrictions on `~/Desktop`, `~/Documents`, and `~/Downloads`. See [docs/project-file-browser.md](docs/project-file-browser.md).
 
 `DHI_PROJECT_FOLDERS` is legacy only. It keeps tasks created before the file browser working. New tasks use the file browser.
-
-## Task container and isolation
-
-DHI<sup>+</sup> starts one task container per task through the host Docker socket. The DHI<sup>+</sup> container mounts the socket and includes the Docker CLI. A task container does not get the socket. The DHI<sup>+</sup> container can control Docker on the host. Use isolation on a host with other important services.
-
-The task container has a read-only root filesystem. The selected project is mounted at `/project` read-only. The task folder is mounted at `/work` read-write. DHI<sup>+</sup> writes only under `/work`, which maps to `<project>/.dhi/<task-id>` on the host. Existing project files do not change. The container also has dropped capabilities, `no-new-privileges`, and memory, CPU, and PID caps.
-
-Tasks created before the file browser can still use the workspace root.
 
 ## Features
 
@@ -144,7 +242,7 @@ Tasks created before the file browser can still use the workspace root.
 - **Swarm workspace** — Task board (default), Mailbox (Inbox/Sent), Mission log, Outcomes, Runs, and Graph.
 - **Team messages** — `GET /api/tasks/{id}/team/messages` returns direct and broadcast messages. The Graph tab shows the message routes.
 - **Manager-worker lead loop** — the manager reads worker results and assigns each next task. It returns one final fact.
-- **File browser** — the user selects a host project folder and an optional `AGENTS.md` through `GET /api/fs`. DHI<sup>+</sup> uses the folder in place.
+- **File browser** — the user selects a project folder and an optional `AGENTS.md` on the same Mac through `GET /api/fs`. DHI<sup>+</sup> uses the folder in place.
 
 ### Core features
 
@@ -155,8 +253,8 @@ Tasks created before the file browser can still use the workspace root.
 - **Approvals** — a guard rule may return `ask`. The call waits for a human decision or expires on its approval deadline.
 - **MCP tools** — standard `mcpServers` configuration, guarded tool names of the form `mcp__<server>__<tool>`, live server management, refresh, reload, and deferred schemas above a tool threshold.
 - **Web tools** — `web_search`, `web_read`, and `web_research` behind one provider router with fallback across TinyFish, Parallel, and Firecrawl. `web_read` also handles PDF and DOCX documents.
-- **Coding tools** — `read`, `write`, `edit`, `search`, `list`, and `shell` run in a task container created through the host Docker socket. The project is at `/project` read-only; writes go to `/work`.
-- **Persistent terminals** — `shell_open`, `shell_send`, `shell_read`, `shell_close`, and `shell_list` keep a long-lived shell in the task container.
+- **Coding tools** — `read`, `write`, `edit`, `search`, `list`, and `shell` run in the task sandbox under `sandbox-exec`. The project is read-only; writes go to `<project>/.dhi/<task-id>`.
+- **Persistent terminals** — `shell_open`, `shell_send`, `shell_read`, `shell_close`, and `shell_list` keep a long-lived shell in the same task sandbox.
 - **Skills** — `skills/<name>/SKILL.md` instruction packs loaded through the guarded `load_skill` tool, with role visibility.
 - **Custom tools** — file-defined tools backed by HTTP calls or direct commands, registered behind the same guard.
 - **Profiles and pool** — OpenAI-compatible and Anthropic-format LLM profiles, active planner and worker profiles, an ordered failover pool with per-profile breakers, and optional per-task profile pins.
@@ -166,7 +264,7 @@ Tasks created before the file browser can still use the workspace root.
 
 ## Architecture
 
-One Rust process, `dhi-server`, serves the JSON API under `/api` and the exported web UI. PostgreSQL is the only durable state store. Docker is used for the task containers that host coding tools and persistent terminals.
+One Rust process, `dhi-server`, serves the JSON API under `/api` and the exported web UI. PostgreSQL is the only durable state store. There is no container runtime and no VM. Coding tools and persistent terminals run in the native macOS task sandbox.
 
 Workspace crates:
 
@@ -176,8 +274,8 @@ Workspace crates:
 - `dhi-orchestrator` — manager-worker lead loop, swarm coordinator and team runners, plan validation, deterministic aggregation
 - `dhi-guard` — allow, deny, and ask policy plus the guarded tool executor
 - `dhi-agent` — Rig runtime, prompts, LLM profiles, failover pool, coordinator and teammate runs, specialists
-- `dhi-exec` — coding tools, task containers, project read-only and task write mounts
-- `dhi-pty` — persistent terminal sessions inside task containers
+- `dhi-exec` — coding tools run in the native macOS task sandbox
+- `dhi-pty` — persistent terminal sessions in the same task sandbox
 - `dhi-followups` — side-question snapshots and task reopening rules
 - `dhi-server` — Axum API, static UI hosting, file browser, team routes, scale approvals, wiring, and the binary
 - `dhi-testkit` — in-memory store and test fixtures
@@ -191,66 +289,18 @@ Workspace crates:
 - `dhi-web` — provider-neutral web search, read, and research tools
 - `dhi-mcp-upgrade` — MCP visibility, deferred schemas, transport, and reload planning
 
-The web app lives in `web/` (Next.js, React, Tailwind). Operational files live in `ops/` (prompts, specialists, MCP examples, custom-tool examples). Database roles and grants live in `docker/initdb/` and `docker/grants/`.
+The web app lives in `web/` (Next.js, React, Tailwind). Operational files live in `ops/` (prompts, specialists, MCP examples, custom-tool examples, and the macOS sandbox profile in `ops/macos/`). Native PostgreSQL roles and grants live in `ops/postgres/`. Schema migrations live in `crates/dhi-store/migrations/` and are applied by the server at startup.
 
 Every model tool call passes through one `GuardedExecutor`: record, evaluate the current policy snapshot, allow/deny/ask, then audit. The backend chain is persistent terminals → coding tools → web tools → skills → custom tools → MCP → the closed sources delegate. Unknown tool names fail closed.
-
-## Requirements
-
-- Rust 1.99.1 (pinned in `rust-toolchain.toml`)
-- Node.js 22
-- Docker with Compose v2
-- PostgreSQL 16 (the compose file uses `postgres:16-alpine`)
-- Optional: `uv`/`uvx` on the host for the chess MCP server
-
-## Quick start with Docker
-
-```bash
-export DHI_IMAGE=ghcr.io/akshay93akshay/dhi:sha-<short>
-docker compose pull dhi-server
-docker compose up -d --no-build
-```
-
-- UI and API: http://127.0.0.1:8080
-- Chess board: http://127.0.0.1:8090
-- Health: `curl -fsS http://127.0.0.1:8080/api/health`
-
-Copy `.env.example` to `.env` if you need LLM or web provider keys, and authenticate to GHCR first if you have not already (see [Container image](#container-image)). The published image contains the static UI; Compose starts PostgreSQL and `dhi-server`. `scripts/dhi-health.sh` checks the API, UI, PostgreSQL, disk space, and the optional chess board.
-
-To use the project file browser, set `DHI_FILE_BROWSER_ROOT` and add `docker-compose.fs.yml` as shown in [Project folder and AGENTS.md](#project-folder-and-agentsmd).
-
-`docker compose up --build` is only for local image development, not the deployment path.
-
-## Container image
-
-GitHub Actions builds and pushes the container image on `master` and `v*` tags. Feature branches and pull requests run code, web, and hygiene checks only.
-
-- Registry: `ghcr.io/akshay93akshay/dhi`
-- Tags: `sha-<short>` on every master build and the tag name on each `v*` release, such as `v1.0.0`. There is no `latest` tag.
-- The package is private. Authenticate with a GitHub token that has only `read:packages`.
-
-Pull on a server:
-
-```bash
-echo "$GHCR_TOKEN" | docker login ghcr.io -u akshay93akshay --password-stdin
-export DHI_IMAGE=ghcr.io/akshay93akshay/dhi:sha-abc1234
-docker compose pull dhi-server
-docker compose up -d --no-build
-```
-
-To roll back, set `DHI_IMAGE` to the previous `sha-...` tag, then pull and start again. The image contains the Rust server, the static UI, `ops/`, the Docker CLI, and the pinned chess MCP runtime; it has no Rust or Node compiler.
-
-For a final build, run the `fresh-image` workflow manually. It pulls fresh base images, uses the shared build cache, publishes `fresh-<short-sha>`, and verifies the pulled image. Use this for final deployment checks.
 
 ## Local development
 
 ```bash
-docker compose up -d postgres
 scripts/migrate.sh
 scripts/dev.sh
 ```
 
-`scripts/dev.sh` runs the API on http://127.0.0.1:8080 and the Next.js development server on http://127.0.0.1:3000. The development server proxies `/api` to port 8080.
+`scripts/dev.sh` runs the API on http://127.0.0.1:8080 and the Next.js development server on http://127.0.0.1:3000. The development server proxies `/api` to port 8080. PostgreSQL must be running natively and the roles and grants applied before either script starts.
 
 To run the embedded static build instead:
 
@@ -261,7 +311,7 @@ cargo build -p dhi-server
 scripts/dhi-service.sh install && scripts/dhi-service.sh start
 ```
 
-The exported files are written to `web/out`, which the server serves on http://127.0.0.1:8080. Set `DHI_WEB_DIR` to serve an export from another directory. PostgreSQL must be running and migrated before the service starts.
+The exported files are written to `web/out`, which the server serves on http://127.0.0.1:8080. Set `DHI_WEB_DIR` to serve an export from another directory. PostgreSQL must be running before the service starts; the server applies the app migrations itself.
 
 ### Build cache
 
@@ -275,7 +325,7 @@ Keep the Rust build cache between runs:
 
 ## Configuration
 
-`.env.example` lists the runtime settings. Copy it to `.env` (ignored by Git) and fill in only the values you need. Docker Compose reads `.env` automatically.
+`.env.example` lists the runtime settings. Copy it to `.env` (ignored by Git) and fill in only the values you need. The server loads `.env` from its working directory at startup.
 
 Database roles:
 
@@ -287,12 +337,13 @@ Main settings:
 
 - `DATABASE_URL` — runtime database connection
 - `MIGRATION_DATABASE_URL` — migration connection
+- `TEST_DATABASE_URL` — test database connection
 - `DHI_BIND` — API bind address, default `127.0.0.1:8080`
 - `DHI_WEB_DIR` — static UI directory; when unset, `web/out` is used if present
-- `DHI_WORKSPACE_ROOT` — workspace root visible to the server; defaults to `workspace`
-- `DHI_WORKSPACE_HOST_ROOT` — host path of that root, used as the bind-mount source for task containers; set it when the server runs in a container
-- `DHI_FILE_BROWSER_ROOT` — absolute host root listed by the project file browser; the server creates it when missing and refuses a symlink, and the server and Docker daemon must see the same path; unset disables the browser
-- `DHI_PROJECT_FOLDERS` — legacy only: comma-separated absolute paths kept for tasks created before the file browser; each must remain mounted into the server at the same absolute path
+- `DHI_SANDBOX_PROFILE` — absolute path to `ops/macos/dhi-task.sb` in this checkout, such as `/Users/<you>/Desktop/dhi/ops/macos/dhi-task.sb`; required, and `~` is not expanded. There is no install copy
+- `DHI_WORKSPACE_ROOT` — absolute root for legacy task work folders and the per-task pidfiles in `pids/`
+- `DHI_FILE_BROWSER_ROOT` — absolute root listed by the project file browser; the server creates it when missing and refuses a symlink; unset disables the browser
+- `DHI_PROJECT_FOLDERS` — legacy only: comma-separated absolute paths kept for tasks created before the file browser
 - `DHI_MCP_CONFIG` — MCP config path; when unset, the nearest `ops/mcp.json`
 - `DHI_LLM_BASE_URL`, `DHI_LLM_API_KEY`, `DHI_LLM_PLANNER_MODEL`, `DHI_LLM_WORKER_MODEL` — LLM endpoint and models; other OpenAI-compatible endpoints work
 - `TINYFISH_API_KEY`, `PARALLEL_API_KEY`, `FIRECRAWL_API_KEY`, `DHI_WEB_PROVIDER` — web tool providers
@@ -303,27 +354,28 @@ Never put secrets in Git. Keep local secret files at mode 600: `.env`, `ops/mcp.
 
 ## MCP and chess
 
-`ops/mcp.example.json` is the portable example. On a host, copy it to `ops/mcp.json` (ignored by Git) and edit that file. The Docker image has its own `ops/mcp.docker.json`, copied to `/app/ops/mcp.json` at build time.
+`ops/mcp.example.json` is the portable example. Copy it to `ops/mcp.json` (ignored by Git) and edit that file. The server uses the nearest `ops/mcp.json` unless `DHI_MCP_CONFIG` points elsewhere.
 
-The example starts the chess MCP server through `uvx` and patches its dashboard to listen on `0.0.0.0:8090`, so the board is reachable from the host and through Docker port forwarding. Host chess requires `uv`/`uvx` on `PATH`. The chess board is served at http://127.0.0.1:8090.
+The example starts the chess MCP server through `uvx` and patches its dashboard to listen on `0.0.0.0:8090`. Chess requires `uv`/`uvx` on `PATH`. The chess board is served at http://127.0.0.1:8090.
 
-Keep `ops/mcp.json` local. `ops/mcp.example.json` and `ops/mcp.docker.json` are safe to commit.
+Keep `ops/mcp.json` local. `ops/mcp.example.json` is safe to commit.
 
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `scripts/check.sh` | Start PostgreSQL, then run rustfmt, clippy, workspace tests, web tests, and the static web build. `SKIP_DB=1` and `SKIP_WEB=1` skip those parts. |
-| `scripts/test.sh` | Start PostgreSQL, run the workspace tests, and build the static web export. |
+| `scripts/check.sh` | Run rustfmt, clippy, workspace tests, web tests, and the static web build against a native PostgreSQL. `SKIP_DB=1` and `SKIP_WEB=1` skip those parts. |
+| `scripts/test.sh` | Run the workspace tests against a native PostgreSQL and build the static web export. |
+| `scripts/migrate.sh` | Apply `ops/postgres/01-roles.sql` and `ops/postgres/02-grants.sql` to the native database and verify the activity lock. The server applies app migrations at startup. |
+| `scripts/check-sandbox.sh [project-dir]` | Acceptance checks for the native sandbox profile. No root needed. |
 | `scripts/backup.sh [dir]` | Write a compressed logical backup of the database to `backups/` or the given directory. |
 | `scripts/restore-test.sh [dump]` | Restore a backup into a throwaway database and compare row counts. |
-| `scripts/dhi-health.sh [--api-only]` | Read-only check of API, UI, PostgreSQL, disk space, and the optional chess board. |
+| `scripts/dhi-health.sh [--api-only]` | Read-only check of API, UI, PostgreSQL, and disk space. |
 | `scripts/check-secrets.sh` | Read-only check of secret file modes and secret material in the repository. |
 | `scripts/check-paths.sh` | Read-only check for machine-specific absolute paths in product files. |
 | `scripts/check-stale.sh` | Read-only check for stale development-language markers in product files. |
 | `scripts/target-gc.sh [--apply]` | Prune stale workspace build artifacts from `target/`; dry run by default. |
-| `scripts/migrate.sh` | Apply migrations twice, apply runtime grants, and verify the activity lock. |
-| `scripts/dev.sh` | Start PostgreSQL, migrate, then run the API on 8080 and Next dev on 3000. |
+| `scripts/dev.sh` | Migrate, then run the API on 8080 and Next dev on 3000. |
 | `scripts/dhi-service.sh install\|start\|stop\|restart\|status` | Install and manage the background server; also manages web provider keys. |
 
 ## API overview
@@ -332,7 +384,7 @@ All API routes are under `/api`. Most return JSON; `/api/stream` is a server-sen
 
 - **Health** — `GET /api/health`
 - **Tasks** — `GET|POST /api/tasks`; `GET|DELETE /api/tasks/{id}`; `POST /api/tasks/{id}/stop`; `POST /api/tasks/{id}/capacity`; bulk `POST /api/tasks/stop` and `POST /api/tasks/delete`; `GET /api/tasks/{id}/work`, `/activity`, and `/usage`. `POST /api/tasks` accepts `goal`, `project_folder`, `agents_md_path`, `topology`, `swarm_workers`, capacity, and optional profile pins.
-- **File browser** — `GET /api/fs` and `GET /api/fs?path=…` list host files and directories under `DHI_FILE_BROWSER_ROOT` for project and `AGENTS.md` selection
+- **File browser** — `GET /api/fs` and `GET /api/fs?path=…` list folders on this Mac under `DHI_FILE_BROWSER_ROOT` for project and `AGENTS.md` selection
 - **Team** — `GET /api/tasks/{id}/team`; `/team/tasks`; `/team/mailbox?box=inbox|sent`; `/team/messages`; `/team/mission`; `/team/runs`; `/team/outcomes`. Team state is read-only for the UI; agents change it through tools.
 - **Goals** — `POST /api/tasks/{id}/goals`
 - **Instructions** — `GET|POST /api/tasks/{id}/instructions`
@@ -350,22 +402,24 @@ All API routes are under `/api`. Most return JSON; `/api/stream` is a server-sen
 
 DHI<sup>+</sup> has no login or authentication layer. Keep the default localhost bind, or put the server behind a protected tunnel or reverse proxy. Do not expose port 8080 directly to an untrusted network.
 
-- The DHI<sup>+</sup> container mounts the host Docker socket. It can control Docker on the host. A task container does not get the socket, but the DHI<sup>+</sup> container is still a host-level control point. Use isolation on a shared host.
-- Task containers have a read-only root filesystem. The selected project is read-only at `/project`. Only `/work` is writable, and it maps to `<project>/.dhi/<task-id>`.
+- The task sandbox runs as the same macOS user as the server under `sandbox-exec`. The project root is read-only. Only the task folder is writable, and it maps to `<project>/.dhi/<task-id>`. This is an accident boundary, not a boundary against malicious code; see [docs/macos-native.md](docs/macos-native.md#limits).
 - The file browser rejects paths outside `DHI_FILE_BROWSER_ROOT` and paths through a symlink. Task creation accepts an `AGENTS.md` only with the exact name.
 - Keep `.env`, `ops/mcp.json`, `config/dhi.config.json`, and other key files out of Git and at mode 600.
-- `ops/mcp.json` is ignored. The example and Docker configs contain no secrets.
+- `ops/mcp.json` is ignored. The example contains no secrets.
 - Use the database roles as designed: `dhi_owner` for migrations and `dhi_app` for runtime. The runtime role cannot modify or delete activity rows.
 - The guard defaults to deny. Rules can allow, deny, or require approval, and every decision is recorded.
-- The compose passwords are for local development. Use distinct strong credentials on any shared host.
+- The example passwords in `.env.example` are for local development. Use distinct strong credentials on any shared Mac.
 
 ## Troubleshooting
 
-- **File browser is disabled** — `DHI_FILE_BROWSER_ROOT` is unset. Set it in `.env`, add `docker-compose.fs.yml`, and recreate `dhi-server`. `GET /api/fs` returns `404` while the browser is disabled.
+- **Server fails to start with `DHI_SANDBOX_PROFILE`** — the value is unset, empty, relative, contains `~`, or names a missing or non-regular file. Use the full absolute path to `ops/macos/dhi-task.sb` in this checkout, for example `/Users/<you>/Desktop/dhi/ops/macos/dhi-task.sb`.
+- **File browser is disabled** — `DHI_FILE_BROWSER_ROOT` is unset. Set it in `.env` and restart the server. `GET /api/fs` returns `404` while the browser is disabled.
 - **Selected path is rejected** — the path is missing, is outside `DHI_FILE_BROWSER_ROOT`, passes through a symlink, or is not a directory. For `AGENTS.md`, use the exact name, keep it under the root, and keep it at or below 32 KiB.
-- **Task container cannot mount the project** — the server and the Docker daemon do not see the same absolute path. Share the root with Docker Desktop, or create the same path on a remote daemon.
+- **Project folder or `AGENTS.md` lies under `~/Desktop`, `~/Documents`, or `~/Downloads` and is denied** — macOS TCC blocks the sandboxed task when the server itself lacks access. Move the root to `/Users/Shared/dhi/projects`, or grant the server access in System Settings → Privacy & Security.
+- **A sandboxed write fails with `Operation not permitted`** — the command wrote outside `<project>/.dhi/<task-id>`, into the spill directory, or into the project. Move the write into the task folder.
+- **A process survives task end** — it left its process group with `setsid`, so pidfile cleanup cannot find it. Stop it by PID.
 - **Missing `web/out`** — the server logs a warning and serves the API only. Build the export with `cd web && npm ci && NEXT_EXPORT=1 npm run build`, or point `DHI_WEB_DIR` at a directory that contains `index.html`.
-- **Missing `uvx`** — host chess fails to start. Install `uv`, which provides `uvx`, or use the Docker image, which has the chess server installed at `/opt/chess`.
-- **PostgreSQL is unhealthy** — check `docker compose ps`, then run `docker compose exec postgres pg_isready -U dhi_owner -d dhi`. Re-run `scripts/migrate.sh` if the schema is missing.
-- **Port conflicts** — DHI<sup>+</sup> uses 8080 (API/UI), 8090 (chess), 5432 (PostgreSQL), and 3000 (Next dev). Set `DHI_BIND` or the compose port mappings, or stop the process using the port.
+- **Missing `uvx`** — the chess MCP server fails to start. Install `uv`, which provides `uvx`.
+- **PostgreSQL is not reachable** — confirm the native cluster is running and listening on `127.0.0.1:5432` (`"$PG_BIN/pg_isready" -h 127.0.0.1 -p 5432 -U dhi_owner -d dhi`). Start it with `"$PG_BIN/pg_ctl" -D <data-dir> -l <log> start`, or the optional LaunchAgent. Re-run `scripts/migrate.sh` if the roles or grants are missing; the server applies app migrations at startup.
+- **Port conflicts** — DHI<sup>+</sup> uses 8080 (API/UI), 8090 (chess), 5432 (PostgreSQL), and 3000 (Next dev). Set `DHI_BIND` or stop the process using the port.
 - **`DHI_WEB_DIR` does not take effect** — relative paths resolve from the server's working directory, and the directory must contain `index.html`. An empty value falls back to `web/out` when it exists.

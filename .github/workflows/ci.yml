@@ -10,60 +10,66 @@ permissions:
   contents: read
 
 jobs:
+  macos:
+    runs-on: macos-14
+    env:
+      DATABASE_URL: postgres://dhi_test:dhi_test@127.0.0.1:5432/dhi
+      MIGRATION_DATABASE_URL: postgres://dhi_owner:dhi_owner@127.0.0.1:5432/dhi
+      TEST_DATABASE_URL: postgres://dhi_test:dhi_test@127.0.0.1:5432/dhi
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos
+
+      - name: postgres
+        run: |
+          brew install postgresql@16
+          export PATH="$(brew --prefix postgresql@16)/bin:$PATH"
+          initdb -D "$RUNNER_TEMP/pgdata" -U dhi_owner --auth=trust
+          pg_ctl -D "$RUNNER_TEMP/pgdata" -l "$RUNNER_TEMP/pg.log" start
+          createdb -h 127.0.0.1 -p 5432 -U dhi_owner dhi
+          psql "postgres://dhi_owner@127.0.0.1:5432/dhi" -v ON_ERROR_STOP=1 -f ops/postgres/01-roles.sql
+          pg_isready -h 127.0.0.1 -p 5432 -U dhi_owner -d dhi
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: test
+        run: cargo test --workspace --locked
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: build server
+        run: cargo build -p dhi-server --locked
+
+      - name: sandbox
+        run: bash scripts/check-sandbox.sh
+
+      - name: stop postgres
+        if: always()
+        run: '"$(brew --prefix postgresql@16)/bin/pg_ctl" -D "$RUNNER_TEMP/pgdata" stop -m fast'
+
   hygiene:
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - name: secret check
-        run: scripts/check-secrets.sh
+        run: bash scripts/check-secrets.sh
       - name: stale check
-        run: scripts/check-stale.sh
+        run: bash scripts/check-stale.sh
       - name: path check
-        run: scripts/check-paths.sh
-
-  rust:
-    runs-on: ubuntu-latest
-    env:
-      DATABASE_URL: postgres://dhi_test:dhi_test@localhost:5432/dhi
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: dhi_owner
-          POSTGRES_PASSWORD: dhi_owner
-          POSTGRES_DB: dhi
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U dhi_owner -d dhi"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: create test roles
-        run: |
-          docker run --rm --network host \
-            -v "$PWD:/repo" \
-            -e PGPASSWORD=dhi_owner \
-            postgres:16-alpine \
-            psql -h localhost -U dhi_owner -d dhi -v ON_ERROR_STOP=1 \
-            -f /repo/docker/initdb/01-roles.sql
-      - uses: dtolnay/rust-toolchain@1.99.1
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: rust
-      - name: fmt
-        run: cargo fmt --all -- --check
-      - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: test
-        run: cargo test --workspace
+        run: bash scripts/check-paths.sh
 
   web:
-    runs-on: ubuntu-latest
+    runs-on: macos-14
     defaults:
       run:
         working-directory: web
@@ -82,76 +88,3 @@ jobs:
         env:
           NEXT_EXPORT: "1"
         run: npm run build
-
-  publish:
-    needs: [hygiene, rust, web]
-    # Branch pushes do not publish an image; fresh-image handles those. Skip
-    # the redundant untagged Docker build on every branch.
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: set up buildx
-        uses: docker/setup-buildx-action@v3
-      - name: log in to GHCR
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: image metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=sha,prefix=sha-,format=short,enable=${{ github.ref == 'refs/heads/master' }}
-            type=ref,event=tag
-          flavor: |
-            latest=false
-      - name: build and push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')) }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-  verify-pull:
-    needs: publish
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - name: log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: pull and inspect image
-        run: |
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            TAG="$GITHUB_REF_NAME"
-          else
-            TAG="sha-${GITHUB_SHA::7}"
-          fi
-          IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:$TAG"
-          for attempt in 1 2 3 4 5; do
-            if docker pull "$IMAGE"; then
-              break
-            fi
-            if [ "$attempt" = "5" ]; then
-              exit 1
-            fi
-            sleep 10
-          done
-          docker run --rm --entrypoint sh "$IMAGE" -c 'test -f /app/web/out/index.html && test -x /usr/local/bin/dhi-server && test -x /usr/local/bin/docker'

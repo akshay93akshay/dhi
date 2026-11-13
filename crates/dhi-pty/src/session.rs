@@ -1,13 +1,10 @@
 //! Persistent terminal sessions inside a task runtime.
 //!
-//! A session is one long-lived `/bin/sh`. In container mode it runs behind
-//! the Python PTY proxy in [`crate::proxy`], reached with
-//! `docker exec -i dhi-task-<task-id> python3 -u -c <proxy> <cwd> <pidfile>`.
-//! In local test mode it is a plain `/bin/sh` with piped stdio, started in
-//! the task directory with a minimal environment. In native macOS sandbox
-//! mode it is also a `/bin/sh` with piped stdio, started as the same macOS
-//! user through `/usr/bin/env ... /usr/bin/sandbox-exec`. The container
-//! boundary, mounts, and limits are inherited from
+//! A session is one long-lived `/bin/sh`. In native macOS sandbox mode it is
+//! a `/bin/sh` with piped stdio, started as the same macOS user through
+//! `/usr/bin/env ... /usr/bin/sandbox-exec`. In local test mode it is a plain
+//! `/bin/sh` with piped stdio, started in the task directory with a minimal
+//! environment. The sandbox boundary is inherited from
 //! [`dhi_exec::TaskContainers`]; this module only adds the process and its
 //! output buffer.
 //!
@@ -15,26 +12,16 @@
 //! was authorized for, so task B cannot address task A's session even when
 //! it knows the session id.
 //!
-//! # Container process cleanup
-//!
-//! The proxy writes the shell PID to `/tmp/dhi-pty/<session-id>.pid`, which
-//! is in the container's writable tmpfs. Nothing is created or permissioned
-//! on the host outside the task mount. Close kills the shell's process group
-//! with `kill -TERM -<pid>` and, after a short grace period,
-//! `kill -KILL -<pid>`. The pid is read back strictly as decimal digits and
-//! must be greater than one, so a corrupt pidfile can never turn into
-//! `kill -1` or `kill 0`.
+//! # Process cleanup
 //!
 //! A native sandbox session is a host process: `spawn_sandbox` calls `setsid`
 //! in the child, so the `/usr/bin/env ... sandbox-exec` wrapper is a
 //! process-group leader and close signals the whole group with
 //! `kill(-pid, ...)`. That stops `sandbox-exec`, the shell, and any jobs it
-//! started. Local and Docker sessions signal only their direct child.
+//! started. A local session signals only its direct child.
 //!
-//! A session is removed from the map only after cleanup succeeds, except when
-//! the container is gone or the pidfile is missing: those mean the session is
-//! already dead. A cleanup error keeps the session so a later `shell_close`
-//! can retry it.
+//! A session is removed from the map only after cleanup succeeds: a cleanup
+//! error keeps the session so a later `shell_close` can retry it.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -50,14 +37,12 @@ use anyhow::{anyhow, bail};
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::{Mutex, Notify, oneshot};
+use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
 use uuid::Uuid;
 
 use dhi_exec::{SandboxRuntime, TaskContainers, TaskRuntime, sandbox_prefix};
-
-use crate::proxy::{PYTHON_PROXY, READY_MARKER};
 
 /// The largest number of bytes a session keeps, including output a caller
 /// has already read but that has not been displaced yet.
@@ -90,15 +75,6 @@ const KILL_WAIT: Duration = Duration::from_secs(1);
 /// How long close waits for the output readers to drain after the process
 /// has stopped. A background child can keep a pipe open, so this is bounded.
 const READER_CLOSE_WAIT: Duration = Duration::from_secs(2);
-
-/// How long the container-side pidfile cleanup may take.
-const CONTAINER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How long `shell_open` waits for the proxy's readiness marker.
-const READY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How much pre-marker stdout is held while looking for the marker.
-const READY_PENDING_MAX: usize = 64 * 1024;
 
 /// The default `shell_read` timeout, in milliseconds.
 pub const DEFAULT_READ_TIMEOUT_MS: u64 = 1_000;
@@ -164,7 +140,7 @@ pub struct SessionInfo {
     pub buffered_bytes: usize,
 }
 
-/// Owns every persistent terminal session for a task container manager.
+/// Owns every persistent terminal session for a task runtime manager.
 ///
 /// Production must call [`shutdown`](Self::shutdown); there is no async
 /// `Drop`, and dropping the manager without it leaves running sessions
@@ -196,9 +172,8 @@ impl PtySessions {
     ///
     /// `cwd` must be a relative path below the task root, or absent for the
     /// root itself. Absolute paths and any `..` component are refused before
-    /// a process starts. In container mode `cwd` is a relative container path
-    /// below the task mount; the proxy resolves and enters it, so the host
-    /// never inspects a container path.
+    /// a process starts. The path is a real host path that must exist and
+    /// resolve below the task directory.
     ///
     /// A task may have at most [`MAX_SESSIONS_PER_TASK`] sessions. After
     /// [`shutdown`](Self::shutdown) no new session starts.
@@ -235,11 +210,7 @@ impl PtySessions {
         let cwd_path = resolve_cwd(&runtime, cwd.as_deref())?;
 
         let session_id = Uuid::new_v4();
-        // The Docker proxy is the only mode with a readiness handshake and a
-        // container-side pidfile. A native sandbox is a host process and uses
-        // pipes exactly like local test mode.
-        let uses_container_proxy = runtime.is_container && runtime.sandbox.is_none();
-        let (mut child, container, target) = if let Some(sandbox) = &runtime.sandbox {
+        let (mut child, target) = if let Some(sandbox) = &runtime.sandbox {
             let child = spawn_sandbox(sandbox, &cwd_path).map_err(|err| {
                 anyhow!(
                     "cannot start a sandboxed terminal in {}: {err}",
@@ -247,14 +218,7 @@ impl PtySessions {
                 )
             })?;
             let target = format!("sandbox {}", cwd_path.display());
-            (child, None, target)
-        } else if uses_container_proxy {
-            let name = self.containers.container_name(task_id);
-            let pidfile = format!("/tmp/dhi-pty/{session_id}.pid");
-            let child = spawn_container(&name, &cwd_path, &pidfile)
-                .map_err(|err| anyhow!("cannot start a terminal in container {name}: {err}"))?;
-            let target = format!("container {name}");
-            (child, Some(ContainerClose { name, pidfile }), target)
+            (child, target)
         } else {
             let child = spawn_local(&runtime, &cwd_path).map_err(|err| {
                 anyhow!(
@@ -262,8 +226,8 @@ impl PtySessions {
                     cwd_path.display()
                 )
             })?;
-            let target = format!("{}", cwd_path.display());
-            (child, None, target)
+            let target = cwd_path.display().to_string();
+            (child, target)
         };
 
         let pid = child.id().ok_or_else(|| {
@@ -288,7 +252,6 @@ impl PtySessions {
             id: session_id,
             task_id,
             cwd: cwd_text.clone(),
-            container,
             stdin: Mutex::new(Some(stdin)),
             pid,
             kill_group,
@@ -301,39 +264,12 @@ impl PtySessions {
             close_lock: Mutex::new(()),
         });
 
-        let mut ready = None;
-        let stdout_reader = if uses_container_proxy {
-            let (ready_tx, ready_rx) = oneshot::channel();
-            ready = Some(ready_rx);
-            spawn_ready_reader(stdout, Arc::clone(&session), ready_tx)
-        } else {
-            spawn_reader(stdout, Arc::clone(&session))
-        };
+        let stdout_reader = spawn_reader(stdout, Arc::clone(&session));
         let stderr_reader = spawn_reader(stderr, Arc::clone(&session));
         *session.readers.lock().await = vec![stdout_reader, stderr_reader];
         // The waiter owns the child, reaps it, and is the authority for
         // `closed`/`alive`. `kill_on_drop` still covers a runtime shutdown.
         drop(spawn_waiter(child, Arc::clone(&session)));
-
-        if let Some(ready) = ready {
-            match timeout(READY_TIMEOUT, ready).await {
-                Ok(Ok(true)) => {}
-                Ok(Ok(false)) | Ok(Err(_)) => {
-                    let details = abort_with_details(&session).await;
-                    bail!(
-                        "the terminal process in {target} exited before it became ready{details}"
-                    );
-                }
-                Err(_) => {
-                    let details = abort_with_details(&session).await;
-                    bail!(
-                        "the terminal process in {target} did not become ready within {} \
-                         seconds{details}",
-                        READY_TIMEOUT.as_secs()
-                    );
-                }
-            }
-        }
 
         {
             // `shutdown` sets the flag before it walks the map. Holding the
@@ -461,7 +397,7 @@ impl PtySessions {
     /// Closes a session and stops its process.
     ///
     /// Closing a session whose process already exited succeeds. An unknown
-    /// session, or one owned by another task, is an error. If the container
+    /// session, or one owned by another task, is an error. If the process
     /// cleanup fails, the session stays in the map so the call may be
     /// retried; it is removed only after cleanup succeeds or the session is
     /// found to be already dead.
@@ -524,7 +460,7 @@ impl PtySessions {
     }
 
     /// Closes every session this manager owns and refuses any new session.
-    /// It does not stop the task containers; that remains
+    /// It does not stop the task runtimes; that remains
     /// [`TaskContainers::shutdown`]'s job.
     ///
     /// A session whose cleanup fails stays in the map, so a later call
@@ -587,16 +523,14 @@ struct Session {
     task_id: Uuid,
     /// The directory shown in `open` and `list`.
     cwd: String,
-    /// The container-side pidfile, when the proxy is used.
-    container: Option<ContainerClose>,
     /// The shell's stdin. Taking and dropping it closes the pipe.
     stdin: Mutex<Option<ChildStdin>>,
-    /// The OS process id of `/bin/sh` or the local `docker exec` client.
+    /// The OS process id of `/bin/sh` or its `sandbox-exec` wrapper.
     pid: u32,
     /// Whether `pid` is the leader of a process group this session owns.
     /// Native sandbox sessions start under `setsid`, so close must signal
     /// the whole group to stop `sandbox-exec`, the shell, and its jobs.
-    /// Local and Docker sessions signal only their direct child.
+    /// Local sessions signal only their direct child.
     kill_group: bool,
     /// Output produced by both readers and not yet returned by `read`.
     buffer: Mutex<Buffer>,
@@ -612,14 +546,6 @@ struct Session {
     readers: Mutex<Vec<JoinHandle<()>>>,
     /// Makes concurrent closes of one session serial.
     close_lock: Mutex<()>,
-}
-
-/// What close needs to stop the process inside a container.
-struct ContainerClose {
-    /// The task container's name.
-    name: String,
-    /// The pidfile the proxy wrote, as a container path.
-    pidfile: String,
 }
 
 /// A bounded byte buffer with a read cursor.
@@ -674,26 +600,6 @@ fn read_reply(output: Vec<u8>, dropped: u64, closed: bool) -> ReadReply {
         dropped_bytes: dropped,
         truncated: dropped > 0,
     }
-}
-
-/// Starts the container-side proxy.
-fn spawn_container(name: &str, cwd: &Path, pidfile: &str) -> io::Result<Child> {
-    let mut command = Command::new("docker");
-    command
-        .arg("exec")
-        .arg("-i")
-        .arg(name)
-        .arg("python3")
-        .arg("-u")
-        .arg("-c")
-        .arg(PYTHON_PROXY)
-        .arg(cwd)
-        .arg(pidfile)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    command.spawn()
 }
 
 /// Starts the local test shell with piped stdio and a scrubbed environment.
@@ -777,84 +683,6 @@ where
     })
 }
 
-/// Spawns the container stdout reader: it holds stdout back until the
-/// readiness marker arrives, strips that marker, and then behaves like a
-/// normal reader. `false` means the stream ended before the marker.
-fn spawn_ready_reader<R>(
-    mut reader: R,
-    session: Arc<Session>,
-    ready: oneshot::Sender<bool>,
-) -> JoinHandle<()>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut ready = Some(ready);
-        let mut pending = Vec::new();
-        let mut synced = false;
-        let mut chunk = [0_u8; 16 * 1024];
-
-        loop {
-            match reader.read(&mut chunk).await {
-                Ok(0) => {
-                    if !synced {
-                        if !pending.is_empty() {
-                            append_output(&session, &pending).await;
-                        }
-                        if let Some(sender) = ready.take() {
-                            let _ = sender.send(false);
-                        }
-                    }
-                    break;
-                }
-                Ok(count) => {
-                    if synced {
-                        append_output(&session, &chunk[..count]).await;
-                        continue;
-                    }
-
-                    pending.extend_from_slice(&chunk[..count]);
-                    if let Some(position) = find_bytes(&pending, READY_MARKER) {
-                        if position > 0 {
-                            append_output(&session, &pending[..position]).await;
-                        }
-                        let after = position + READY_MARKER.len();
-                        if after < pending.len() {
-                            append_output(&session, &pending[after..]).await;
-                        }
-                        pending.clear();
-                        synced = true;
-                        if let Some(sender) = ready.take() {
-                            let _ = sender.send(true);
-                        }
-                    } else if pending.len() > READY_PENDING_MAX {
-                        // Keep enough of the tail that a marker split across
-                        // reads is still found; everything older is output.
-                        let keep = READY_MARKER.len().saturating_sub(1);
-                        let flush = pending.len().saturating_sub(keep);
-                        append_output(&session, &pending[..flush]).await;
-                        pending.drain(..flush);
-                    }
-                }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(_) => {
-                    if !synced {
-                        if !pending.is_empty() {
-                            append_output(&session, &pending).await;
-                        }
-                        if let Some(sender) = ready.take() {
-                            let _ = sender.send(false);
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        reader_finished(&session).await;
-    })
-}
-
 /// Appends output and wakes every waiter.
 async fn append_output(session: &Session, data: &[u8]) {
     if data.is_empty() {
@@ -873,16 +701,6 @@ async fn reader_finished(session: &Session) {
         session.readers_done.store(true, Ordering::SeqCst);
         session.notify.notify_waiters();
     }
-}
-
-/// Finds `needle` in `haystack`.
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 /// Owns the child, reaps it, and is the authority for `closed` and `alive`.
@@ -951,12 +769,6 @@ async fn close_session(session: &Session) -> anyhow::Result<()> {
         failures.push(format!("cannot stop the terminal process: {err}"));
     }
 
-    if let Some(container) = &session.container
-        && let Err(err) = reap_container_session(container).await
-    {
-        failures.push(err.to_string());
-    }
-
     drain_readers(session).await;
 
     if failures.is_empty() {
@@ -973,9 +785,9 @@ async fn close_session(session: &Session) -> anyhow::Result<()> {
 }
 
 /// Terminates the session's child by its OS process id. A native sandbox
-/// child is a process-group leader, so its whole group is signalled; local
-/// and Docker sessions signal only their direct child. The waiter still owns
-/// the `Child` and reaps it.
+/// child is a process-group leader, so its whole group is signalled; a local
+/// session signals only its direct child. The waiter still owns the `Child`
+/// and reaps it.
 async fn terminate_local(session: &Session) -> anyhow::Result<()> {
     if session.exited.load(Ordering::SeqCst) {
         return Ok(());
@@ -1077,103 +889,12 @@ async fn drain_readers(session: &Session) {
     session.readers_done.store(true, Ordering::SeqCst);
 }
 
-/// Closes a session whose readiness handshake failed and returns its output
-/// (normally the proxy's stderr) for the error message.
-async fn abort_with_details(session: &Session) -> String {
-    let _ = close_session(session).await;
-    let (bytes, _) = {
-        let mut buffer = session.buffer.lock().await;
-        buffer.take()
-    };
-    let text = String::from_utf8_lossy(&bytes);
-    let text = text.trim();
-    if text.is_empty() {
-        " (no error output)".to_owned()
-    } else {
-        format!(": {text}")
-    }
-}
-
-/// Removes the container-side process group and its pidfile.
-async fn reap_container_session(container: &ContainerClose) -> anyhow::Result<()> {
-    let pidfile = shell_quote(&container.pidfile);
-    let script = format!(
-        "f={pidfile}\n\
-         [ -f \"$f\" ] || exit 3\n\
-         p=$(cat \"$f\")\n\
-         case \"$p\" in *[!0-9]*|'') exit 4;; esac\n\
-         [ \"$p\" -gt 1 ] || exit 5\n\
-         kill -TERM -\"$p\" 2>/dev/null || kill -TERM \"$p\" 2>/dev/null || true\n\
-         sleep 0.2\n\
-         kill -KILL -\"$p\" 2>/dev/null || kill -KILL \"$p\" 2>/dev/null || true\n\
-         rm -f \"$f\"\n"
-    );
-    let mut command = Command::new("docker");
-    command
-        .arg("exec")
-        .arg("-i")
-        .arg(&container.name)
-        .arg("sh")
-        .arg("-c")
-        .arg(script)
-        .kill_on_drop(true);
-
-    match timeout(CONTAINER_CLEANUP_TIMEOUT, command.output()).await {
-        Ok(Ok(output)) if output.status.success() => Ok(()),
-        Ok(Ok(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-            match output.status.code() {
-                // The pidfile is gone: the proxy never started a shell, or
-                // an earlier close already removed it.
-                Some(3) => Ok(()),
-                Some(4) | Some(5) => Err(anyhow!(
-                    "cannot clean up the terminal process in container {}: the pidfile {} is \
-                     invalid; the session was kept so shell_close can retry",
-                    container.name,
-                    container.pidfile
-                )),
-                _ if container_is_gone(&stderr) => Ok(()),
-                _ => Err(anyhow!(
-                    "cannot clean up the terminal process in container {}: docker exec exited \
-                     with {}: {}",
-                    container.name,
-                    output.status,
-                    if stderr.is_empty() {
-                        "(no error output)"
-                    } else {
-                        stderr.as_str()
-                    }
-                )),
-            }
-        }
-        Ok(Err(err)) => Err(anyhow!(
-            "cannot run docker to clean up the terminal process in container {}: {err}",
-            container.name
-        )),
-        Err(_) => Err(anyhow!(
-            "docker did not finish cleaning up the terminal process in container {} within \
-             {} seconds",
-            container.name,
-            CONTAINER_CLEANUP_TIMEOUT.as_secs()
-        )),
-    }
-}
-
-/// Whether Docker reported that the container no longer exists or runs.
-fn container_is_gone(stderr: &str) -> bool {
-    let text = stderr.to_ascii_lowercase();
-    text.contains("no such container") || text.contains("is not running")
-}
-
 /// Resolves the requested `cwd` to a path below the task base.
 ///
-/// Only relative paths without a `..` component are accepted. In container
-/// mode the result is a container path and no host metadata is consulted:
-/// `cwd` is handed to the proxy, which calls `os.chdir` inside the
-/// container. Native sandbox mode uses the real host work folder, so the
-/// same host checks as local mode apply. Local mode additionally checks the
-/// host directory and refuses a symbolic link that resolves outside the task
-/// directory.
+/// Only relative paths without a `..` component are accepted. The result is a
+/// real host path below the task's work folder; it must be an existing
+/// directory, and a symbolic link that resolves outside the task directory is
+/// refused.
 fn resolve_cwd(runtime: &TaskRuntime, requested: Option<&str>) -> anyhow::Result<PathBuf> {
     let relative = relative_cwd(requested)?;
     let normalized = if relative.as_os_str().is_empty() {
@@ -1187,10 +908,6 @@ fn resolve_cwd(runtime: &TaskRuntime, requested: Option<&str>) -> anyhow::Result
             normalized.display()
         );
     }
-    if runtime.is_container {
-        return Ok(normalized);
-    }
-
     let metadata = fs::metadata(&normalized).map_err(|err| {
         anyhow!(
             "terminal cwd {} cannot be used: {err}",
@@ -1231,11 +948,6 @@ fn relative_cwd(requested: Option<&str>) -> anyhow::Result<PathBuf> {
         }
     }
     Ok(relative)
-}
-
-/// Quotes `text` as one shell word.
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -1307,19 +1019,5 @@ mod tests {
                 "{refused} must be refused"
             );
         }
-    }
-
-    #[test]
-    fn shell_quoting_keeps_one_word() {
-        assert_eq!(shell_quote("/tmp/dhi-pty/a.pid"), "'/tmp/dhi-pty/a.pid'");
-        assert_eq!(shell_quote("a'b"), "'a'\\''b'");
-    }
-
-    #[test]
-    fn the_readiness_marker_is_found_across_a_split() {
-        let mut split = b"prefix\x1eDHI".to_vec();
-        split.extend_from_slice(b"_PTY_READY\x1e\nsuffix");
-        assert_eq!(find_bytes(&split, READY_MARKER), Some(6));
-        assert_eq!(find_bytes(b"nothing here", READY_MARKER), None);
     }
 }

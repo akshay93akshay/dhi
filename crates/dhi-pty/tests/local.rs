@@ -1,5 +1,5 @@
 //! Local test mode: the public terminal tools over a plain `/bin/sh`, with
-//! no Docker and no Python proxy.
+//! no sandbox and no wrapper.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

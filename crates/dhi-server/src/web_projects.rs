@@ -6,9 +6,8 @@
 //!
 //! `DHI_WEB_PROJECTS_ROOT` is an optional absolute directory. It must exist or
 //! be creatable, be writable by the server, and must not be a symbolic link.
-//! The same absolute path must be visible to the server process and to the
-//! Docker daemon: a task's `project_folder` is `<root>/<id>` and the existing
-//! project mount uses it directly, with no host-root remapping.
+//! A task's `project_folder` is `<root>/<id>`: the server process and the
+//! task's native sandbox both see that real path.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
