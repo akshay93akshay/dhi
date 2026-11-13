@@ -302,10 +302,138 @@ temporary directories. It runs two phases:
   link from `WORK` to a project file is denied; a symlink from `WORK` to a
   project file cannot write through it; moving `WORK` is denied; and
   `/usr/bin/sudo -n true` is denied (skipped when sudo is not installed).
+- **GPU** — a Metal compute program is written, compiled, and run inside the
+  sandbox with the real profile; it selects `MTLCopyAllDevices()[0]`, compiles
+  a kernel at run time, and prints `[1,2,3,4]`.
 
 A failed curl is reported as `SKIP` when the host is offline. The optional
 project argument adds a read-only readability check against a real project
 tree.
+
+## GPU
+
+The profile grants raw graphics access with a single line, `(system-graphics)`,
+placed after `(import "system.sb")`. Nothing else is added: no `windowserver`
+rule, no broker, no typed GPU tool, and no GPU policy. A task talks to the GPU
+the way any local program does.
+
+### Hardware
+
+| Property | Value |
+| --- | --- |
+| GPU | Intel UHD Graphics 617 |
+| Peak FP32 | ~155 GFLOPS |
+| Memory bandwidth | ~17 GB/s |
+| Memory | 1.5 GB shared with the CPU |
+| FP64 | none |
+
+### Raw access
+
+Inside the task a program can use Metal 3 compute and offscreen render, OpenCL
+1.2, MPS, CoreImage, and VideoToolbox directly. There is no intermediary: the
+task links the framework and creates its own device, queues, and pipeline
+states.
+
+### Building and running
+
+Compile and run under `$WORK`, and `cd "$WORK"` first so the compiler's output
+and any temporary files land in writable space.
+
+`MTLCreateSystemDefaultDevice` returns nil on this Intel Mac, so select the
+device explicitly:
+
+```objc
+NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
+id<MTLDevice> dev = devices[0];
+```
+
+Runtime shader compilation works: `newLibraryWithSource:` compiles a Metal
+source string at run time. No `metal` CLI and no prebuilt `.metallib` are
+needed.
+
+### Objective-C++ (default)
+
+Objective-C++ is the default host language. Save the file as `.mm`, because
+`clang++ -std=c++17` rejects a plain `.m` file, and build with the Command Line
+Tools compiler:
+
+```sh
+cd "$WORK"
+/Library/Developer/CommandLineTools/usr/bin/clang++ \
+  -std=c++17 -fobjc-arc \
+  -isysroot /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
+  -framework Metal -framework Foundation \
+  -o gpu_probe gpu_probe.mm
+./gpu_probe
+```
+
+A short compute example, `gpu_probe.mm`, prints `[1,2,3,4]`:
+
+```objc
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
+int main(void) {
+  @autoreleasepool {
+    NSError *err = nil;
+    id<MTLDevice> dev = MTLCopyAllDevices()[0];
+    // out[i] = i + 1, compiled at run time.
+    id<MTLLibrary> lib = [dev newLibraryWithSource:
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "kernel void bump(device int *out [[buffer(0)]],\n"
+         "                 uint i [[thread_position_in_grid]]) {\n"
+         "  out[i] = int(i) + 1;\n"
+         "}\n"
+        options:nil error:&err];
+    id<MTLFunction> fn = [lib newFunctionWithName:@"bump"];
+    id<MTLComputePipelineState> pso =
+        [dev newComputePipelineStateWithFunction:fn error:&err];
+
+    id<MTLBuffer> buf = [dev newBufferWithLength:4 * sizeof(int)
+                                        options:MTLResourceStorageModeShared];
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:buf offset:0 atIndex:0];
+    [enc dispatchThreads:MTLSizeMake(4, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    int *out = (int *)buf.contents;
+    printf("[%d,%d,%d,%d]\n", out[0], out[1], out[2], out[3]);
+  }
+  return 0;
+}
+```
+
+### Pure C++ with metal-cpp (optional)
+
+Apple's `metal-cpp` headers give C++ bindings to the same Metal API without
+Objective-C++. The headers are not installed anywhere on this Mac, so they must
+be vendored into the repository before use. Build the same shape, pointing
+`-I` at the vendored headers:
+
+```sh
+clang++ -std=c++17 -I<metal-cpp> -framework Metal -framework Foundation \
+  -o gpu_probe gpu_probe.cpp
+```
+
+### Gaps
+
+- **MPSGraph fails on Intel.** Do not plan on it.
+- **No CoreML model compiler.** Models cannot be compiled on this host.
+- **No `metal` or `metallib`.** There is no offline shader compiler tool; compile
+  shaders at run time from source, as above.
+
+### Architecture
+
+There is no broker, no typed GPU tool, and no server-side helper. The server
+does not mediate GPU work; the task program owns the device and its command
+queues, subject only to the sandbox profile.
 
 ## Limits
 

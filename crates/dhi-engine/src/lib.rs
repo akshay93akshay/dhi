@@ -750,6 +750,10 @@ impl Engine {
                     .to_string()
             });
         lines.push(format!("Work folder (writable): {work}"));
+        lines.push(
+            "GPU: raw Metal 3 and OpenCL 1.2 access inside the sandbox. Build and run in the work folder. Use MTLCopyAllDevices()[0]."
+                .to_string(),
+        );
         lines
     }
 
@@ -6748,16 +6752,22 @@ mod tests {
             vec![
                 "Project root (read-only): /p".to_string(),
                 format!("Work folder (writable): /p/.dhi/{}", project_task.id),
+                "GPU: raw Metal 3 and OpenCL 1.2 access inside the sandbox. Build and run in the work folder. Use MTLCopyAllDevices()[0]."
+                    .to_string(),
             ]
         );
 
         let legacy = Task::new("legacy task");
         assert_eq!(
             engine.workspace_context(&legacy),
-            vec![format!(
-                "Work folder (writable): /Users/Shared/dhi/work/{}",
-                legacy.id
-            )]
+            vec![
+                format!(
+                    "Work folder (writable): /Users/Shared/dhi/work/{}",
+                    legacy.id
+                ),
+                "GPU: raw Metal 3 and OpenCL 1.2 access inside the sandbox. Build and run in the work folder. Use MTLCopyAllDevices()[0]."
+                    .to_string(),
+            ]
         );
     }
 

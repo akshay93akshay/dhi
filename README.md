@@ -261,6 +261,7 @@ The server and the task sandbox run on the same Mac and use the same real absolu
 - **Specialists** — named sub-agents with scoped tool lists and turn budgets, used for delegation.
 - **Tool control** — one catalog for every tool source, with enablement and role visibility.
 - **Embedded UI** — the static Next.js export is served by the Rust process on the same origin as the API.
+- **GPU** — raw Metal 3 and OpenCL 1.2 access inside the task sandbox. Build and run GPU code in the work folder.
 
 ## Architecture
 

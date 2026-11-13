@@ -333,6 +333,78 @@ else
   pass "sudo exec is denied"
 fi
 
+# 21. Raw GPU access. The profile grants `(system-graphics)` and nothing more,
+# so a Metal compute program compiled and run inside the sandbox must see the
+# Intel GPU, compile a kernel at runtime, and return the computed values.
+# MTLCreateSystemDefaultDevice is nil on this Intel Mac, so the probe uses
+# MTLCopyAllDevices()[0]. The CLT clang and SDK are named directly to keep
+# xcrun_db off the path.
+CLANG="/Library/Developer/CommandLineTools/usr/bin/clang++"
+CLT_SDK="/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+GPU_DIR="$WORK/gpu"
+mkdir -p "$GPU_DIR/.home" "$GPU_DIR/.tmp"
+cat > "$GPU_DIR/gpu_probe.mm" <<'PROBE'
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+
+static NSString *const kSrc =
+    @"#include <metal_stdlib>\n"
+     "using namespace metal;\n"
+     "kernel void bump(device int *out [[buffer(0)]],\n"
+     "                 uint i [[thread_position_in_grid]]) {\n"
+     "  out[i] = int(i) + 1;\n"
+     "}\n";
+
+int main(void) {
+  @autoreleasepool {
+    NSError *err = nil;
+    NSArray<id<MTLDevice>> *devices = MTLCopyAllDevices();
+    if (devices.count == 0) { fprintf(stderr, "no Metal device\n"); return 1; }
+    id<MTLDevice> dev = devices[0];
+    id<MTLLibrary> lib = [dev newLibraryWithSource:kSrc options:nil error:&err];
+    if (!lib) { fprintf(stderr, "compile: %s\n", err.localizedDescription.UTF8String); return 1; }
+    id<MTLFunction> fn = [lib newFunctionWithName:@"bump"];
+    id<MTLComputePipelineState> pso = [dev newComputePipelineStateWithFunction:fn error:&err];
+    if (!pso) { fprintf(stderr, "pipeline: %s\n", err.localizedDescription.UTF8String); return 1; }
+
+    id<MTLBuffer> buf = [dev newBufferWithLength:4 * sizeof(int) options:MTLResourceStorageModeShared];
+    id<MTLCommandQueue> q = [dev newCommandQueue];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pso];
+    [enc setBuffer:buf offset:0 atIndex:0];
+    [enc dispatchThreads:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(4, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) {
+      fprintf(stderr, "command buffer status %ld\n", (long)cb.status); return 1;
+    }
+    int *out = (int *)buf.contents;
+    printf("[%d,%d,%d,%d]\n", out[0], out[1], out[2], out[3]);
+    return (out[0] == 1 && out[1] == 2 && out[2] == 3 && out[3] == 4) ? 0 : 1;
+  }
+}
+PROBE
+
+if [ ! -x "$CLANG" ] || [ ! -d "$CLT_SDK" ]; then
+  skip "Metal compute (Command Line Tools or SDK missing)"
+elif ! run_sandbox /bin/sh -c \
+       'cd "$1" || exit 1; HOME="$1/.home" TMPDIR="$1/.tmp" "$2" \
+          -std=c++17 -fobjc-arc -isysroot "$3" \
+          -framework Metal -framework Foundation \
+          -o gpu_probe gpu_probe.mm' \
+       sh "$GPU_DIR" "$CLANG" "$CLT_SDK" >/dev/null 2>&1; then
+  fail "Metal compute: probe does not compile inside the sandbox"
+elif out="$(run_sandbox /bin/sh -c \
+         'cd "$1" || exit 1; HOME="$1/.home" TMPDIR="$1/.tmp" ./gpu_probe' \
+         sh "$GPU_DIR" 2>/dev/null)" \
+     && [ "$out" = "[1,2,3,4]" ]; then
+  pass "Metal compute inside sandbox"
+else
+  fail "Metal compute inside sandbox (got: ${out:-<error>})"
+fi
+
 # Optional: a real project tree is readable read-only.
 if [ -n "$EXTRA_PROJECT" ]; then
   if "$SANDBOX_EXEC" -f "$PROFILE" \
