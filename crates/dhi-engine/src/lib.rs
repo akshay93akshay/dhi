@@ -170,9 +170,9 @@ fn team_fact_context(facts: &[Fact]) -> Vec<String> {
 
 /// Adds the selected `AGENTS.md` text to one worker's context.
 ///
-/// The selected file may live outside `/project`, so the worker cannot read
-/// it from the task container. The engine gives the worker the same bounded
-/// text the planner received.
+/// The selected file may live outside the project root, so the worker cannot
+/// read it from the task container. The engine gives the worker the same
+/// bounded text the planner received.
 fn append_project_instructions(context: &mut Vec<String>, project_instructions: Option<&str>) {
     if let Some(text) = project_instructions
         .map(str::trim)
@@ -671,6 +671,10 @@ pub struct Engine {
     team_store: Option<Arc<dyn dhi_core::team::TeamStore>>,
     /// `swarm_scale` gate for an Auto swarm above the approval-free cap.
     scale_gate: Option<Arc<dyn dhi_core::ScaleApprovalGate>>,
+    /// The real host root of legacy task folders. A project task carries its
+    /// own `<project>/.dhi/<task-id>` folder; a legacy task has no stored
+    /// folder, so its work folder is `<workspace_root>/<task-id>`.
+    workspace_root: std::path::PathBuf,
     /// In-memory cache of DHI+ plans keyed by the intent the planner created.
     ///
     /// Every planned intent also has a durable `intent_plans` row. The cache is
@@ -703,8 +707,50 @@ impl Engine {
             lead_runtime: false,
             team_store: None,
             scale_gate: None,
+            workspace_root: std::path::PathBuf::from("workspace"),
             plans: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Sets the real host root that legacy task folders are below.
+    ///
+    /// The server passes the task container root (`DHI_WORKSPACE_ROOT`) so
+    /// the prompts name the same absolute work folder the tools use.
+    pub fn with_workspace_root(mut self, root: impl Into<std::path::PathBuf>) -> Self {
+        self.workspace_root = root.into();
+        self
+    }
+
+    /// The two absolute path lines every worker, coordinator, and teammate
+    /// context starts with.
+    ///
+    /// A project task stores `<project>/.dhi/<task-id>` as its work folder; a
+    /// legacy task stores none, so its folder is
+    /// `<workspace_root>/<task-id>` exactly as the runtime computes it.
+    fn workspace_context(&self, task: &dhi_core::Task) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(project) = task
+            .project_folder
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(format!("Project root (read-only): {project}"));
+        }
+        let work = task
+            .task_folder
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                self.workspace_root
+                    .join(task.id.to_string())
+                    .display()
+                    .to_string()
+            });
+        lines.push(format!("Work folder (writable): {work}"));
+        lines
     }
 
     /// Remembers a planner-proposed execution plan for its new intent.
@@ -915,11 +961,13 @@ impl Engine {
     ) -> anyhow::Result<(IntentResult, IntentPlan, bool)> {
         let plan = effective_team_plan(plan.clone(), task);
         let plan = self.apply_scale_gate(task, &plan, stop).await?;
+        let mut worker_lines = self.workspace_context(task);
+        worker_lines.extend(worker_context(facts, project_instructions));
         let executor = Arc::new(RuntimeWorkerExecutor {
             agent: Arc::clone(&self.agent),
             task_id,
             intent_id: intent.id,
-            context: worker_context(facts, project_instructions),
+            context: worker_lines,
             worker_profile_id: task.pinned_worker_profile_id,
         });
         let (result, allow_empty_result) = match plan.topology {
@@ -972,7 +1020,8 @@ impl Engine {
                 Some(store) => {
                     let teammate_cap = Self::effective_teammate_cap(task, &plan);
                     let config = Self::team_run_config(task_id, intent.id, &plan, teammate_cap);
-                    let mut context = team_fact_context(facts);
+                    let mut context = self.workspace_context(task);
+                    context.extend(team_fact_context(facts));
                     append_project_instructions(&mut context, project_instructions);
                     context.push(format!(
                         "Coordinator id: {} (the persisted team role is `lead`; it is the coordinator)",
@@ -1590,8 +1639,8 @@ impl Engine {
 
         // Project instructions are read exactly once per task start. The
         // planner receives them in PlanInput; workers receive the same
-        // bounded text in their context so a selected file outside /project
-        // can still guide the work.
+        // bounded text in their context so a selected file outside the
+        // project root can still guide the work.
         let project_instructions = load_project_instructions(self.store.as_ref(), &mut task).await;
 
         let mut rounds = 0;
@@ -2452,8 +2501,8 @@ impl Engine {
                     intent_id: claimed.id,
                     intent: claimed.description.clone(),
                     context: {
-                        let mut context: Vec<String> =
-                            facts.iter().map(|f| f.claim.clone()).collect();
+                        let mut context: Vec<String> = self.workspace_context(&task);
+                        context.extend(facts.iter().map(|f| f.claim.clone()));
                         append_project_instructions(&mut context, project_instructions.as_deref());
                         context
                     },
@@ -6683,6 +6732,33 @@ mod tests {
         // A narrow DHI+ capacity must never throttle a swarm below its team.
         task.capacity.max_parallel_workers = Some(1);
         task
+    }
+
+    #[test]
+    fn workspace_context_names_the_real_project_and_work_folders() {
+        let store = Arc::new(MemoryStore::new());
+        let engine = Engine::new(store, Arc::new(MockAgentRuntime))
+            .with_workspace_root("/Users/Shared/dhi/work");
+
+        let mut project_task = Task::new("project task");
+        project_task.project_folder = Some("/p".to_string());
+        project_task.task_folder = Some(format!("/p/.dhi/{}", project_task.id));
+        assert_eq!(
+            engine.workspace_context(&project_task),
+            vec![
+                "Project root (read-only): /p".to_string(),
+                format!("Work folder (writable): /p/.dhi/{}", project_task.id),
+            ]
+        );
+
+        let legacy = Task::new("legacy task");
+        assert_eq!(
+            engine.workspace_context(&legacy),
+            vec![format!(
+                "Work folder (writable): /Users/Shared/dhi/work/{}",
+                legacy.id
+            )]
+        );
     }
 
     #[test]

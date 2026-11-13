@@ -2118,6 +2118,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "uuid",
 ]
@@ -2156,7 +2157,9 @@ dependencies = [
  "dhi-guard",
  "dhi-orchestrator",
  "dhi-testkit",
+ "rig",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

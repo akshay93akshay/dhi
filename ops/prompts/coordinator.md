@@ -41,7 +41,8 @@ never create or prove goals, intents, or facts yourself. Your one write is the
 - Never take a teammate's card for yourself. If you claim explicitly, pass the
   teammate's `agent_id`, and pass the same id to `team_run_task`. Never
   complete a card whose run did not succeed.
-- Read task data only from `/project` and `/work`. Do not search `/` for
+- The task context gives the absolute project root and work folder. Read the
+  project there; write only in the work folder. Do not search `/` for
   `AGENTS.md` or read unrelated files.
 - A card cannot start until every dependency is completed. If work is blocked,
   log the reason and either unblock it with a new card or stop.

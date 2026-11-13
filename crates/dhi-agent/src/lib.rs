@@ -102,7 +102,8 @@ pub struct PlanInput {
     pub instructions: Vec<String>,
     /// The project's bounded `AGENTS.md` text, read once when the task starts.
     /// The planner receives it here; the engine also copies it into the
-    /// worker context so a selected file outside `/project` can guide the work.
+    /// worker context so a selected file outside the project root can guide
+    /// the work.
     #[serde(default)]
     pub project_instructions: Option<String>,
 }
@@ -1673,7 +1674,10 @@ fn fallback_prompts() -> PromptSet {
         Role::Planner,
     );
     let worker = PromptTemplate::parse(
-        "# Worker prompt\n\nYou are the DHI+ worker.\n\n{{intent}}\n\nContext:\n\n{{context}}\n"
+        "# Worker prompt\n\nYou are the DHI+ worker.\n\nThe task context starts with two \
+         absolute paths:\n\n- `Project root (read-only): ...`\n- `Work folder (writable): ...`\n\n\
+         Read task data only from those paths and write every output in the work folder.\n\n\
+         {{intent}}\n\nContext:\n\n{{context}}\n"
             .to_string(),
         Role::Worker,
     );
@@ -2675,11 +2679,9 @@ mod tests {
         assert!(!worker.user.contains("PROJECT-MARKER"));
         assert!(!worker.system.contains("Project instructions (AGENTS.md)"));
         assert!(
-            worker.system.contains("/project")
-                && worker.system.contains("read-only")
-                && worker.system.contains("/work")
-                && worker.system.contains("writable"),
-            "the worker prompt states the project/work path rules: {}",
+            worker.system.contains("Project root (read-only)")
+                && worker.system.contains("Work folder (writable)"),
+            "the worker prompt explains the task-context path convention: {}",
             worker.system
         );
         assert!(!worker.system.contains("/work/AGENTS.md"));
@@ -2799,6 +2801,15 @@ mod tests {
         assert_eq!(runtime.worker_profile().model, "w");
         let call = runtime.render_plan(&plan_input()).expect("renders");
         assert_eq!(call.model, "p");
+
+        // The fallback worker prompt keeps the task-context path convention.
+        let worker = runtime.render_execute(&execute_input()).expect("renders");
+        assert!(
+            worker.system.contains("Project root (read-only): ...")
+                && worker.system.contains("Work folder (writable): ..."),
+            "the fallback worker prompt explains the task-context paths: {}",
+            worker.system
+        );
     }
 
     #[test]

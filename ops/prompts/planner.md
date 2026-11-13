@@ -100,8 +100,8 @@ or plan you add; worker prompts never include them. Lines are oldest first:
 
 When project instructions are present, use them to plan the work. The same
 selected text travels with every worker as context. Do not repeat it in every
-subtask description. Workers can read task data only from `/project` and
-`/work`; never ask a worker to locate an `AGENTS.md` file.
+subtask description. Workers receive the absolute project root and work folder
+in their task context; never ask a worker to locate an `AGENTS.md` file.
 
 {{project_instructions}}
 

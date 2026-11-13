@@ -4,9 +4,12 @@
 //! the Python PTY proxy in [`crate::proxy`], reached with
 //! `docker exec -i dhi-task-<task-id> python3 -u -c <proxy> <cwd> <pidfile>`.
 //! In local test mode it is a plain `/bin/sh` with piped stdio, started in
-//! the task directory with a minimal environment. The container boundary,
-//! mounts, and limits are inherited from [`dhi_exec::TaskContainers`]; this
-//! module only adds the process and its output buffer.
+//! the task directory with a minimal environment. In native macOS sandbox
+//! mode it is also a `/bin/sh` with piped stdio, started as the same macOS
+//! user through `/usr/bin/env ... /usr/bin/sandbox-exec`. The container
+//! boundary, mounts, and limits are inherited from
+//! [`dhi_exec::TaskContainers`]; this module only adds the process and its
+//! output buffer.
 //!
 //! Every session stores its task id. Lookups take the task id the caller
 //! was authorized for, so task B cannot address task A's session even when
@@ -21,6 +24,12 @@
 //! `kill -KILL -<pid>`. The pid is read back strictly as decimal digits and
 //! must be greater than one, so a corrupt pidfile can never turn into
 //! `kill -1` or `kill 0`.
+//!
+//! A native sandbox session is a host process: `spawn_sandbox` calls `setsid`
+//! in the child, so the `/usr/bin/env ... sandbox-exec` wrapper is a
+//! process-group leader and close signals the whole group with
+//! `kill(-pid, ...)`. That stops `sandbox-exec`, the shell, and any jobs it
+//! started. Local and Docker sessions signal only their direct child.
 //!
 //! A session is removed from the map only after cleanup succeeds, except when
 //! the container is gone or the pidfile is missing: those mean the session is
@@ -46,7 +55,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout, timeout_at};
 use uuid::Uuid;
 
-use dhi_exec::{TaskContainers, TaskRuntime};
+use dhi_exec::{SandboxRuntime, TaskContainers, TaskRuntime, sandbox_prefix};
 
 use crate::proxy::{PYTHON_PROXY, READY_MARKER};
 
@@ -98,7 +107,8 @@ pub const DEFAULT_READ_TIMEOUT_MS: u64 = 1_000;
 pub const MAX_READ_TIMEOUT_MS: u64 = 30_000;
 
 /// The default `PATH` for a local test shell when the parent has none.
-const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+const DEFAULT_PATH: &str =
+    "/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 
 /// `SIGTERM`, used to stop a local terminal process politely.
 #[cfg(unix)]
@@ -187,8 +197,8 @@ impl PtySessions {
     /// `cwd` must be a relative path below the task root, or absent for the
     /// root itself. Absolute paths and any `..` component are refused before
     /// a process starts. In container mode `cwd` is a relative container path
-    /// below `/work`; the proxy resolves and enters it, so the host never
-    /// inspects a container path.
+    /// below the task mount; the proxy resolves and enters it, so the host
+    /// never inspects a container path.
     ///
     /// A task may have at most [`MAX_SESSIONS_PER_TASK`] sessions. After
     /// [`shutdown`](Self::shutdown) no new session starts.
@@ -225,7 +235,20 @@ impl PtySessions {
         let cwd_path = resolve_cwd(&runtime, cwd.as_deref())?;
 
         let session_id = Uuid::new_v4();
-        let (mut child, container, target) = if runtime.is_container {
+        // The Docker proxy is the only mode with a readiness handshake and a
+        // container-side pidfile. A native sandbox is a host process and uses
+        // pipes exactly like local test mode.
+        let uses_container_proxy = runtime.is_container && runtime.sandbox.is_none();
+        let (mut child, container, target) = if let Some(sandbox) = &runtime.sandbox {
+            let child = spawn_sandbox(sandbox, &cwd_path).map_err(|err| {
+                anyhow!(
+                    "cannot start a sandboxed terminal in {}: {err}",
+                    cwd_path.display()
+                )
+            })?;
+            let target = format!("sandbox {}", cwd_path.display());
+            (child, None, target)
+        } else if uses_container_proxy {
             let name = self.containers.container_name(task_id);
             let pidfile = format!("/tmp/dhi-pty/{session_id}.pid");
             let child = spawn_container(&name, &cwd_path, &pidfile)
@@ -260,6 +283,7 @@ impl PtySessions {
             .ok_or_else(|| anyhow!("the terminal process in {target} did not provide stderr"))?;
 
         let cwd_text = cwd_path.to_string_lossy().into_owned();
+        let kill_group = runtime.sandbox.is_some();
         let session = Arc::new(Session {
             id: session_id,
             task_id,
@@ -267,6 +291,7 @@ impl PtySessions {
             container,
             stdin: Mutex::new(Some(stdin)),
             pid,
+            kill_group,
             buffer: Mutex::new(Buffer::default()),
             notify: Notify::new(),
             exited: AtomicBool::new(false),
@@ -277,7 +302,7 @@ impl PtySessions {
         });
 
         let mut ready = None;
-        let stdout_reader = if runtime.is_container {
+        let stdout_reader = if uses_container_proxy {
             let (ready_tx, ready_rx) = oneshot::channel();
             ready = Some(ready_rx);
             spawn_ready_reader(stdout, Arc::clone(&session), ready_tx)
@@ -568,6 +593,11 @@ struct Session {
     stdin: Mutex<Option<ChildStdin>>,
     /// The OS process id of `/bin/sh` or the local `docker exec` client.
     pid: u32,
+    /// Whether `pid` is the leader of a process group this session owns.
+    /// Native sandbox sessions start under `setsid`, so close must signal
+    /// the whole group to stop `sandbox-exec`, the shell, and its jobs.
+    /// Local and Docker sessions signal only their direct child.
+    kill_group: bool,
     /// Output produced by both readers and not yet returned by `read`.
     buffer: Mutex<Buffer>,
     /// Wakes `read`, close and the child waiter.
@@ -684,6 +714,47 @@ fn spawn_local(runtime: &TaskRuntime, cwd: &Path) -> io::Result<Child> {
         .env("TMPDIR", runtime.host_dir.join(".tmp"))
         .env("TERM", "dumb")
         .env("NO_COLOR", "1");
+    command.spawn()
+}
+
+/// Starts one `/bin/sh` inside the native macOS sandbox with piped stdio.
+///
+/// There is no PTY on the host path, so stdin, stdout, and stderr are pipes
+/// exactly like local test mode. The prefix comes from
+/// [`dhi_exec::sandbox_prefix`], so the terminal and the file/shell tools
+/// share one wrapper; it is `/usr/bin/env PATH=... HOME=... TMPDIR=...
+/// CARGO_HOME=... GIT_CONFIG_NOSYSTEM=1 TERM=dumb NO_COLOR=1
+/// DHI_TASK_ID=... /usr/bin/sandbox-exec -f <profile> -D PROJECT=... -D
+/// WORK=... -D SPILL=...`. There is no `sudo` and no task user: the sandbox
+/// runs as the same macOS user as the server. Only `PATH` is kept on the
+/// process itself; the prefix sets the rest of the environment.
+///
+/// The child is a session and process-group leader (`setsid`), so
+/// [`terminate_local`] can signal the whole `sandbox-exec`/`sh` tree instead
+/// of only the wrapper. macOS has no `/usr/bin/setsid`, so the group is
+/// created in the child just before `exec`.
+fn spawn_sandbox(runtime: &SandboxRuntime, cwd: &Path) -> io::Result<Child> {
+    let mut prefix = sandbox_prefix(runtime);
+    prefix.push(OsString::from("/bin/sh"));
+    let mut command = Command::new(&prefix[0]);
+    command
+        .args(&prefix[1..])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .env_clear()
+        .env("PATH", DEFAULT_PATH);
+    #[cfg(unix)]
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     command.spawn()
 }
 
@@ -901,8 +972,10 @@ async fn close_session(session: &Session) -> anyhow::Result<()> {
     }
 }
 
-/// Terminates the local process (`/bin/sh` or the `docker exec` client) by
-/// its OS process id. The waiter still owns the `Child` and reaps it.
+/// Terminates the session's child by its OS process id. A native sandbox
+/// child is a process-group leader, so its whole group is signalled; local
+/// and Docker sessions signal only their direct child. The waiter still owns
+/// the `Child` and reaps it.
 async fn terminate_local(session: &Session) -> anyhow::Result<()> {
     if session.exited.load(Ordering::SeqCst) {
         return Ok(());
@@ -910,48 +983,56 @@ async fn terminate_local(session: &Session) -> anyhow::Result<()> {
     if session.pid <= 1 {
         bail!("refusing to signal invalid process id {}", session.pid);
     }
+    let target = if session.kill_group {
+        "process group"
+    } else {
+        "process"
+    };
 
-    match send_signal(session.pid, TERMINATE_SIGNAL) {
+    match send_signal(session.pid, TERMINATE_SIGNAL, session.kill_group) {
         Ok(()) => {}
         Err(err) if is_missing_process(&err) => {
             mark_exited(session);
             return Ok(());
         }
-        Err(err) => bail!("cannot send SIGTERM to process {}: {err}", session.pid),
+        Err(err) => bail!("cannot send SIGTERM to {target} {}: {err}", session.pid),
     }
     if wait_for_exit(session, TERMINATE_WAIT).await {
         return Ok(());
     }
 
-    match send_signal(session.pid, KILL_SIGNAL) {
+    match send_signal(session.pid, KILL_SIGNAL, session.kill_group) {
         Ok(()) => {}
         Err(err) if is_missing_process(&err) => {
             mark_exited(session);
             return Ok(());
         }
-        Err(err) => bail!("cannot send SIGKILL to process {}: {err}", session.pid),
+        Err(err) => bail!("cannot send SIGKILL to {target} {}: {err}", session.pid),
     }
     if wait_for_exit(session, KILL_WAIT).await {
         Ok(())
     } else {
         bail!(
-            "process {} did not exit within {} second after SIGKILL",
+            "{target} {} did not exit within {} second after SIGKILL",
             session.pid,
             KILL_WAIT.as_secs()
         )
     }
 }
 
-/// Sends one signal to `pid`.
-fn send_signal(pid: u32, signal: i32) -> io::Result<()> {
+/// Sends one signal to `pid`, or to the process group led by `pid` when
+/// `group` is true.
+fn send_signal(pid: u32, signal: i32, group: bool) -> io::Result<()> {
     #[cfg(unix)]
     {
         let pid = libc::pid_t::try_from(pid).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "process id does not fit pid_t")
         })?;
+        let target = if group { -pid } else { pid };
         // SAFETY: kill has no preconditions beyond a valid signal number and
-        // pid; both are checked values from this process's own child.
-        if unsafe { libc::kill(pid, signal) } == 0 {
+        // target; both are checked values from this process's own child. A
+        // negative target addresses the process group whose id is `pid`.
+        if unsafe { libc::kill(target, signal) } == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())
@@ -959,7 +1040,7 @@ fn send_signal(pid: u32, signal: i32) -> io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        let _ = (pid, signal);
+        let _ = (pid, signal, group);
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "terminating a terminal process is only implemented on Unix",
@@ -1089,8 +1170,10 @@ fn container_is_gone(stderr: &str) -> bool {
 /// Only relative paths without a `..` component are accepted. In container
 /// mode the result is a container path and no host metadata is consulted:
 /// `cwd` is handed to the proxy, which calls `os.chdir` inside the
-/// container. Local mode additionally checks the host directory and refuses
-/// a symbolic link that resolves outside the task directory.
+/// container. Native sandbox mode uses the real host work folder, so the
+/// same host checks as local mode apply. Local mode additionally checks the
+/// host directory and refuses a symbolic link that resolves outside the task
+/// directory.
 fn resolve_cwd(runtime: &TaskRuntime, requested: Option<&str>) -> anyhow::Result<PathBuf> {
     let relative = relative_cwd(requested)?;
     let normalized = if relative.as_os_str().is_empty() {

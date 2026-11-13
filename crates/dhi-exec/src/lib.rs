@@ -4,7 +4,7 @@
 //! (`read`, `write`, `edit`, `search`, `list`, `shell`) come from that crate.
 //! This crate adds what DHI needs:
 //!
-//! - one container per task ([`TaskContainers`]);
+//! - one container or native sandbox per task ([`TaskContainers`]);
 //! - the [`CodingTools`] facade that stamps the trusted task id and a per-task
 //!   MAC into every guarded request;
 //! - guarded dynamic tools registered on a Rig server
@@ -94,11 +94,41 @@
 //! private host layout but uses [`rig_tools::workspace::Local`] instead of
 //! Docker. In that mode the host is still reachable and the file-tool path
 //! checks and symlink checks are the control; `shell` is not an OS sandbox.
+//!
+//! # Native macOS sandbox
+//!
+//! [`TaskContainers::sandbox`] runs tasks without Docker or a VM. Every task
+//! runs as the same macOS user as the server under `/usr/bin/sandbox-exec`,
+//! with its own real host paths: `root/<task-id>` in legacy mode, or
+//! `<project>/.dhi/<task-id>` with the real project root in project mode.
+//! There are no `/work` or `/project` aliases, no `synthetic.conf`, no
+//! dedicated task user, no ACLs, and no `sudo`, so nothing has to be
+//! installed and no reboot is needed.
+//!
+//! Because each task names its own paths, any number of sandbox tasks can run
+//! at the same time. The profile is the boundary; it must let a task read and
+//! write its own work directory, read its project root without seeing
+//! `<project>/.dhi`, read but not write its spill directory, and reach nothing
+//! else.
+//!
+//! Every sandboxed command is wrapped to record its session-leader pid in a
+//! server-owned pidfile below `root/pids`. [`TaskContainers::remove`] kills
+//! each verified pidfile group and removes the file, and
+//! [`TaskContainers::reap_orphans`] kills every leftover pidfile group at
+//! startup, when no task is running. This reaches Apple platform binaries,
+//! whose environment `ps` hides. A group is killed only when its leader's
+//! command line still names `dhi-pids` and the pidfile, so a reused pid is
+//! left alone. `DHI_TASK_ID=<task-id>` is carried for diagnosis only and is
+//! not a cleanup mechanism; a child that deliberately calls `setsid` leaves
+//! the group and can survive.
 
 mod backend;
 mod container;
 mod tools;
 
 pub use backend::CodingBackend;
-pub use container::{ContainerConfig, TaskContainers, TaskRuntime, prepare_project_task_dir};
+pub use container::{
+    ContainerConfig, SandboxConfig, SandboxRuntime, TaskContainers, TaskRuntime,
+    prepare_project_task_dir, sandbox_prefix,
+};
 pub use tools::{CodingTools, SCOPE_MAC_FIELD, TASK_ID_FIELD, ToolDefinition, tool_definitions};

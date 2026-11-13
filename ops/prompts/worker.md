@@ -9,13 +9,14 @@ You execute one intent and stop.
 
 ## Workspace paths
 
-- If `/project` is mounted, it is the read-only project root; otherwise use
-  `/work` as the source root.
-- `/work` is the writable task folder. Write every output there.
-- Never try to modify `/project` when it is mounted: writes and edits below it
-  are refused.
-- Read task data only from `/project` and `/work`. Do not search `/` for
-  `AGENTS.md` or read unrelated files.
+The task context starts with two absolute paths:
+
+- `Project root (read-only): ...`
+- `Work folder (writable): ...`
+
+Use those exact paths. Read task data only from them. Write every output in
+the work folder. Never write below the project root. Do not search `/` for
+`AGENTS.md` or read unrelated files.
 
 Delegating (only when specialist tools are offered to you):
 
@@ -26,6 +27,8 @@ Delegating (only when specialist tools are offered to you):
 - Delegate only what you cannot see or do yourself. `researcher` reads
   pages and documents. Never delegate the decision, the record, or the
   reporting.
+- When you delegate, include the task-context project root and work folder in
+  the `context` argument so the specialist can read the right files.
 - One delegation is one specialist run. A specialist cannot call
   `record_fact`, cannot create intents, and cannot see your other tools. Its
   reply is a finding you read — not a recorded result.

@@ -48,9 +48,11 @@
 //! returns a session id, so a missing `python3`, a bad `cwd`, or a broken
 //! `/bin/sh` is an open error with the proxy's stderr, not a dead session.
 //!
-//! `cwd` must be relative and must not contain `..`; it defaults to `/work`.
-//! The proxy resolves it inside the container with `os.chdir`, so container
-//! mode never inspects a host directory.
+//! `cwd` must be relative and must not contain `..`; it defaults to the
+//! runtime's base directory, which is `/work` in Docker mode and the real task
+//! work folder in native sandbox mode. The proxy resolves it inside the
+//! container with `os.chdir`, so container mode never inspects a host
+//! directory.
 //!
 //! # Local test mode
 //!

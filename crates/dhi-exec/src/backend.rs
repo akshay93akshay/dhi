@@ -9,15 +9,20 @@
 //! registered through the generic [`dhi_agent::guarded_dynamic_tool`] path
 //! cannot forge a task.
 //!
-//! In production the call is resolved to that task's container runtime and
-//! every tool goes through its [`Remote`](rig_tools::remote::Remote)
-//! workspace. The file tools use `/work` as their base and the shell starts
-//! in `/work`; the container sees the task folder there, with `.dhi` and
-//! `.dhi/spill` mounted read-only inside it. A project task can also read its
-//! project root through `/project`; read-style tools are confined to that
-//! root, and writes stay confined to `/work`.
+//! In production the call is resolved to that task's container or native
+//! sandbox runtime. In container mode every file tool goes through its
+//! [`Remote`](rig_tools::remote::Remote) workspace: the file tools use
+//! `/work` as their base and the shell starts in `/work`; there the task
+//! sees the task folder, with `.dhi` and `.dhi/spill` read-only. A project
+//! task can also read its project root through `/project`; read-style tools
+//! are confined to that root, and writes stay confined to `/work`.
 //!
-//! Local test mode uses [`Local`] instead. There the file tools are confined
+//! In native sandbox mode the file tools run on the host against the task's
+//! real work directory and project root, and the shell launcher wraps every
+//! command in `/usr/bin/sandbox-exec`. The shell therefore uses [`Local`] and
+//! does not double-wrap the transport.
+//!
+//! Local test mode also uses [`Local`]. There the file tools are confined
 //! to the host task directory and `write`/`edit` also refuse a target, or a
 //! parent below the task directory, that is a symbolic link, including a
 //! dangling one. The shell starts in the task directory with a scrubbed
@@ -43,7 +48,7 @@ use rig_tools::{
 use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
-use crate::container::{TaskContainers, TaskRuntime};
+use crate::container::{DEFAULT_PATH, TaskContainers, TaskRuntime, sandbox_prefix};
 use crate::tools::{SCOPE_MAC_FIELD, TASK_ID_FIELD, shell_template, task_mac_matches};
 
 /// Runs the coding tools in per-task runtimes.
@@ -165,7 +170,15 @@ impl CodingBackend {
             "shell" => {
                 let args: ShellArgs = parse_args(tool, input)?;
                 let mut shell = shell_template();
-                shell.workspace = Arc::clone(&runtime.workspace);
+                if runtime.sandbox.is_some() {
+                    // The sandbox launcher already wraps every command in
+                    // `sandbox-exec`; running it through `Local` applies that
+                    // wrapper directly. A `Remote` would prepend the launcher
+                    // to its own transport and wrap it twice.
+                    shell.workspace = Arc::new(Local);
+                } else {
+                    shell.workspace = Arc::clone(&runtime.workspace);
+                }
                 shell.launcher = shell_launcher(&runtime);
                 shell.spill = Some(runtime.spill.clone());
                 // `Shell::call` hides the status in its context. `run`
@@ -275,11 +288,46 @@ fn project_read_target(runtime: &TaskRuntime, requested: &str) -> Option<(PathBu
     ))
 }
 
-/// The base and path a read-style tool uses. Reads inside `/project` are
-/// confined to the project root; every other read stays confined to `/work`.
+/// The base and path a read-style tool uses.
+///
+/// An absolute path below the task's own work directory is read with the work
+/// directory as its base, so `<work>/.dhi/<task-id>/note.md` and any other
+/// absolute work path resolve to the same file the work base names. Then
+/// `/project/...` and an absolute path below the task's real project root are
+/// confined to that root; every other read stays confined to the task's work
+/// directory. In native sandbox mode the project root and the work directory
+/// are the task's real host paths, so both spellings of a project path work.
 fn read_base_and_path(runtime: &TaskRuntime, requested: &str) -> (PathBuf, String) {
-    project_read_target(runtime, requested)
-        .unwrap_or_else(|| (runtime.base.clone(), requested.to_string()))
+    if let Some(relative) = absolute_below(&runtime.base, requested) {
+        return (runtime.base.clone(), relative);
+    }
+    if let Some((root, relative)) = project_read_target(runtime, requested) {
+        return (root, relative);
+    }
+    if let Some(root) = runtime.project_dir.as_ref()
+        && let Some(relative) = absolute_below(root, requested)
+    {
+        return (root.clone(), relative);
+    }
+    (runtime.base.clone(), requested.to_string())
+}
+
+/// `requested` relative to `root` when it is an absolute path below `root`;
+/// `root` itself becomes `.`. A relative path and a path outside `root`,
+/// including a sibling that only shares the prefix (`/a/x-y` for `/a/x`),
+/// give `None`.
+fn absolute_below(root: &Path, requested: &str) -> Option<String> {
+    let requested = Path::new(requested);
+    if !requested.is_absolute() {
+        return None;
+    }
+    let relative = requested.strip_prefix(root).ok()?;
+    let relative = relative.to_string_lossy();
+    Some(if relative.is_empty() {
+        ".".to_string()
+    } else {
+        relative.into_owned()
+    })
 }
 
 /// [`read_base_and_path`] for tools whose path is optional.
@@ -384,10 +432,13 @@ const INHERITED_VARIABLES: &[&str] = &[
     "LC_CTYPE",
 ];
 
-/// The search path used when the parent has none.
-const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-
 /// The launcher every `shell` call uses.
+///
+/// In native sandbox mode the command is started as the same macOS user as
+/// this process under `/usr/bin/sandbox-exec`, with no task user and no
+/// `sudo`; the launcher's prefix is the whole wrapper, and the `Shell` tool
+/// appends `sh -c <line>` after it. The parent environment is removed first,
+/// then the same small allowlist as local mode is kept.
 ///
 /// In container mode the command runs inside the task container: `HOME`,
 /// `TMPDIR` and `CARGO_HOME` are below `/work`, so tools that execute
@@ -403,6 +454,9 @@ const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 /// (`SSH_AUTH_SOCK`, `DHI_*`, API keys, database URLs) are not on the
 /// allowlist. This is environment hygiene, not isolation.
 fn shell_launcher(runtime: &TaskRuntime) -> Launcher {
+    if runtime.sandbox.is_some() {
+        return sandbox_launcher(runtime);
+    }
     if runtime.is_container {
         let mut launcher = Launcher::default()
             .in_dir(runtime.base.clone())
@@ -474,12 +528,50 @@ fn local_shell_launcher(task_dir: &Path) -> Launcher {
         .with_env("PYTHONDONTWRITEBYTECODE", "1")
 }
 
+/// The host launcher native sandbox mode uses.
+///
+/// The parent environment is removed wholesale, then the same allowlist as
+/// local mode is kept. The prefix carries the exact environment the task
+/// should see: `PATH`, `HOME`, `TMPDIR`, `CARGO_HOME`, `TERM`, `NO_COLOR`,
+/// and `DHI_TASK_ID`, before `/usr/bin/sandbox-exec`. `DHI_TASK_ID` is
+/// diagnostic only; cleanup is pidfile-only. The `Shell` tool appends
+/// `sh -c <line>` after the prefix, so no `/bin/sh` is in it.
+fn sandbox_launcher(runtime: &TaskRuntime) -> Launcher {
+    let sandbox = runtime
+        .sandbox
+        .as_ref()
+        .expect("sandbox_launcher is only used for a sandbox runtime");
+    let parent_names = std::env::vars_os()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    let mut launcher = Launcher::default()
+        .in_dir(runtime.base.clone())
+        .without_env(parent_names);
+
+    for name in INHERITED_VARIABLES {
+        if let Some(value) = parent_var(name) {
+            launcher = launcher.with_env(name, value);
+        }
+    }
+
+    let locale = default_locale();
+    if parent_var("LANG").is_none() {
+        launcher = launcher.with_env("LANG", locale);
+    }
+    if parent_var("LC_ALL").is_none() {
+        launcher = launcher.with_env("LC_ALL", locale);
+    }
+
+    launcher.wrapped(sandbox_prefix(sandbox))
+}
+
 /// Rewrites the host spill path in cut output to the container path.
 ///
 /// The spill file itself lives on the host below the mounted task directory,
 /// so it is the same file inside the container at `runtime.base`. The model
 /// sees container paths, so the path printed in the cut notice must be the
-/// container path it can `read`.
+/// container path it can `read`. Native sandbox and local mode already use
+/// host paths, so the output is returned unchanged.
 fn translate_spill(output: String, runtime: &TaskRuntime) -> String {
     if !runtime.is_container {
         return output;
@@ -538,6 +630,82 @@ mod tests {
 
     async fn task_dir(containers: &TaskContainers, task_id: Uuid) -> PathBuf {
         containers.ensure(task_id).await.unwrap().host_dir.clone()
+    }
+
+    #[test]
+    fn read_paths_use_the_real_project_root_and_work_stays_in_work() {
+        let work = PathBuf::from("/tmp/dhi/work/task");
+        let project = PathBuf::from("/tmp/dhi/project");
+        let runtime = TaskRuntime {
+            base: work.clone(),
+            host_dir: work.clone(),
+            workspace: Arc::new(Local),
+            project_dir: Some(project.clone()),
+            seen: rig_tools::Seen::default(),
+            spill: rig_tools::Spill(work.join(".dhi/spill")),
+            is_container: false,
+            sandbox: None,
+        };
+
+        assert_eq!(
+            read_base_and_path(&runtime, "/tmp/dhi/project/src/main.rs"),
+            (project.clone(), "src/main.rs".to_owned()),
+            "an absolute project path maps to the project root"
+        );
+        assert_eq!(
+            read_base_and_path(&runtime, "/project/README.md"),
+            (project.clone(), "README.md".to_owned()),
+            "the /project name still works"
+        );
+        assert_eq!(
+            read_base_and_path(&runtime, "/tmp/dhi/project"),
+            (project.clone(), ".".to_owned())
+        );
+        assert_eq!(
+            read_base_and_path(&runtime, "src/main.rs"),
+            (work.clone(), "src/main.rs".to_owned()),
+            "a relative path stays in the work directory"
+        );
+        assert_eq!(
+            read_base_and_path(&runtime, "/tmp/dhi/work/task/a.txt"),
+            (work.clone(), "a.txt".to_owned()),
+            "an absolute work path is read with the work base"
+        );
+        assert_eq!(
+            read_base_and_path(&runtime, "/tmp/dhi/work/task"),
+            (work.clone(), ".".to_owned())
+        );
+        assert_eq!(
+            read_base_and_path(&runtime, "/tmp/dhi/project-x/a.txt"),
+            (work.clone(), "/tmp/dhi/project-x/a.txt".to_owned()),
+            "a sibling with the same prefix is not the project"
+        );
+    }
+
+    #[test]
+    fn an_absolute_work_path_below_the_hidden_project_dhi_uses_the_work_base() {
+        let project = PathBuf::from("/tmp/dhi/project");
+        let work = project.join(".dhi").join("task-1");
+        let runtime = TaskRuntime {
+            base: work.clone(),
+            host_dir: work.clone(),
+            workspace: Arc::new(Local),
+            project_dir: Some(project),
+            seen: rig_tools::Seen::default(),
+            spill: rig_tools::Spill(work.join(".dhi/spill")),
+            is_container: false,
+            sandbox: None,
+        };
+
+        assert_eq!(
+            read_base_and_path(&runtime, "/tmp/dhi/project/.dhi/task-1/note.md"),
+            (work.clone(), "note.md".to_owned()),
+            "the task's own work folder is below the project .dhi but is its work base"
+        );
+        assert_eq!(
+            read_base_and_path(&runtime, "/tmp/dhi/project/.dhi/task-1/.dhi/spill/out.txt"),
+            (work.clone(), ".dhi/spill/out.txt".to_owned())
+        );
     }
 
     #[test]
@@ -733,6 +901,85 @@ mod tests {
             listed.as_str().unwrap_or_default().contains("README.md"),
             "{listed}"
         );
+
+        // The work folder the task is told about is an absolute path below
+        // the project `.dhi`; reading, listing and searching it must work.
+        let work = containers.ensure(task).await.unwrap().host_dir.clone();
+        fs::write(work.join("note.md"), "own note\n").unwrap();
+        let absolute_note = work.join("note.md").to_string_lossy().into_owned();
+        let read = backend
+            .execute_for_task(task, "read", serde_json::json!({ "path": absolute_note }))
+            .await
+            .unwrap_or_else(|err| panic!("the work path {absolute_note} is readable: {err}"));
+        assert_eq!(read, serde_json::json!("own note\n"));
+
+        let absolute_work = work.to_string_lossy().into_owned();
+        let listed = backend
+            .execute_for_task(task, "list", serde_json::json!({ "path": absolute_work }))
+            .await
+            .unwrap_or_else(|err| panic!("the work directory {absolute_work} lists: {err}"));
+        assert!(
+            listed.as_str().unwrap_or_default().contains("note.md"),
+            "{listed}"
+        );
+
+        let found = backend
+            .execute_for_task(
+                task,
+                "search",
+                serde_json::json!({ "pattern": "own note", "path": absolute_work }),
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!("the work directory {absolute_work} is searchable: {err}")
+            });
+        assert!(
+            found.as_str().unwrap_or_default().contains("own note"),
+            "{found}"
+        );
+
+        // Another task's folder below the same `.dhi` stays hidden.
+        let other = Uuid::new_v4();
+        containers.set_task_project(other, Some(&project)).unwrap();
+        let other_work = containers.ensure(other).await.unwrap().host_dir.clone();
+        fs::write(other_work.join("secret.md"), "other secret\n").unwrap();
+        let other_note = other_work.join("secret.md").to_string_lossy().into_owned();
+        let err = backend
+            .execute_for_task(task, "read", serde_json::json!({ "path": other_note }))
+            .await
+            .expect_err("another task's work file is hidden");
+        assert!(err.to_string().contains("hidden"), "{err}");
+
+        // A symlink inside the work folder that leaves the project is still
+        // refused before the tool opens it.
+        #[cfg(unix)]
+        {
+            let outside = temp.path().join("outside.txt");
+            fs::write(&outside, "outside secret\n").unwrap();
+            std::os::unix::fs::symlink(&outside, work.join("escape.txt")).unwrap();
+            let escape = work.join("escape.txt").to_string_lossy().into_owned();
+            let err = backend
+                .execute_for_task(task, "read", serde_json::json!({ "path": escape }))
+                .await
+                .expect_err("a symlink out of the project is refused");
+            assert!(err.to_string().contains("outside"), "{err}");
+        }
+        // A project file is still readable by its absolute path, both as
+        // the task gets it and by its `/project` name.
+        let project_absolute = fs::canonicalize(&project)
+            .unwrap()
+            .join("README.md")
+            .to_string_lossy()
+            .into_owned();
+        let read = backend
+            .execute_for_task(
+                task,
+                "read",
+                serde_json::json!({ "path": project_absolute }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read, serde_json::json!("project text\n"));
 
         let err = backend
             .execute_for_task(

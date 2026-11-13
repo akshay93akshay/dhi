@@ -10,7 +10,7 @@ use dhi_agent::{
 use dhi_core::team::TeamStore;
 use dhi_core::{GraphStore, GuardStore, ScaleApprovalGate};
 use dhi_engine::Engine;
-use dhi_exec::{CodingTools, ContainerConfig, TaskContainers};
+use dhi_exec::{CodingTools, ContainerConfig, SandboxConfig, TaskContainers};
 use dhi_guard::{GuardedExecutor, SharedPolicy, ToolBackend};
 use dhi_pty::PtyTools;
 use dhi_server::{
@@ -135,6 +135,58 @@ fn select_runtime(has_env_key: bool, pool_len: usize) -> bool {
 fn env_has_llm_key() -> bool {
     std::env::var("DHI_LLM_API_KEY").is_ok_and(|k| !k.trim().is_empty())
         || std::env::var("RIVER_API_KEY").is_ok_and(|k| !k.trim().is_empty())
+}
+
+/// Validates the `DHI_SANDBOX_PROFILE` value and returns its canonical path.
+///
+/// The profile is handed to `/usr/bin/sandbox-exec -f` verbatim, so the value
+/// must be usable as-is:
+///
+/// - surrounding whitespace is trimmed, and an empty value is rejected with
+///   the same "required" message an unset variable gets;
+/// - a value containing `~`, including a leading `~/`, is rejected: no shell
+///   expansion happens here and `sandbox-exec` would receive the literal
+///   tilde;
+/// - the path must be absolute — a relative path would resolve against
+///   whatever working directory the sandboxed command starts in;
+/// - the path is canonicalized and must name an existing regular file; a
+///   failure names the raw value and the reason.
+///
+/// The canonical path is what the backend gets, so symlinks in the profile
+/// path are resolved once, at startup.
+fn resolve_sandbox_profile(raw: Option<&str>) -> anyhow::Result<std::path::PathBuf> {
+    let raw = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "DHI_SANDBOX_PROFILE is required when DHI_EXEC_BACKEND=sandbox; set it to \
+             the absolute path of the sandbox profile (for example \
+             ops/macos/dhi-task.sb)"
+            )
+        })?;
+    if raw.contains('~') {
+        return Err(anyhow::anyhow!(
+            "DHI_SANDBOX_PROFILE={raw} must be an absolute path; no shell expansion is done, \
+             so `~` is not replaced with the home directory (write /Users/<you>/... instead)"
+        ));
+    }
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(anyhow::anyhow!(
+            "DHI_SANDBOX_PROFILE={raw} must be an absolute path (starting with `/`)"
+        ));
+    }
+    let canonical = std::fs::canonicalize(path).map_err(|err| {
+        anyhow::anyhow!("DHI_SANDBOX_PROFILE={raw} cannot be canonicalized: {err}")
+    })?;
+    if !canonical.is_file() {
+        return Err(anyhow::anyhow!(
+            "DHI_SANDBOX_PROFILE={raw} resolved to {}, which is not a file",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
 }
 
 /// Routes a guarded tool call to the coding tools first, then to the existing
@@ -528,12 +580,17 @@ async fn main() -> anyhow::Result<()> {
     // extension edits this server file.
     let skills_runtime = dhi_skills::SkillsRuntime::from_env();
     let custom_tools_runtime = dhi_custom_tools::CustomToolsRuntime::from_env();
-    // Coding tools: one Docker container per task, rooted at
-    // DHI_WORKSPACE_ROOT (default `workspace`). Containers left by a process
-    // that died without shutdown are cleaned up best effort here, before any
-    // task runs; a Docker failure only warns and the server still boots.
+    // Coding tools: one managed task boundary per task, rooted at
+    // DHI_WORKSPACE_ROOT (default `workspace`). The default backend is one
+    // Docker container per task; DHI_EXEC_BACKEND=sandbox selects the native
+    // macOS sandbox instead: the same macOS user, no Docker daemon, no VM,
+    // no task user, and no reboot. Runtimes left by a process that died
+    // without shutdown are cleaned up best effort here, before any task runs;
+    // a runtime failure only warns and the server still boots.
     let workspace_root =
         std::env::var("DHI_WORKSPACE_ROOT").unwrap_or_else(|_| "workspace".to_string());
+    let exec_backend = std::env::var("DHI_EXEC_BACKEND").unwrap_or_default();
+    let use_sandbox = exec_backend.trim().eq_ignore_ascii_case("sandbox");
     // The server normally runs in its own container and reaches the host
     // Docker daemon through /var/run/docker.sock. The daemon resolves bind
     // mount sources on the host, so it needs the real host path of
@@ -544,37 +601,56 @@ async fn main() -> anyhow::Result<()> {
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    let mut task_containers =
-        TaskContainers::new(workspace_root.clone(), ContainerConfig::default())?;
-    if let Some(host_root) = &workspace_host_root {
-        task_containers = task_containers.with_host_root(host_root.clone())?;
-    } else {
-        warn!(
+    let task_containers = if use_sandbox {
+        // The profile is validated and canonicalized here, before any task
+        // runs: an unset, empty, relative, `~`-relative, missing, or
+        // non-file value fails startup with the raw value in the message.
+        let raw_profile = std::env::var("DHI_SANDBOX_PROFILE").ok();
+        let profile = resolve_sandbox_profile(raw_profile.as_deref())?;
+        info!(
+            backend = "sandbox",
+            profile = %profile.display(),
             workspace_root = %workspace_root,
-            "DHI_WORKSPACE_HOST_ROOT is unset; task container bind mounts use the task root \
-             as their host path, which is only correct when this process sees the host \
-             filesystem directly"
+            "native macOS sandbox backend selected: tasks run as the same macOS user under \
+             sandbox-exec"
         );
-    }
-    info!(
-        workspace_root = %workspace_root,
-        workspace_host_root = %workspace_host_root.as_deref().unwrap_or(workspace_root.as_str()),
-        "task container workspace roots configured"
-    );
+        TaskContainers::sandbox(workspace_root.clone(), SandboxConfig { profile })?
+    } else {
+        let mut containers =
+            TaskContainers::new(workspace_root.clone(), ContainerConfig::default())?;
+        if let Some(host_root) = &workspace_host_root {
+            containers = containers.with_host_root(host_root.clone())?;
+        } else {
+            warn!(
+                workspace_root = %workspace_root,
+                "DHI_WORKSPACE_HOST_ROOT is unset; task container bind mounts use the task root \
+                 as their host path, which is only correct when this process sees the host \
+                 filesystem directly"
+            );
+        }
+        info!(
+            backend = "docker",
+            workspace_root = %workspace_root,
+            workspace_host_root = %workspace_host_root.as_deref().unwrap_or(workspace_root.as_str()),
+            "task container workspace roots configured"
+        );
+        containers
+    };
     let task_containers = Arc::new(task_containers);
     if let Err(err) = task_containers.reap_orphans().await {
-        warn!(error = %err, "coding container orphan cleanup failed; continuing");
+        warn!(error = %err, "task runtime orphan cleanup failed; continuing");
     }
     let coding = Arc::new(CodingTools::new(task_containers.clone()));
     let coding_backend = Arc::new(coding.backend());
-    // Persistent terminals: the PTY sessions share the same task
-    // containers as the coding tools, so a terminal sees the task workspace
-    // and the container is removed only after its terminals are closed.
+    // Persistent terminals: the PTY sessions share the same task runtimes
+    // (Docker containers or the native sandbox) as the coding tools, so a
+    // terminal sees the task workspace and the runtime is removed only after
+    // its terminals are closed.
     let pty = Arc::new(PtyTools::new(task_containers.clone()));
     let pty_backend = Arc::new(pty.backend());
     // The registry owns the hard-kill cleanup handles: a loop that ignores
     // its cooperative stop for five seconds is aborted and its terminals and
-    // container are closed under the same task id.
+    // runtime are closed under the same task id.
     let task_runs = Arc::new(TaskRunRegistry::with_cleanup(
         pty.clone(),
         task_containers.clone(),
@@ -775,6 +851,7 @@ async fn main() -> anyhow::Result<()> {
         .with_executor(executor, guard_store.clone())
         .with_max_rounds(DEFAULT_ENGINE_MAX_ROUNDS)
         .with_max_no_progress_rounds(DEFAULT_ENGINE_NO_PROGRESS_ROUNDS)
+        .with_workspace_root(task_containers.root().to_path_buf())
         .with_scale_gate(scale_gate.clone());
     if lead_runtime {
         // The lead/team runtimes are opt-in: the mock runtime refuses both
@@ -808,8 +885,9 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     // The terminal reaper: once a task is terminal, its persistent terminals
-    // are closed and its task container is removed. The host work folder is
-    // kept. Failures are logged and retried on the next pass.
+    // are closed and its task runtime (container or sandbox) is removed. The
+    // host work folder is kept. Failures are logged and retried on the next
+    // pass.
     tokio::spawn(run_terminal_reaper(
         store.clone(),
         pty.clone(),
@@ -841,8 +919,8 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     info!("DHI listening on http://{bind}");
     // SIGTERM (`scripts/dhi-service.sh stop`) and Ctrl-C stop the HTTP server
-    // first, then close every terminal session and remove every coding
-    // container this process started.
+    // first, then close every terminal session and remove every task runtime
+    // (container or sandbox) this process started.
     axum::serve(listener, router_with_web_ui(state))
         .with_graceful_shutdown(shutdown_signal(task_containers, pty))
         .await?;
@@ -852,8 +930,8 @@ async fn main() -> anyhow::Result<()> {
 /// How often the terminal reaper checks for tasks that finished.
 const TERMINAL_REAPER_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Closes the persistent terminals and removes the task container of every
-/// task that reached a terminal state.
+/// Closes the persistent terminals and removes the task runtime (container or
+/// native sandbox) of every task that reached a terminal state.
 ///
 /// The host work folder is intentionally left in place: it is the task's
 /// durable workspace, not a runtime resource. A failure is logged and the
@@ -892,7 +970,7 @@ async fn run_terminal_reaper(
                 warn!(
                     task_id = %task.id,
                     error = %err,
-                    "terminal reaper: removing the task container failed"
+                    "terminal reaper: removing the task runtime failed"
                 );
             }
         }
@@ -900,14 +978,14 @@ async fn run_terminal_reaper(
 }
 
 /// Waits for Ctrl-C or SIGTERM, then closes the persistent terminals and
-/// shuts the task containers down.
+/// shuts the task runtimes down.
 ///
-/// Terminals close first: their processes run inside the task containers, so
-/// removing a container under a live session would leave the session manager
-/// with a dead runtime it still has to clean up. `shutdown` is what prevents
-/// orphaned containers when the service is stopped normally;
-/// [`TaskContainers::reap_orphans`] covers the cases where the process died
-/// before this could run.
+/// Terminals close first: their processes run inside the task runtime
+/// (container or native sandbox), so removing a runtime under a live session
+/// would leave the session manager with a dead runtime it still has to clean
+/// up. `shutdown` is what prevents orphaned containers and sandboxes when the
+/// service is stopped normally; [`TaskContainers::reap_orphans`] covers the
+/// cases where the process died before this could run.
 async fn shutdown_signal(containers: Arc<TaskContainers>, pty: Arc<PtyTools>) {
     let ctrl_c = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -931,7 +1009,7 @@ async fn shutdown_signal(containers: Arc<TaskContainers>, pty: Arc<PtyTools>) {
         warn!(error = %err, "terminal session shutdown failed");
     }
     if let Err(err) = containers.shutdown().await {
-        warn!(error = %err, "coding container shutdown failed");
+        warn!(error = %err, "task runtime shutdown failed");
     }
 }
 
@@ -967,6 +1045,63 @@ mod tests {
             "keyless boot, empty pool -> Mock"
         );
         assert!(select_runtime(true, 1), "env key plus one profile -> Rig");
+    }
+
+    /// `DHI_SANDBOX_PROFILE` is passed to `sandbox-exec -f` verbatim: trim,
+    /// reject empty/`~`/relative, then require a canonical existing file.
+    #[test]
+    fn sandbox_profile_must_be_an_absolute_existing_file() {
+        let missing = resolve_sandbox_profile(None).expect_err("unset is rejected");
+        assert!(
+            missing
+                .to_string()
+                .contains("DHI_SANDBOX_PROFILE is required"),
+            "{missing}"
+        );
+        let empty = resolve_sandbox_profile(Some("   ")).expect_err("empty is rejected");
+        assert!(
+            empty
+                .to_string()
+                .contains("DHI_SANDBOX_PROFILE is required"),
+            "{empty}"
+        );
+
+        let tilde = resolve_sandbox_profile(Some("~/ops/dhi-task.sb")).expect_err("~ is rejected");
+        let message = tilde.to_string();
+        assert!(message.contains("~/ops/dhi-task.sb"), "{message}");
+        assert!(message.contains("absolute"), "{message}");
+        assert!(message.contains("no shell expansion"), "{message}");
+        let inner_tilde =
+            resolve_sandbox_profile(Some("/Users/me/~/dhi-task.sb")).expect_err("~ is rejected");
+        assert!(inner_tilde.to_string().contains("no shell expansion"));
+
+        let relative =
+            resolve_sandbox_profile(Some("ops/macos/dhi-task.sb")).expect_err("relative rejected");
+        assert!(relative.to_string().contains("absolute"), "{relative}");
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let absent = temp.path().join("absent.sb");
+        let missing_file = resolve_sandbox_profile(Some(&absent.to_string_lossy()))
+            .expect_err("a missing file is rejected");
+        let message = missing_file.to_string();
+        assert!(message.contains(&*absent.to_string_lossy()), "{message}");
+        assert!(message.contains("canonicalized"), "{message}");
+
+        let directory = temp.path().join("profile-dir");
+        std::fs::create_dir(&directory).expect("profile dir");
+        let not_file = resolve_sandbox_profile(Some(&directory.to_string_lossy()))
+            .expect_err("a directory is rejected");
+        assert!(not_file.to_string().contains("not a file"), "{not_file}");
+
+        let profile = temp.path().join("task.sb");
+        std::fs::write(&profile, "(version 1)\n").expect("profile");
+        let padded = format!("  {}  ", profile.display());
+        let resolved = resolve_sandbox_profile(Some(&padded)).expect("an existing file resolves");
+        assert!(resolved.is_absolute());
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(&profile).expect("canonical profile")
+        );
     }
 
     // -- local provider stub -------------------------------------------------
